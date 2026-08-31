@@ -17,7 +17,8 @@ const State = {
   sort: { column: 'Score (1-10)', direction: 'desc' },
   live: false,
   lastSync: 0,
-  lpvEstimated: false
+  lpvEstimated: false,
+  accountTz: null,      // ad account timezone — the only clock the daily rules mean anything against
 };
 
 const LS = {
@@ -197,7 +198,17 @@ const WINDOW_META = {
   midnight: { title: '🌙 Midnight Check', sub: 'Scale · keep · descale · kill' }
 };
 
-function activeWindow() { return State.window || VE.detectWindow(new Date()); }
+/* Every time shown on this dashboard is the ad account's time. Your laptop's
+   clock is irrelevant to Meta's advertising day and showing it invites you to
+   act on the wrong read window. */
+function accountClock(d = new Date()) {
+  const tz = State.accountTz;
+  const t = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', ...(tz ? { timeZone: tz } : {}) });
+  const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return tz && tz !== localTz ? `${t} ${tz.split('/').pop().replace(/_/g, ' ')}` : t;
+}
+
+function activeWindow() { return State.window || VE.detectWindow(new Date(), State.accountTz); }
 
 function setupWindowTabs() {
   document.querySelectorAll('.command-tabs .playbook-tab').forEach(tab => {
@@ -211,7 +222,7 @@ function setupWindowTabs() {
 function renderCommandBar() {
   const win = activeWindow();
   const meta = WINDOW_META[win];
-  const auto = VE.detectWindow(new Date());
+  const auto = VE.detectWindow(new Date(), State.accountTz);
   document.getElementById('command-title').innerText = meta.title;
   document.getElementById('command-sub').innerText =
     meta.sub + (win === auto ? ' · this is where you are now' : ' · viewing out of hours');
@@ -398,7 +409,8 @@ async function syncMetaAPI() {
       return;
     }
 
-    setApiStatus('online', `Live · ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
+    State.accountTz = (ok[0] && ok[0].account && ok[0].account.timezone_name) || null;
+    setApiStatus('online', `Live · ${accountClock()}`);
     document.getElementById('brand-sub').innerText = ok.length === 1
       ? `${ok[0].account.name || acc} · ${State.currency} · ${ok[0].account.timezone_name || ''}`
       : `${ok.length} ad accounts · ${State.currency}`;
@@ -688,7 +700,7 @@ function berFor(campaign) {
 
 function computeVerdicts() {
   const now = new Date();
-  const ctxDay = VE.dayContext(now);
+  const ctxDay = VE.dayContext(now, State.accountTz);
   const win = activeWindow();
   const log = actionLog();
 
