@@ -412,6 +412,31 @@
         rule: 'Campaign name: Productname | BER | Profit margin'
       }, f, margin, ber);
     }
+    /* A paused campaign is not a candidate for any budget move. It still
+       shows up while it has spend in the window being viewed, because you
+       need to see how the day it was stopped actually ended — but telling
+       someone to scale a campaign they just switched off is nonsense, and
+       acting on it would mean turning it back on by accident. Report the
+       outcome; leave the decision to restart to the person. */
+    if (/PAUSED|ARCHIVED|DELETED/i.test(c.status || '')) {
+      const outcome = c.purchases > 0
+        ? `It ended on ROAS ${c.roas.toFixed(2)} against break-even ${ber.toFixed(2)} — ${profitable ? 'profitable' : 'under water'}.`
+        : `It ended with ${money(c.spend, ctx.currency)} spent and no sales.`;
+      const broken = brokenStage(c, { includePurchaseStep: false });
+      return build('PAUSED', c, {
+        headline: profitable ? 'Paused — it was working when you stopped it' : 'Paused',
+        reasons: [
+          outcome,
+          broken
+            ? `${broken.upCount} ${broken.from} produced 0 ${broken.to}. Fix that before switching it back on.`
+            : profitable
+              ? 'Switching it back on is a decision for you — the sheet does not scale a campaign that is off.'
+              : 'Leave it off until the creative or the funnel behind it has changed.'
+        ],
+        rule: 'Paused campaigns are never scaled, descaled or killed — these numbers are final for this window.'
+      }, f, margin, ber, notes);
+    }
+
     if (c.spend < RULES.minSpendForVerdict) {
       return build('MONITOR', c, {
         headline: 'Too early to call',
@@ -855,7 +880,8 @@
     SCALE: 'success', SURF: 'success', PROVE: 'success',
     HOLD: 'neutral', MONITOR: 'neutral', DIAGNOSE: 'neutral', NEEDS_SETUP: 'neutral',
     DESCALE: 'warning', PRICE_DROP: 'warning',
-    KILL: 'danger'
+    KILL: 'danger',
+    PAUSED: 'neutral'
   };
 
   function build(code, c, spec, f, margin, ber, notes) {
