@@ -1720,7 +1720,6 @@ function renderPnl() {
 
   const roas = spend > 0 ? revenue / spend : 0;
   const cpa = purchases > 0 ? spend / purchases : null;
-  const cur = State.currency;
   const tone = profit > 0 ? 'good' : profit < 0 ? 'bad' : 'warn';
   const cell = (label, value, sub, cls) =>
     `<div class="pnl-cell ${cls || ''}"><span class="pnl-label">${esc(label)}</span>` +
@@ -1728,14 +1727,14 @@ function renderPnl() {
     `<span class="pnl-sub">${sub || ''}</span></div>`;
 
   el.innerHTML =
-    cell('Spend', money(spend, cur), `${live.length} campaign${live.length > 1 ? 's' : ''} · ${esc(windowLabel())}`, 'lead') +
-    cell('Revenue', money(revenue, cur), `${purchases} order${purchases === 1 ? '' : 's'}`) +
+    cell('Spend', fmtMoney(spend), `${live.length} campaign${live.length > 1 ? 's' : ''} · ${esc(windowLabel())}`, 'lead') +
+    cell('Revenue', fmtMoney(revenue), `${purchases} order${purchases === 1 ? '' : 's'}`) +
     cell('Blended ROAS', roas ? roas.toFixed(2) : '—', roas ? 'revenue ÷ spend' : 'no sales yet') +
     (haveMargin
-      ? cell('Profit', (profit >= 0 ? '+' : '') + money(profit, cur),
+      ? cell('Profit', (profit >= 0 ? '+' : '') + fmtMoney(profit),
              profit >= 0 ? 'after product cost and fees' : 'you are losing money right now', tone)
       : cell('Profit', '—', 'set BER in campaign names', 'warn')) +
-    cell('CPA', cpa === null ? '—' : money(cpa, cur), cpa === null ? 'no orders yet' : 'cost per order');
+    cell('CPA', cpa === null ? '—' : fmtMoney(cpa), cpa === null ? 'no orders yet' : 'cost per order');
 }
 
 
