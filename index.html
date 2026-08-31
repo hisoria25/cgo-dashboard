@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CGO Media Buyer — Verdict Dashboard</title>
+  <meta name="description" content="Meta ads decision dashboard running the Samuel Ecom scaling rules: scale, keep, descale or kill, with the exact new budget.">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+
+<!-- ======================= HEADER ======================= -->
+<header>
+  <div class="container header-content">
+    <div class="brand-wrapper">
+      <div class="logo-icon">C</div>
+      <div class="brand-title">
+        <h1>CGO Media Buyer</h1>
+        <span id="brand-sub">Verdict Dashboard · Samuel Ecom rules</span>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <div id="api-status-badge" class="api-status-badge offline">
+        <span class="status-pulse"></span>
+        <span class="status-text">Demo Mode</span>
+      </div>
+
+      <button id="api-sync-btn" class="btn btn-primary" style="display:none;">🔄 Sync</button>
+      <button id="econ-toggle" class="btn btn-secondary">💶 Unit Economics</button>
+      <button id="settings-toggle" class="btn btn-secondary">⚙️ Meta API</button>
+
+      <div class="file-upload-wrapper">
+        <button class="btn btn-secondary">📁 CSV
+          <input type="file" id="csv-file-input" class="file-upload-input" accept=".csv" />
+        </button>
+      </div>
+
+      <button class="btn btn-secondary" onclick="window.print()">🖨️</button>
+      <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle theme">☀️</button>
+    </div>
+  </div>
+</header>
+
+<!-- ======================= META API MODAL ======================= -->
+<div id="settings-modal" class="modal-overlay">
+  <div class="modal-card card">
+    <div class="modal-header">
+      <h3>Meta Marketing API</h3>
+      <button class="modal-close-btn" data-close="settings-modal">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-intro">Credentials are stored in this browser only. Nothing is sent anywhere except Meta.</p>
+
+      <div class="form-group mb14">
+        <label for="meta-account-id">Ad Account IDs</label>
+        <textarea id="meta-account-id" class="sandbox-textarea acct-input" placeholder="act_1234567890, act_9876543210"></textarea>
+        <span class="hint">Keep the <code>act_</code> prefix. Running several accounts for ban prevention? Separate them with commas — the dashboard merges them into one picture.</span>
+      </div>
+
+      <div class="form-group mb14">
+        <label for="meta-access-token">User Access Token</label>
+        <input type="password" id="meta-access-token" class="search-input full" placeholder="Paste token…" />
+        <span class="hint">Needs <code>ads_read</code> + <code>read_insights</code>.</span>
+      </div>
+
+      <div class="form-group mb14">
+        <label for="meta-date-preset">Verdict window</label>
+        <select id="meta-date-preset" class="select-input full">
+          <option value="today" selected>Today (what the rules are written for)</option>
+          <option value="yesterday">Yesterday</option>
+          <option value="last_3d">Last 3 days</option>
+          <option value="last_7d">Last 7 days</option>
+        </select>
+        <span class="hint">The kill/scale rules are daily rules. Keep this on <strong>Today</strong> unless you are reviewing history.</span>
+      </div>
+
+      <div class="info-box">
+        <h4>Getting a token</h4>
+        <ol>
+          <li>Open the <a href="https://developers.facebook.com/tools/explorer/" target="_blank" rel="noopener">Graph API Explorer</a>.</li>
+          <li>Pick your Business app, add <strong>ads_read</strong> and <strong>read_insights</strong>.</li>
+          <li>Generate Access Token → paste it above.</li>
+          <li>Short tokens expire in ~1 hour. Extend to 60 days with the <a href="https://developers.facebook.com/tools/accesstoken/" target="_blank" rel="noopener">Access Token Tool</a>.</li>
+        </ol>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button id="btn-save-settings" class="btn btn-primary full mb8">Save &amp; Connect</button>
+      <button id="btn-disconnect-settings" class="btn btn-secondary full danger-text">Disconnect</button>
+    </div>
+  </div>
+</div>
+
+<!-- ======================= ECONOMICS MODAL ======================= -->
+<div id="econ-modal" class="modal-overlay">
+  <div class="modal-card card">
+    <div class="modal-header">
+      <h3>Unit Economics → BER</h3>
+      <button class="modal-close-btn" data-close="econ-modal">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-intro">
+        Every rule on the cheat sheet compares ROAS against your <strong>break-even ROAS</strong>.
+        Campaigns named <code>Product | BER | Margin</code> use their own BER. Everything else falls back to this.
+      </p>
+
+      <div class="econ-grid">
+        <div class="form-group">
+          <label for="econ-price">Selling price</label>
+          <input type="number" step="0.01" id="econ-price" class="search-input full" value="29.95" />
+        </div>
+        <div class="form-group">
+          <label for="econ-cogs">Product cost</label>
+          <input type="number" step="0.01" id="econ-cogs" class="search-input full" value="7.00" />
+        </div>
+        <div class="form-group">
+          <label for="econ-shipping">Shipping cost</label>
+          <input type="number" step="0.01" id="econ-shipping" class="search-input full" value="2.00" />
+        </div>
+        <div class="form-group">
+          <label for="econ-fees">Payment fees %</label>
+          <input type="number" step="0.1" id="econ-fees" class="search-input full" value="3" />
+        </div>
+      </div>
+
+      <div class="econ-result" id="econ-result"><!-- filled by JS --></div>
+
+      <div class="info-box">
+        <h4>The maths behind every verdict</h4>
+        <p class="mono-line">gross margin = (price − cost − shipping − fees) ÷ price</p>
+        <p class="mono-line">BER = 1 ÷ gross margin</p>
+        <p class="mono-line">profit margin = gross margin − (1 ÷ ROAS)</p>
+        <p class="hint mt8">
+          That last line is why the sheet holds together: ROAS above BER and profit margin above zero are the same statement.
+          The +35% / +20% / hold ladder reads this number.
+        </p>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button id="btn-save-econ" class="btn btn-primary full">Save economics</button>
+    </div>
+  </div>
+</div>
+
+<main class="container main-content fade-in">
+
+  <!-- ======================= COMMAND BAR ======================= -->
+  <div class="card command-bar">
+    <div class="command-left">
+      <div class="command-window">
+        <span class="command-eyebrow">Current read</span>
+        <h2 id="command-title">☀️ Morning Check</h2>
+        <span id="command-sub" class="command-sub">Creative quality · 11:00</span>
+      </div>
+      <div class="playbook-tabs command-tabs">
+        <button class="playbook-tab" data-window="morning">☀️ Morning</button>
+        <button class="playbook-tab" data-window="evening">🌇 Evening</button>
+        <button class="playbook-tab" data-window="midnight">🌙 Midnight</button>
+      </div>
+    </div>
+
+    <div class="command-right" id="verdict-tally">
+      <!-- verdict counters injected here -->
+    </div>
+  </div>
+
+  <!-- ======================= VERDICTS ======================= -->
+  <section class="section-block">
+    <h2 class="section-title">⚡ Campaign Verdicts</h2>
+    <p class="section-lede">
+      One card per CBO campaign. Each one is the cheat sheet applied to tonight's numbers — the action, the exact new budget,
+      and the line of the sheet it came from.
+    </p>
+    <div id="verdict-grid" class="verdict-grid"><!-- injected --></div>
+  </section>
+
+  <!-- ======================= GUARDRAILS ======================= -->
+  <div id="guardrails" class="guardrail-stack"><!-- injected --></div>
+
+  <!-- ======================= TREND ======================= -->
+  <div class="card trend-card">
+    <h2 class="section-title">📈 Last 14 days</h2>
+    <p class="section-lede">
+      Spend against ROAS, with your break-even line. One day is noise; the shape of two weeks is the truth.
+    </p>
+    <div class="chart-container h240"><canvas id="trendChart"></canvas></div>
+  </div>
+
+  <!-- ======================= ACCOUNT KPIs ======================= -->
+  <div class="kpi-grid">
+    <div class="card kpi-card accent-purple">
+      <span class="kpi-label">Account ROAS</span>
+      <span class="kpi-value" id="kpi-roas">0.00</span>
+      <span class="kpi-trend neutral" id="kpi-roas-sub">vs BER —</span>
+    </div>
+    <div class="card kpi-card">
+      <span class="kpi-label">Spend</span>
+      <span class="kpi-value" id="kpi-total-spend">—</span>
+      <span class="kpi-trend neutral" id="kpi-spend-sub">All campaigns</span>
+    </div>
+    <div class="card kpi-card">
+      <span class="kpi-label">Revenue</span>
+      <span class="kpi-value" id="kpi-revenue">—</span>
+      <span class="kpi-trend neutral" id="kpi-profit-sub">Profit —</span>
+    </div>
+    <div class="card kpi-card">
+      <span class="kpi-label">Purchases</span>
+      <span class="kpi-value" id="kpi-total-purchases">0</span>
+      <span class="kpi-trend neutral" id="kpi-cpa-sub">CPA —</span>
+    </div>
+    <div class="card kpi-card">
+      <span class="kpi-label">Link CTR</span>
+      <span class="kpi-value" id="kpi-ctr">0.00%</span>
+      <span class="kpi-trend neutral">Benchmark &gt; 2%</span>
+    </div>
+    <div class="card kpi-card accent-indigo">
+      <span class="kpi-label">Video Hook Rate</span>
+      <span class="kpi-value" id="kpi-hook-rate">0.0%</span>
+      <span class="kpi-trend neutral">Benchmark &gt; 25%</span>
+    </div>
+  </div>
+
+  <!-- ======================= FUNNEL + PLAYBOOK ======================= -->
+  <div class="dashboard-grid two-up">
+    <div class="card funnel-card">
+      <h2 class="section-title">🌐 Funnel Health</h2>
+      <p class="section-lede">
+        Link Clicks → Landing Page Views → Add to Cart → Initiate Checkout → Purchase.
+        The stage that breaks first is the thing to fix — before you touch any budget.
+      </p>
+      <div class="funnel-container">
+        <div class="funnel-row">
+          <div class="funnel-label"><strong>Page speed</strong><span>LPV ÷ Clicks · target 70–90%</span></div>
+          <div class="funnel-bar-container">
+            <div class="funnel-bar" id="ratio-lpv-clicks-bar" style="width:0%"></div>
+            <span class="funnel-bar-value" id="ratio-lpv-clicks-text">0%</span>
+          </div>
+          <div class="funnel-status-badge" id="ratio-lpv-clicks-status">—</div>
+        </div>
+        <div class="funnel-diagnostic-note" id="note-ratio-lpv-clicks">—</div>
+
+        <div class="funnel-row">
+          <div class="funnel-label"><strong>Offer strength</strong><span>ATC ÷ LPV · target 5–10%</span></div>
+          <div class="funnel-bar-container">
+            <div class="funnel-bar" id="ratio-atc-lpv-bar" style="width:0%"></div>
+            <span class="funnel-bar-value" id="ratio-atc-lpv-text">0%</span>
+          </div>
+          <div class="funnel-status-badge" id="ratio-atc-lpv-status">—</div>
+        </div>
+        <div class="funnel-diagnostic-note" id="note-ratio-atc-lpv">—</div>
+
+        <div class="funnel-row">
+          <div class="funnel-label"><strong>Checkout intent</strong><span>IC ÷ ATC · target 30–60%</span></div>
+          <div class="funnel-bar-container">
+            <div class="funnel-bar" id="ratio-ic-atc-bar" style="width:0%"></div>
+            <span class="funnel-bar-value" id="ratio-ic-atc-text">0%</span>
+          </div>
+          <div class="funnel-status-badge" id="ratio-ic-atc-status">—</div>
+        </div>
+        <div class="funnel-diagnostic-note" id="note-ratio-ic-atc">—</div>
+
+        <div class="funnel-row">
+          <div class="funnel-label"><strong>Checkout completion</strong><span>Purchases ÷ IC · target 50%+</span></div>
+          <div class="funnel-bar-container">
+            <div class="funnel-bar" id="ratio-pur-ic-bar" style="width:0%"></div>
+            <span class="funnel-bar-value" id="ratio-pur-ic-text">0%</span>
+          </div>
+          <div class="funnel-status-badge" id="ratio-pur-ic-status">—</div>
+        </div>
+        <div class="funnel-diagnostic-note" id="note-ratio-pur-ic">—</div>
+      </div>
+    </div>
+
+    <div class="card playbook-card">
+      <h2 class="section-title">🧠 What this read is for</h2>
+      <div id="playbook-content" class="playbook-content-wrapper"><!-- injected --></div>
+    </div>
+  </div>
+
+  <!-- ======================= AD TABLE ======================= -->
+  <div class="card table-card">
+    <div class="table-header-row">
+      <h2 class="section-title nomargin">Ad-level evidence · 12-column preset</h2>
+      <div class="filters-wrapper">
+        <input type="text" id="search-ads" class="search-input" placeholder="🔍 Search ads…" />
+        <select id="filter-type" class="select-input">
+          <option value="All">All formats</option>
+          <option value="Video">Video</option>
+          <option value="Image">Image</option>
+          <option value="Carousel">Carousel</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="ads-table-container">
+      <table class="ads-table">
+        <thead>
+          <tr>
+            <th class="w40"></th>
+            <th onclick="sortData('Score (1-10)')">Score <span class="sort-icon">↕</span></th>
+            <th>Ad</th>
+            <th onclick="sortData('Spend ($)')" data-col="spend">Spent <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('Purchases')" data-col="purchases">Purchases <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('Purchase ROAS')" data-col="roas">ROAS <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('Cost per Purchase')" data-col="cpa">CPA <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('CPM ($)')" data-col="cpm">CPM <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('Link CTR (%)')" data-col="ctr">CTR <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('CPC ($)')" data-col="cpc">CPC <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('Link Clicks')" data-col="clicks">Clicks <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('Landing Page Views')" data-col="lpv">LPV <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('Adds to Cart')" data-col="atc">ATC <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('Checkouts Initiated')" data-col="ic">IC <span class="sort-icon">↕</span></th>
+            <th onclick="sortData('Frequency')" data-col="frequency">Freq <span class="sort-icon">↕</span></th>
+          </tr>
+        </thead>
+        <tbody id="ads-table-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ======================= CHARTS + GRADER ======================= -->
+  <div class="dashboard-grid">
+    <div class="charts-wrapper">
+      <div class="card">
+        <h2 class="section-title">CPC &amp; CTR by ad</h2>
+        <div class="chart-container"><canvas id="cpcCtrChart"></canvas></div>
+      </div>
+    </div>
+
+    <div class="charts-wrapper">
+      <div class="card">
+        <h2 class="section-title">Spend by creative type</h2>
+        <div class="chart-container h180"><canvas id="spendCreativeChart"></canvas></div>
+      </div>
+
+      <div class="card sandbox-card">
+        <h2 class="section-title">Copy grader</h2>
+        <div class="form-group">
+          <label for="sandbox-headline">Headline <span class="hint">(max 6 words)</span></label>
+          <input type="text" id="sandbox-headline" class="search-input full" placeholder="Headline…" />
+          <span class="char-counter" id="char-count-headline">0 chars</span>
+        </div>
+        <div class="form-group">
+          <label for="sandbox-primary">Primary text <span class="hint">(1–3 emotional sentences)</span></label>
+          <textarea id="sandbox-primary" class="sandbox-textarea" placeholder="Primary text…"></textarea>
+          <span class="char-counter" id="char-count-primary">0 chars</span>
+        </div>
+        <div class="sandbox-results">
+          <div class="results-header">
+            <div class="sandbox-grade-box">
+              <span class="sandbox-grade-value" id="sandbox-grade">5.0</span>
+              <div class="sandbox-score-label">
+                <span>Predicted score</span>
+                <span>Copy structure only</span>
+              </div>
+            </div>
+          </div>
+          <div>
+            <span class="sandbox-feedback-title">Triggers found</span>
+            <div class="triggers-container" id="sandbox-active-triggers"></div>
+          </div>
+          <div>
+            <span class="sandbox-feedback-title">Recommendations</span>
+            <div id="sandbox-recommendations"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="page-footer">
+    Rules encoded from the Samuel Ecom scaling cheat sheet · verdicts are decision support, you still press the button in Ads Manager.
+  </footer>
+</main>
+
+<script src="rules.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
