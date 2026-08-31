@@ -18,7 +18,9 @@ const State = {
   live: false,
   lastSync: 0,
   lpvEstimated: false,
-  accountTz: null,      // ad account timezone — the only clock the daily rules mean anything against
+  accountTz: null,
+  range: null,          // {since,until} when a custom date range is picked
+  tokenInfo: null,      // ad account timezone — the only clock the daily rules mean anything against
 };
 
 const LS = {
@@ -49,9 +51,11 @@ document.addEventListener('DOMContentLoaded', () => {
   loadEconomics();
   setupModals();
   setupWindowTabs();
+  setupDateBar();
   setupTableControls();
   setupGrader();
   loadData();
+  renderTokenStatus();
   startAutoRefresh();
 });
 
@@ -163,7 +167,9 @@ function setupModals() {
     LS.del('meta_account_id');
     LS.set('meta_access_token', tok);
     LS.set('meta_date_preset', dateEl.value);
+    State.range = null;              // an explicit preset overrides any custom range
     close('settings-modal');
+    renderTokenStatus();
     syncMetaAPI();
   });
 
@@ -288,11 +294,26 @@ async function graph(path, params) {
         const res = await fetch(`https://graph.facebook.com/${v}/${path}?${qs}`);
         body = await res.json();
       } catch (e) {
-        throw new Error('Could not reach Meta. If the address bar starts with file://, open the dashboard through "Start Dashboard.command" instead.');
+        // A dropped connection is not a broken token. Retry before failing.
+        if (retry < 5) { await new Promise(r => setTimeout(r, 800 * Math.pow(2, retry))); continue; }
+        throw new Error(location.protocol === 'file:'
+          ? 'Could not reach Meta. The page is open as a file:// URL — open it through "Start Dashboard.command" instead.'
+          : 'Could not reach Meta after several tries. This is a network problem, not your token.');
       }
 
       if (body && body.error) {
         const msg = body.error.message || 'Unknown Graph error';
+        const code = body.error.code;
+
+        // Transient: rate limits, Meta's own hiccups, "unknown error".
+        // These are NOT credential problems and must never be reported as
+        // one. Back off and try again before giving up.
+        const TRANSIENT = [1, 2, 4, 17, 32, 341, 368, 80000, 80003, 80004];
+        if (TRANSIENT.includes(code) && retry < 5) {
+          await new Promise(r => setTimeout(r, 800 * Math.pow(2, retry)));
+          continue;
+        }
+
 
         // A field this API version no longer knows — drop it and retry.
         const dead = msg.match(/\(#100\)\s*([a-zA-Z0-9_]+)\s+is not valid for fields param/i);
@@ -307,7 +328,13 @@ async function graph(path, params) {
           lastErr = msg;
           break;
         }
-        throw new Error(msg);
+        const err = new Error(msg);
+        // 190/102/463/467 and OAuthException are the only real credential
+        // failures. Everything else gets its own explanation.
+        err.isAuth = [190, 102, 463, 467, 2500].includes(code) ||
+                     /OAuthException/i.test(body.error.type || '');
+        err.graphCode = code;
+        throw err;
       }
 
       LS.set('meta_api_version', v);
@@ -343,16 +370,35 @@ const AD_FIELDS = [
   'video_play_actions', 'video_thruplay_watched_actions'
 ].join(',');
 
+/* Meta accepts either a named preset or an explicit {since,until}. The date
+   bar uses the second form so any day or span can be judged, not just the
+   handful of presets. */
+function windowParams() {
+  return State.range
+    ? { time_range: JSON.stringify(State.range) }
+    : { date_preset: LS.get('meta_date_preset', 'today') };
+}
+
+function windowLabel() {
+  if (State.range) {
+    const { since, until } = State.range;
+    const fmt = d => new Date(d + 'T12:00:00').toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+    return since === until ? fmt(since) : `${fmt(since)} – ${fmt(until)}`;
+  }
+  return LS.get('meta_date_preset', 'today').replace(/_/g, ' ').replace(/^last /, 'last ');
+}
+
 async function fetchAccount(acc, preset) {
+  const win = windowParams();
   const [account, campaigns, adsets, judged, history, adInsights, adsMeta] = await Promise.all([
     graph(acc, { fields: 'name,currency,timezone_name' }),
     graph(`${acc}/campaigns`, { fields: 'id,name,status,effective_status,daily_budget,lifetime_budget,created_time', limit: 200 }),
     graph(`${acc}/adsets`, { fields: 'id,campaign_id,daily_budget,effective_status,learning_stage_info', limit: 300 }),
     // the window being judged, aggregated by Meta — not summed by us
-    graph(`${acc}/insights`, { level: 'campaign', fields: CAMPAIGN_FIELDS, date_preset: preset, limit: 200 }),
+    graph(`${acc}/insights`, { level: 'campaign', fields: CAMPAIGN_FIELDS, ...win, limit: 200 }),
     // history for sparklines and streaks (ends yesterday, which is what we want)
     graph(`${acc}/insights`, { level: 'campaign', fields: 'campaign_id,spend,actions,action_values,purchase_roas', date_preset: 'last_30d', time_increment: 1, limit: 800 }),
-    graph(`${acc}/insights`, { level: 'ad', fields: AD_FIELDS, date_preset: preset, limit: 300 }),
+    graph(`${acc}/insights`, { level: 'ad', fields: AD_FIELDS, ...win, limit: 300 }),
     graph(`${acc}/ads`, { fields: 'id,name,campaign_id,effective_status,creative{id,title,body,object_type}', limit: 300 })
   ]);
 
@@ -403,12 +449,20 @@ async function syncMetaAPI() {
     State.lastSync = Date.now();
 
     if (!State.campaigns.length) {
-      setApiStatus('offline');
-      showModal('Connected, but no spend found', `The ${accounts.length === 1 ? 'account' : 'accounts'} answered fine, but there is no campaign data for <strong>${preset.replace(/_/g, ' ')}</strong>. Pick a wider window in the Meta API panel, or wait until spend starts.`);
-      loadDemoFallback();
+      // Connected and answering — there is simply no spend in this window.
+      // That is a real answer, not a failure, and it must not be dressed up
+      // as demo data.
+      State.live = true;
+      clearStaleBanner();
+      State.accountTz = (ok[0] && ok[0].account && ok[0].account.timezone_name) || null;
+      setApiStatus('online', `Live · ${accountClock()}`);
+      renderAll();
+      const note = document.getElementById('date-note');
+      if (note) note.innerHTML = `<strong>No spend in ${esc(windowLabel())}.</strong> The account answered fine — there is just nothing to judge in this window.`;
       return;
     }
 
+    clearStaleBanner();
     State.accountTz = (ok[0] && ok[0].account && ok[0].account.timezone_name) || null;
     setApiStatus('online', `Live · ${accountClock()}`);
     document.getElementById('brand-sub').innerText = ok.length === 1
@@ -419,7 +473,15 @@ async function syncMetaAPI() {
   } catch (err) {
     console.error(err);
     setApiStatus('offline');
-    const expired = /session|expired|access token|OAuth|190/i.test(err.message);
+    /* If we already have real numbers on screen, KEEP them. Replacing a
+       live account with demo data mid-session is the most dangerous thing
+       this dashboard could do — you could scale a budget off invented
+       figures. Show a banner saying the data is stale and leave it alone. */
+    if (State.live && State.campaigns.length && State.lastSync) {
+      showStaleBanner(err);
+      return;
+    }
+    const expired = err.isAuth || /session|expired|access token|OAuth|190/i.test(err.message);
     showModal('Sync failed', expired
       ? `<p><strong>Your access token has expired.</strong></p>
          <p>Meta said: <em>${esc(err.message)}</em></p>
@@ -438,6 +500,90 @@ async function syncMetaAPI() {
     loadDemoFallback();
   }
 }
+/* ==========================================================================
+ *  STALE DATA BANNER
+ *  A failed refresh is not a reason to throw away good numbers. This keeps
+ *  the last real sync on screen and says plainly how old it is.
+ * ========================================================================== */
+function showStaleBanner(err) {
+  const mins = Math.max(1, Math.round((Date.now() - State.lastSync) / 60000));
+  let bar = document.getElementById('stale-banner');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'stale-banner';
+    bar.className = 'stale-banner';
+    const main = document.querySelector('main.main-content');
+    main.insertBefore(bar, main.firstChild);
+  }
+  const why = err && err.isAuth
+    ? 'Your token was rejected.'
+    : 'Could not reach Meta just now.';
+  bar.innerHTML =
+    `<span>⚠️ ${esc(why)} Showing the numbers from ${esc(String(mins))} min ago — they are real, just not current.</span>` +
+    `<button class="btn btn-small" id="stale-retry">Retry now</button>`;
+  document.getElementById('stale-retry').onclick = () => { clearStaleBanner(); syncMetaAPI(); };
+}
+
+function clearStaleBanner() {
+  const bar = document.getElementById('stale-banner');
+  if (bar) bar.remove();
+}
+
+/* Ask Meta how long this token actually has left, so the panel can say so
+   instead of guessing. A short-lived token is the single most common reason
+   a working dashboard stops working a couple of hours later. */
+async function checkToken() {
+  const token = LS.get('meta_access_token');
+  if (!token) return null;
+  const v = LS.get('meta_api_version') || GRAPH_VERSIONS[0];
+  try {
+    const r = await fetch(`https://graph.facebook.com/${v}/debug_token` +
+      `?input_token=${encodeURIComponent(token)}&access_token=${encodeURIComponent(token)}`);
+    const d = (await r.json()).data;
+    if (!d) return null;
+    const expiresAt = d.expires_at ? d.expires_at * 1000 : null;
+    const hoursLeft = expiresAt ? (expiresAt - Date.now()) / 3600000 : Infinity;
+    return {
+      valid: !!d.is_valid,
+      scopes: d.scopes || [],
+      hasAdsRead: (d.scopes || []).includes('ads_read'),
+      hasInsights: (d.scopes || []).includes('read_insights'),
+      expiresAt, hoursLeft,
+      shortLived: hoursLeft < 24
+    };
+  } catch (e) { return null; }
+}
+
+async function renderTokenStatus() {
+  const el = document.getElementById('token-status');
+  if (!el) return;
+  const info = await checkToken();
+  State.tokenInfo = info;
+  if (!info) { el.innerHTML = ''; return; }
+  if (!info.valid) {
+    el.innerHTML = `<span class="token-bad">✗ Token is not valid. Generate a new one.</span>`;
+    return;
+  }
+  const missing = [!info.hasAdsRead && 'ads_read', !info.hasInsights && 'read_insights'].filter(Boolean);
+  if (missing.length) {
+    el.innerHTML = `<span class="token-bad">✗ Token is missing ${esc(missing.join(' and '))}. Regenerate it with those permissions ticked.</span>`;
+    return;
+  }
+  if (info.hoursLeft === Infinity) {
+    el.innerHTML = `<span class="token-ok">✓ Valid, does not expire.</span>`;
+  } else if (info.shortLived) {
+    const h = Math.max(0, Math.round(info.hoursLeft * 10) / 10);
+    el.innerHTML = `<span class="token-warn">⚠ Short-lived token — about ${esc(String(h))} h left.</span>
+      <span class="token-hint">Extend it to 60 days with the
+      <a href="https://developers.facebook.com/tools/accesstoken/" target="_blank" rel="noopener">Access Token Tool</a>,
+      then paste the long one back here.</span>`;
+  } else {
+    const days = Math.round(info.hoursLeft / 24);
+    el.innerHTML = `<span class="token-ok">✓ Valid for about ${esc(String(days))} more days
+      (until ${esc(new Date(info.expiresAt).toLocaleDateString())}).</span>`;
+  }
+}
+
 
 function loadDemoFallback() {
   const demo = buildDemoData();
@@ -815,15 +961,27 @@ function renderVerdicts() {
           <div class="vstat"><span class="vstat-val">${fmtMoney(m.spend, 0)}</span><span class="vstat-cap">Spent</span></div>
           <div class="vstat"><span class="vstat-val">${m.purchases}</span><span class="vstat-cap">Sales</span></div>
           <div class="vstat ${m.frequency > VE.RULES.frequency.fatigue ? 'tone-warning' : ''}"><span class="vstat-val">${m.frequency.toFixed(2)}</span><span class="vstat-cap">Freq</span></div>
+          ${m.profit !== null && m.profit !== undefined
+            ? `<div class="vstat tone-${m.profit >= 0 ? 'good' : 'bad'}"><span class="vstat-val">${(m.profit >= 0 ? '+' : '') + fmtMoney(m.profit, 0)}</span><span class="vstat-cap">Profit</span></div>` : ''}
+          ${m.headroomPct !== null && m.headroomPct !== undefined
+            ? `<div class="vstat tone-${m.headroomPct >= 25 ? 'good' : m.headroomPct >= 0 ? 'warning' : 'bad'}"><span class="vstat-val">${m.headroomPct}%</span><span class="vstat-cap">CPA room</span></div>` : ''}
         </div>
 
         ${sparkline(c.series, m.ber)}
 
+        ${m.broken ? `<div class="broken-alert">
+            <strong>\u26d4 ${esc(m.broken.upCount + ' ' + m.broken.from)} produced 0 ${esc(m.broken.to)}.</strong>
+            ${esc(m.broken.message)}
+          </div>` : ''}
+
         <ul class="verdict-reasons">
+        
           ${v.reasons.map(r => `<li>${esc(r)}</li>`).join('')}
           ${v.notes.map(n => `<li class="note">${esc(n)}</li>`).join('')}
           ${m.cpa && m.maxCpa ? `<li class="${m.cpa <= m.maxCpa ? 'note' : ''}">CPA ${fmtMoney(m.cpa)} against a break-even CPA of ${fmtMoney(m.maxCpa)}${m.cpa > m.maxCpa ? ' — you are paying more per order than an order is worth.' : '.'}</li>` : ''}
           ${m.pacingPct !== null && m.pacingPct < 70 && c.budget ? `<li class="note">Spent only ${m.pacingPct}% of the ${fmtMoney(c.budget, 0)} budget — the auction cannot fill it.</li>` : ''}
+          ${m.pacing && !State.range && LS.get('meta_date_preset','today') === 'today'
+            ? `<li class="note">${m.pacing.dayFractionPct}% of the day gone. On this pace it lands near ${fmtMoney(m.pacing.projectedSpend, 0)} spend${m.pacing.projectedPurchases >= 1 ? ` and about ${Math.round(m.pacing.projectedPurchases)} orders` : ''}.${m.pacing.willUnderDeliver && c.budget ? ` It will not spend its ${fmtMoney(c.budget, 0)} budget.` : ''}</li>` : ''}
         </ul>
 
         <div class="verdict-funnel">
@@ -1456,8 +1614,134 @@ function showModal(title, html) {
 
 /* ========================================================================== *
  *  RENDER ALL
+ * ========================================================================== *//* ==========================================================================
+ *  DATE BAR
+ *  The three read windows say WHICH RULES apply. The date bar says WHICH
+ *  NUMBERS they are applied to. Keeping them separate means you can review
+ *  last Tuesday without the engine pretending it is Tuesday morning.
  * ========================================================================== */
+function todayInAccountTz(offsetDays = 0) {
+  const tz = State.accountTz;
+  const d = new Date(Date.now() + offsetDays * 86400000);
+  if (!tz) return d.toISOString().slice(0, 10);
+  // en-CA gives YYYY-MM-DD, which is what Meta wants.
+  try { return d.toLocaleDateString('en-CA', { timeZone: tz }); }
+  catch (e) { return d.toISOString().slice(0, 10); }
+}
+
+function setupDateBar() {
+  document.querySelectorAll('.date-btn[data-preset]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      State.range = null;
+      LS.set('meta_date_preset', btn.dataset.preset);
+      const sel = document.getElementById('meta-date-preset');
+      if (sel) sel.value = btn.dataset.preset;
+      refreshWindow();
+    });
+  });
+
+  const from = document.getElementById('date-from');
+  const to   = document.getElementById('date-to');
+  const apply = document.getElementById('date-apply');
+
+  apply && apply.addEventListener('click', () => {
+    if (!from.value) return;
+    const since = from.value;
+    const until = to.value && to.value >= since ? to.value : since;
+    State.range = { since, until };
+    refreshWindow();
+  });
+
+  // ‹ › step one day at a time through history — the fastest way to answer
+  // "was yesterday a fluke or is this a trend?"
+  const step = dir => {
+    const base = State.range ? State.range.until : todayInAccountTz(0);
+    const d = new Date(base + 'T12:00:00');
+    d.setDate(d.getDate() + dir);
+    const day = d.toISOString().slice(0, 10);
+    if (day > todayInAccountTz(0)) return;         // no future days
+    State.range = { since: day, until: day };
+    from.value = day; to.value = day;
+    refreshWindow();
+  };
+  const prev = document.getElementById('date-prev');
+  const next = document.getElementById('date-next');
+  prev && prev.addEventListener('click', () => step(-1));
+  next && next.addEventListener('click', () => step(1));
+}
+
+function refreshWindow() {
+  renderDateBar();
+  if (State.live) syncMetaAPI(); else loadData();
+}
+
+function renderDateBar() {
+  const preset = LS.get('meta_date_preset', 'today');
+  document.querySelectorAll('.date-btn[data-preset]').forEach(b =>
+    b.classList.toggle('active', !State.range && b.dataset.preset === preset));
+
+  const note = document.getElementById('date-note');
+  if (!note) return;
+  const tzName = State.accountTz ? State.accountTz.split('/').pop().replace(/_/g, ' ') : null;
+
+  if (State.range) {
+    note.innerHTML = `Showing <strong>${esc(windowLabel())}</strong>` +
+      (tzName ? ` in ${esc(tzName)} time.` : '.') +
+      ` Verdicts still follow the ${esc(activeWindow())} read.`;
+  } else if (preset === 'today') {
+    note.innerHTML = `Showing <strong>today so far</strong>` + (tzName ? ` (${esc(tzName)} time)` : '') +
+      `. This is a part-day — the day-1 thresholds read it against how much of the day has passed.`;
+  } else {
+    note.innerHTML = `Showing <strong>${esc(windowLabel())}</strong>. ` +
+      `Meta's multi-day windows <strong>end yesterday</strong> — today is not included.`;
+  }
+}
+
+/* ==========================================================================
+ *  ACCOUNT P&L
+ *  The single line a media buyer needs before anything else: across every
+ *  live campaign, am I up or down right now, and by how much?
+ *  Profit is summed per campaign because each has its own margin — a
+ *  blended margin across different products would be meaningless.
+ * ========================================================================== */
+function renderPnl() {
+  const el = document.getElementById('pnl-bar');
+  if (!el) return;
+  const live = (State.campaigns || []).filter(c => (c.status || '').toUpperCase() === 'ACTIVE' || c.spend > 0);
+  if (!live.length) { el.innerHTML = ''; el.style.display = 'none'; return; }
+  el.style.display = '';
+
+  let spend = 0, revenue = 0, purchases = 0, profit = 0, haveMargin = false;
+  live.forEach(c => {
+    const { ber } = berFor(c);
+    spend += c.spend || 0; revenue += c.revenue || 0; purchases += c.purchases || 0;
+    if (ber > 0) { haveMargin = true; profit += (c.revenue || 0) / ber - (c.spend || 0); }
+  });
+
+  const roas = spend > 0 ? revenue / spend : 0;
+  const cpa = purchases > 0 ? spend / purchases : null;
+  const cur = State.currency;
+  const tone = profit > 0 ? 'good' : profit < 0 ? 'bad' : 'warn';
+  const cell = (label, value, sub, cls) =>
+    `<div class="pnl-cell ${cls || ''}"><span class="pnl-label">${esc(label)}</span>` +
+    `<span class="pnl-value ${cls === 'good' || cls === 'bad' ? cls : ''}">${value}</span>` +
+    `<span class="pnl-sub">${sub || ''}</span></div>`;
+
+  el.innerHTML =
+    cell('Spend', money(spend, cur), `${live.length} campaign${live.length > 1 ? 's' : ''} · ${esc(windowLabel())}`, 'lead') +
+    cell('Revenue', money(revenue, cur), `${purchases} order${purchases === 1 ? '' : 's'}`) +
+    cell('Blended ROAS', roas ? roas.toFixed(2) : '—', roas ? 'revenue ÷ spend' : 'no sales yet') +
+    (haveMargin
+      ? cell('Profit', (profit >= 0 ? '+' : '') + money(profit, cur),
+             profit >= 0 ? 'after product cost and fees' : 'you are losing money right now', tone)
+      : cell('Profit', '—', 'set BER in campaign names', 'warn')) +
+    cell('CPA', cpa === null ? '—' : money(cpa, cur), cpa === null ? 'no orders yet' : 'cost per order');
+}
+
+
 function renderAll() {
+  renderDateBar();
+  renderPnl();
   computeVerdicts();
   renderCommandBar();
   renderVerdicts();
