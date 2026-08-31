@@ -616,3 +616,58 @@ th.highlight-col { border-bottom: 2px solid var(--accent-primary) !important; }
   .details-row { display: table-row !important; }
   .kpi-value, .vstat-val, .bud-to { color: #000 !important; }
 }
+/* ==========================================================================
+   DATE BAR — pick any day or range, not just the three read windows
+   ========================================================================== */
+.date-bar{display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between;
+  padding:14px 18px;margin-bottom:10px}
+.date-bar-left{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.date-bar-right{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.date-presets{display:flex;gap:6px;flex-wrap:wrap}
+.date-btn{border:1px solid var(--border,#d8dee6);background:var(--surface,#fff);
+  color:var(--text,#1a2029);border-radius:8px;padding:6px 11px;font-size:12.5px;font-weight:600;
+  cursor:pointer;transition:background .12s,border-color .12s,color .12s;white-space:nowrap}
+.date-btn:hover{background:var(--surface-2,#f2f5f9);border-color:var(--accent,#4c7ef3)}
+.date-btn.active{background:var(--accent,#4c7ef3);border-color:var(--accent,#4c7ef3);color:#fff}
+.date-btn-nav{font-size:16px;line-height:1;padding:5px 10px;font-weight:700}
+.date-input{border:1px solid var(--border,#d8dee6);background:var(--surface,#fff);color:var(--text,#1a2029);
+  border-radius:8px;padding:5px 8px;font-size:12.5px;font-family:inherit}
+.date-sep{opacity:.5;font-size:12px}
+.date-note{margin:0 0 16px;font-size:12.5px;opacity:.75;line-height:1.5}
+.date-note strong{opacity:1}
+
+/* ==========================================================================
+   ACCOUNT P&L — the one number that says whether today is working
+   ========================================================================== */
+.pnl-bar{display:flex;flex-wrap:wrap;gap:10px;align-items:stretch;padding:16px 18px;margin-bottom:12px}
+.pnl-cell{flex:1 1 130px;min-width:120px;display:flex;flex-direction:column;gap:3px;
+  padding:8px 12px;border-left:3px solid var(--border,#d8dee6)}
+.pnl-cell.lead{border-left-color:var(--accent,#4c7ef3)}
+.pnl-cell.good{border-left-color:var(--success,#1f9d55)}
+.pnl-cell.bad{border-left-color:var(--danger,#d64545)}
+.pnl-cell.warn{border-left-color:var(--warning,#c98a12)}
+.pnl-label{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;opacity:.62;font-weight:700}
+.pnl-value{font-size:21px;font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums}
+.pnl-sub{font-size:11.5px;opacity:.7;line-height:1.35}
+.pnl-value.good{color:var(--success,#1f9d55)}
+.pnl-value.bad{color:var(--danger,#d64545)}
+
+/* Stale-data banner: real numbers stay on screen, we just say they are old. */
+.stale-banner{display:flex;align-items:center;gap:10px;padding:10px 16px;margin-bottom:12px;
+  border-radius:10px;font-size:13px;font-weight:600;
+  background:rgba(201,138,18,.12);border:1px solid rgba(201,138,18,.35);color:var(--warning,#8a5f06)}
+.stale-banner button{margin-left:auto}
+
+/* Token status — say what Meta actually reports, not what we assume. */
+.token-status{margin-top:8px;display:flex;flex-direction:column;gap:3px;font-size:12px;line-height:1.45}
+.token-ok{color:var(--success,#1f9d55);font-weight:600}
+.token-warn{color:var(--warning,#c98a12);font-weight:600}
+.token-bad{color:var(--danger,#d64545);font-weight:600}
+.token-hint{opacity:.75}
+
+/* Broken funnel stage — the finding that outranks every other number. */
+.broken-alert{margin:10px 0 4px;padding:10px 13px;border-radius:9px;font-size:12.5px;line-height:1.5;
+  background:rgba(214,69,69,.10);border:1px solid rgba(214,69,69,.35);color:var(--danger,#a32b2b)}
+.broken-alert strong{display:block;margin-bottom:2px}
+.vstat.tone-good .vstat-val{color:var(--success,#1f9d55)}
+.vstat.tone-bad .vstat-val{color:var(--danger,#d64545)}
