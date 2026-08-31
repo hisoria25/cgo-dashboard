@@ -276,6 +276,108 @@
   }
 
   /* ------------------------------------------------------------------
+     5b. BREAK-EVEN CPA
+     ------------------------------------------------------------------
+     ROAS tells you whether you are winning. Break-even CPA tells you by
+     how much, in the unit you actually bid in. maxCPA is the most you can
+     pay for a customer and still not lose money:
+
+       maxCPA = AOV x grossMargin        (and BER = 1 / grossMargin)
+
+     headroom is how much room is left before the campaign turns. A
+     campaign at 30% headroom can absorb a CPM rise; one at 1% cannot.
+     ------------------------------------------------------------------ */
+  function cpaPicture(c, grossMargin) {
+    const spend = num(c.spend), purchases = num(c.purchases), revenue = num(c.revenue);
+    const aov = purchases > 0 ? revenue / purchases : 0;
+    const cpa = purchases > 0 ? spend / purchases : null;
+    const maxCPA = aov > 0 && grossMargin > 0 ? aov * grossMargin : null;
+    return {
+      cpa: cpa === null ? null : round2(cpa),
+      aov: round2(aov),
+      maxCPA: maxCPA === null ? null : round2(maxCPA),
+      // Positive = room to spend more per customer. Negative = losing money.
+      headroomPct: (cpa !== null && maxCPA) ? round1(((maxCPA - cpa) / maxCPA) * 100) : null,
+      profit: maxCPA !== null ? round2((maxCPA - cpa) * purchases) : null
+    };
+  }
+
+  /* ------------------------------------------------------------------
+     5c. DAY PACING
+     ------------------------------------------------------------------
+     You cannot judge a running day by its spend alone. At 11:00 a €40
+     spend means something very different than at 23:00. This projects
+     where the day lands so the day-1 thresholds are read in context.
+     Meta's delivery is not linear, but it is close enough to linear
+     after the first couple of hours to be a useful guide — and being
+     roughly right beats being precisely blind.
+     ------------------------------------------------------------------ */
+  function dayPacing(c, ctx) {
+    if (!ctx || typeof ctx.accountHour !== 'number') return null;
+    const elapsed = ctx.accountHour + (ctx.accountMinute || 0) / 60;
+    if (elapsed < 1) return null;                 // too early to extrapolate
+    const fraction = elapsed / 24;
+    const spend = num(c.spend), budget = num(c.budget);
+    const projectedSpend = round2(spend / fraction);
+    return {
+      elapsedHours: round1(elapsed),
+      dayFractionPct: round1(fraction * 100),
+      projectedSpend,
+      // Under-delivery: budget it is not managing to spend.
+      budgetUsedPct: budget > 0 ? round1((spend / budget) * 100) : null,
+      willUnderDeliver: budget > 0 && projectedSpend < budget * RULES.pacing.underDelivering,
+      projectedPurchases: spend > 0 ? round1(num(c.purchases) / fraction) : 0
+    };
+  }
+
+  /* ------------------------------------------------------------------
+     5d. BROKEN FUNNEL STAGE
+     ------------------------------------------------------------------
+     Different from biggestLeak, which grades a stage as weak. This finds
+     a stage that is flatly DEAD — zero events where the stage above it
+     produced plenty. That is a bug on the page, not a bad offer, and no
+     budget or price change will touch it. Learned the hard way: 11 carts
+     and 0 checkouts is a broken button, not a pricing objection.
+     ------------------------------------------------------------------ */
+  const STAGE_MIN = 8;       // mid-funnel: this many above, zero below = broken
+  const PURCHASE_MIN = 12;   // the purchase step needs more evidence, see below
+
+  /* opts.includePurchaseStep — the checkout→purchase step is the one
+     ambiguous link. Zero purchases from a handful of checkouts can be a
+     dead payment provider OR simply a price objection, which the sheet
+     already handles with a price drop. So day-1 triage looks only at the
+     unambiguous mid-funnel steps; the account-wide alarm looks at all of
+     them and says what it sees. */
+  function brokenStage(c, opts) {
+    const includePurchase = !opts || opts.includePurchaseStep !== false;
+    const clicks = num(c.clicks), lpv = num(c.lpv), atc = num(c.atc),
+          ic = num(c.ic), purchases = num(c.purchases);
+    const chain = [
+      { from: 'clicks',    to: 'landing page views', up: clicks, down: lpv,
+        msg: 'Clicks are not turning into page views. The page is not loading — check the domain, the redirect and load speed.' },
+      { from: 'page views', to: 'add-to-carts', up: lpv, down: atc,
+        msg: 'Page views produce no add-to-carts. Either the button is broken or the add-to-cart event is not firing.' },
+      { from: 'add-to-carts', to: 'checkouts', up: atc, down: ic,
+        msg: 'Carts never reach checkout. The checkout button or its event is broken — a discount cannot fix this.' },
+      { from: 'checkouts', to: 'purchases', up: ic, down: purchases, purchaseStep: true,
+        msg: 'Checkouts never complete. Check the payment providers — Klarna, PayPal and Stripe — and the purchase event.' }
+    ];
+    for (let i = 0; i < chain.length; i++) {
+      const st = chain[i];
+      if (st.purchaseStep && !includePurchase) continue;
+      const floor = st.purchaseStep ? PURCHASE_MIN : STAGE_MIN;
+      if (st.up < floor || st.down !== 0) continue;
+      // A zero stage with live traffic BELOW it is a skipped step, not a
+      // broken one. Funnelish one-page funnels go straight to checkout, so
+      // they never fire add-to-cart — that is architecture, not a bug.
+      const downstreamAlive = chain.slice(i + 1).some(later => later.down > 0);
+      if (downstreamAlive) continue;
+      return { from: st.from, to: st.to, upCount: st.up, message: st.msg, purchaseStep: !!st.purchaseStep };
+    }
+    return null;
+  }
+
+  /* ------------------------------------------------------------------
      6. THE VERDICT
      ------------------------------------------------------------------
      campaign = {
@@ -288,8 +390,11 @@
      }
      ctx = { ber, grossMargin, window, isSaturday, isSunday, currency }
      ------------------------------------------------------------------ */
+  let _ctx = null;   // set by verdict(), read by build() for pacing/economics
+
   function verdict(campaign, ctx) {
     const c = normalizeCampaign(campaign);
+    _ctx = ctx || {};
     const ber = num(ctx.ber);
     const gm = ctx.grossMargin || grossMarginFromBer(ber);
     const win = ctx.window || 'midnight';
@@ -382,15 +487,15 @@
         }
         // High ATC but nobody reaches checkout is a broken funnel, not a
         // price objection — dropping the price on it just burns €30 more.
-        const stalled = c.atc >= 5 && c.ic === 0;
-        if (stalled) {
+        const broken = brokenStage(c, { includePurchaseStep: false });
+        if (broken) {
           return build('KILL', c, {
-            headline: 'Stop it — the checkout is not receiving anyone',
+            headline: `Stop it — ${broken.to} are not happening at all`,
             newBudget: 0,
             reasons: [
-              `${money(c.spend, ctx.currency)} spent, 0 sales, and ${c.atc} add-to-carts produced 0 checkouts.`,
-              'Cart-to-checkout is 0%. That is a broken step, not a price objection — a discount cannot fix it.',
-              'Pause it, fix the checkout, then retest at full price.'
+              `${money(c.spend, ctx.currency)} spent, 0 sales, and ${broken.upCount} ${broken.from} produced 0 ${broken.to}.`,
+              broken.message,
+              'Pause it, fix that step, then retest at full price.'
             ],
             rule: 'Adspend ≤ 40 and 0 sales → kill; price drop only applies when the funnel still works'
           }, f, margin, ber);
@@ -780,7 +885,13 @@
           ? round2((c.revenue / c.purchases) * (ber > 0 ? 1 / ber : 0))
           : null,
         pacingPct: c.budget > 0 ? Math.round((c.spend / c.budget) * 100) : null,
-        learning: c.learning
+        learning: c.learning,
+        // Profit and headroom in euros — what ROAS actually means in the bank.
+        aov: cpaPicture(c, ber > 0 ? 1 / ber : 0).aov,
+        headroomPct: cpaPicture(c, ber > 0 ? 1 / ber : 0).headroomPct,
+        profit: cpaPicture(c, ber > 0 ? 1 / ber : 0).profit,
+        pacing: dayPacing(c, _ctx),
+        broken: brokenStage(c)
       },
       funnel: f
     };
@@ -802,7 +913,8 @@
 
   return {
     RULES, economics, netMarginPct, grossMarginFromBer, parseCampaignName,
-    clockIn, detectWindow, dayContext, funnel, biggestLeak, verdict, guardrails, deliveryAlarms, productLabel,
+    clockIn, detectWindow, dayContext, funnel, biggestLeak,
+    cpaPicture, dayPacing, brokenStage, verdict, guardrails, deliveryAlarms, productLabel,
     countUnprofitableStreak, countProfitableStreak, money
   };
 });
