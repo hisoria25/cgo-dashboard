@@ -185,19 +185,48 @@
   /* ------------------------------------------------------------------
      4. CHECK WINDOW — which of the 3 daily reads are we in?
      ------------------------------------------------------------------ */
-  function detectWindow(date = new Date()) {
-    const h = date.getHours();
-    const m = date.getMinutes();
+  /* The read windows must follow the AD ACCOUNT's clock, not the laptop's.
+     Meta rolls the advertising day over in the account timezone, so that is
+     the only clock the daily rules mean anything against. Reading the browser
+     clock instead silently shifts every window by your UTC offset — sitting
+     in the browser (UTC+3) against a Berlin account (UTC+2) tips you into the
+     evening read an hour early, every single day, which suppresses the
+     day-1 kill and price-drop calls. */
+  function clockIn(date, tz) {
+    if (!tz) return { h: date.getHours(), m: date.getMinutes(), dow: date.getDay() };
+    try {
+      const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: tz, hour: '2-digit', minute: '2-digit',
+        weekday: 'short', hour12: false
+      }).formatToParts(date);
+      const get = t => (parts.find(p => p.type === t) || {}).value;
+      const DOW = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+      let h = parseInt(get('hour'), 10);
+      if (!isFinite(h)) h = date.getHours();
+      if (h === 24) h = 0;
+      const m = parseInt(get('minute'), 10);
+      const dow = DOW[get('weekday')];
+      return { h, m: isFinite(m) ? m : 0, dow: dow === undefined ? date.getDay() : dow };
+    } catch (e) {
+      return { h: date.getHours(), m: date.getMinutes(), dow: date.getDay() };
+    }
+  }
+
+  function detectWindow(date = new Date(), tz = null) {
+    const { h, m } = clockIn(date, tz);
     if (h >= 9 && h < 15) return 'morning';                 // ~11:00 read
     if (h >= 15 && (h < 23 || (h === 23 && m < 30))) return 'evening';
     return 'midnight';                                       // 23:30 – 08:59
   }
 
-  function dayContext(date = new Date()) {
-    const dow = date.getDay();                               // 0 Sun … 6 Sat
+  function dayContext(date = new Date(), tz = null) {
+    const { h, m, dow } = clockIn(date, tz);                 // 0 Sun … 6 Sat
     return {
       date,
-      window: detectWindow(date),
+      tz,
+      accountHour: h,
+      accountMinute: m,
+      window: detectWindow(date, tz),
       isSaturday: dow === 6,
       isSunday: dow === 0,
       isWeekend: dow === 6 || dow === 0
@@ -328,58 +357,85 @@
        Day-1 triage. On later days the morning read is diagnostic only —
        budget moves happen after midnight.
        ================================================================= */
-    if (win === 'morning') {
-      if (c.daysLive <= 1) {
-        // 40€ spent, no sales
-        if (c.spend >= RULES.day1.decisionSpend && c.purchases === 0) {
-          const atcRate = f.offer.value;
-          if (atcRate < RULES.day1.atcRateLow) {
-            return build('KILL', c, {
-              headline: 'Kill it',
-              newBudget: 0,
-              reasons: [
-                `${money(c.spend, ctx.currency)} spent, 0 sales.`,
-                `Add-to-cart rate is ${atcRate}% — under ${RULES.day1.atcRateLow}%. Nobody wants the offer.`
-              ],
-              rule: 'Adspend ≤ 40 and 0 sales with low ATC rate → KILL CAMPAIGN'
-            }, f, margin, ber);
-          }
-          return build('PRICE_DROP', c, {
-            headline: 'Cut the price 20–30%, give it €30 more',
-            newBudget: c.budget,
-            reasons: [
-              `${money(c.spend, ctx.currency)} spent, 0 sales — but ATC rate is ${atcRate}%, which is healthy.`,
-              'People want it, the price is the blocker. Drop the price 20–30% and allow another €30 of spend.',
-              'Still no sale after that extra €30 → kill it.'
-            ],
-            rule: 'Adspend ≤ 40 and 0 sales with high ATC rate → lower price 20-30%, spend another 30'
-          }, f, margin, ber);
-        }
-        // sales are coming in — let it prove itself
-        if (c.purchases >= 1 && c.spend < RULES.day1.proveWindow[0]) {
-          return build('PROVE', c, {
-            headline: `Let it run to €${RULES.day1.proveWindow[0]}–${RULES.day1.proveWindow[1]}`,
-            newBudget: c.budget,
-            reasons: [
-              `${c.purchases} sale${c.purchases > 1 ? 's' : ''} at ${money(c.spend, ctx.currency)}. Do not touch the budget.`,
-              `By ${money(RULES.day1.proveWindow[1], ctx.currency)} it must be at or above break-even (ROAS ${ber.toFixed(2)}) or it dies tonight.`
-            ],
-            rule: 'Adspend ≤ 40 and 1+ sales → let it spend until 80-90'
-          }, f, margin, ber);
-        }
-        // past the prove window
-        if (c.spend >= RULES.day1.proveWindow[0] && !profitable) {
+    /* Day-1 triage is driven by SPEND, not by the clock. A day-1 campaign
+       that has burnt past the decision threshold with no sales is the same
+       emergency at 15:30 as it is at 11:00, so this runs in the morning AND
+       evening reads. Previously it lived only inside the morning branch,
+       which meant opening the dashboard after 15:00 replaced a KILL with a
+       funnel diagnosis and never mentioned the campaign should be closed. */
+    const dayOne = () => {
+      if (c.daysLive > 1) return null;
+
+      // decision threshold reached, no sales
+      if (c.spend >= RULES.day1.decisionSpend && c.purchases === 0) {
+        const atcRate = f.offer.value;
+        if (atcRate < RULES.day1.atcRateLow) {
           return build('KILL', c, {
             headline: 'Kill it',
             newBudget: 0,
             reasons: [
-              `${money(c.spend, ctx.currency)} spent and ROAS ${c.roas.toFixed(2)} is still below break-even ${ber.toFixed(2)}.`,
-              'It had its chance in the 80–90 window.'
+              `${money(c.spend, ctx.currency)} spent, 0 sales.`,
+              `Add-to-cart rate is ${atcRate}% — under ${RULES.day1.atcRateLow}%. Nobody wants the offer.`
             ],
-            rule: 'By 80-90 it should be profitable or break-even. If not → KILL CAMPAIGN'
+            rule: 'Adspend ≤ 40 and 0 sales with low ATC rate → KILL CAMPAIGN'
           }, f, margin, ber);
         }
+        // High ATC but nobody reaches checkout is a broken funnel, not a
+        // price objection — dropping the price on it just burns €30 more.
+        const stalled = c.atc >= 5 && c.ic === 0;
+        if (stalled) {
+          return build('KILL', c, {
+            headline: 'Stop it — the checkout is not receiving anyone',
+            newBudget: 0,
+            reasons: [
+              `${money(c.spend, ctx.currency)} spent, 0 sales, and ${c.atc} add-to-carts produced 0 checkouts.`,
+              'Cart-to-checkout is 0%. That is a broken step, not a price objection — a discount cannot fix it.',
+              'Pause it, fix the checkout, then retest at full price.'
+            ],
+            rule: 'Adspend ≤ 40 and 0 sales → kill; price drop only applies when the funnel still works'
+          }, f, margin, ber);
+        }
+        return build('PRICE_DROP', c, {
+          headline: 'Cut the price 20–30%, give it €30 more',
+          newBudget: c.budget,
+          reasons: [
+            `${money(c.spend, ctx.currency)} spent, 0 sales — but ATC rate is ${atcRate}%, which is healthy.`,
+            'People want it, the price is the blocker. Drop the price 20–30% and allow another €30 of spend.',
+            'Still no sale after that extra €30 → kill it.'
+          ],
+          rule: 'Adspend ≤ 40 and 0 sales with high ATC rate → lower price 20-30%, spend another 30'
+        }, f, margin, ber);
       }
+      // sales are coming in — let it prove itself
+      if (c.purchases >= 1 && c.spend < RULES.day1.proveWindow[0]) {
+        return build('PROVE', c, {
+          headline: `Let it run to €${RULES.day1.proveWindow[0]}–${RULES.day1.proveWindow[1]}`,
+          newBudget: c.budget,
+          reasons: [
+            `${c.purchases} sale${c.purchases > 1 ? 's' : ''} at ${money(c.spend, ctx.currency)}. Do not touch the budget.`,
+            `By ${money(RULES.day1.proveWindow[1], ctx.currency)} it must be at or above break-even (ROAS ${ber.toFixed(2)}) or it dies tonight.`
+          ],
+          rule: 'Adspend ≤ 40 and 1+ sales → let it spend until 80-90'
+        }, f, margin, ber);
+      }
+      // past the prove window
+      if (c.spend >= RULES.day1.proveWindow[0] && !profitable) {
+        return build('KILL', c, {
+          headline: 'Kill it',
+          newBudget: 0,
+          reasons: [
+            `${money(c.spend, ctx.currency)} spent and ROAS ${c.roas.toFixed(2)} is still below break-even ${ber.toFixed(2)}.`,
+            'It had its chance in the 80–90 window.'
+          ],
+          rule: 'By 80-90 it should be profitable or break-even. If not → KILL CAMPAIGN'
+        }, f, margin, ber);
+      }
+      return null;
+    };
+
+    if (win === 'morning') {
+      const d1 = dayOne();
+      if (d1) return d1;
       // Day 2+ morning = watch only
       return build('MONITOR', c, {
         headline: profitable ? 'On track — no midday changes' : 'Watch it — decision comes tonight',
@@ -398,6 +454,8 @@
        fix on the page, not what to do with money.
        ================================================================= */
     if (win === 'evening') {
+      const d1 = dayOne();
+      if (d1) return d1;
       const leak = biggestLeak(f);
       return build('DIAGNOSE', c, {
         headline: leak ? `Fix: ${stageLabel(leak.stage)}` : 'Funnel is clean',
@@ -744,7 +802,7 @@
 
   return {
     RULES, economics, netMarginPct, grossMarginFromBer, parseCampaignName,
-    detectWindow, dayContext, funnel, biggestLeak, verdict, guardrails, deliveryAlarms, productLabel,
+    clockIn, detectWindow, dayContext, funnel, biggestLeak, verdict, guardrails, deliveryAlarms, productLabel,
     countUnprofitableStreak, countProfitableStreak, money
   };
 });
