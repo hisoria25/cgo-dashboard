@@ -239,11 +239,11 @@ function renderCommandBar() {
   // verdict tally
   const counts = {};
   State.campaigns.forEach(c => { counts[c.verdict.code] = (counts[c.verdict.code] || 0) + 1; });
-  const order = ['KILL', 'DESCALE', 'PRICE_DROP', 'SCALE', 'SURF', 'PROVE', 'HOLD', 'MONITOR', 'DIAGNOSE', 'NEEDS_SETUP'];
+  const order = ['KILL', 'DESCALE', 'PRICE_DROP', 'SCALE', 'SURF', 'PROVE', 'HOLD', 'MONITOR', 'DIAGNOSE', 'PAUSED', 'NEEDS_SETUP'];
   const labels = { KILL: 'Kill', DESCALE: 'Descale', PRICE_DROP: 'Price drop', SCALE: 'Scale', SURF: 'Surf',
-                   PROVE: 'Prove', HOLD: 'Hold', MONITOR: 'Watch', DIAGNOSE: 'Diagnose', NEEDS_SETUP: 'Setup' };
+                   PROVE: 'Prove', HOLD: 'Hold', MONITOR: 'Watch', DIAGNOSE: 'Diagnose', PAUSED: 'Paused', NEEDS_SETUP: 'Setup' };
   const tones = { KILL: 'danger', DESCALE: 'warning', PRICE_DROP: 'warning', SCALE: 'success', SURF: 'success',
-                  PROVE: 'success', HOLD: 'neutral', MONITOR: 'neutral', DIAGNOSE: 'neutral', NEEDS_SETUP: 'neutral' };
+                  PROVE: 'success', HOLD: 'neutral', MONITOR: 'neutral', DIAGNOSE: 'neutral', PAUSED: 'neutral', NEEDS_SETUP: 'neutral' };
   document.getElementById('verdict-tally').innerHTML = order
     .filter(k => counts[k])
     .map(k => `<div class="tally tally-${tones[k]}"><span class="tally-num">${counts[k]}</span><span class="tally-label">${labels[k]}</span></div>`)
