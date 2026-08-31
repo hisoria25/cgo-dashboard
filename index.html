@@ -63,6 +63,7 @@
         <label for="meta-access-token">User Access Token</label>
         <input type="password" id="meta-access-token" class="search-input full" placeholder="Paste token…" />
         <span class="hint">Needs <code>ads_read</code> + <code>read_insights</code>.</span>
+        <div id="token-status" class="token-status"><!-- injected: real expiry from Meta --></div>
       </div>
 
       <div class="form-group mb14">
@@ -72,8 +73,13 @@
           <option value="yesterday">Yesterday</option>
           <option value="last_3d">Last 3 days</option>
           <option value="last_7d">Last 7 days</option>
+          <option value="last_14d">Last 14 days</option>
+          <option value="last_30d">Last 30 days</option>
+          <option value="this_month">This month</option>
+          <option value="last_month">Last month</option>
         </select>
-        <span class="hint">The kill/scale rules are daily rules. Keep this on <strong>Today</strong> unless you are reviewing history.</span>
+        <span class="hint">The kill/scale rules are daily rules. Keep this on <strong>Today</strong> unless you are reviewing history.
+          The date bar on the page changes this too.</span>
       </div>
 
       <div class="info-box">
@@ -145,6 +151,35 @@
 </div>
 
 <main class="container main-content fade-in">
+
+  <!-- ======================= DATE BAR ======================= -->
+  <div class="card date-bar">
+    <div class="date-bar-left">
+      <span class="command-eyebrow">Showing</span>
+      <div class="date-presets">
+        <button class="date-btn" data-preset="today">Today</button>
+        <button class="date-btn" data-preset="yesterday">Yesterday</button>
+        <button class="date-btn" data-preset="last_3d">3 days</button>
+        <button class="date-btn" data-preset="last_7d">7 days</button>
+        <button class="date-btn" data-preset="last_14d">14 days</button>
+        <button class="date-btn" data-preset="last_30d">30 days</button>
+        <button class="date-btn" data-preset="this_month">This month</button>
+        <button class="date-btn" data-preset="last_month">Last month</button>
+      </div>
+    </div>
+    <div class="date-bar-right">
+      <button class="date-btn date-btn-nav" id="date-prev" title="Previous day">‹</button>
+      <input type="date" id="date-from" class="date-input" aria-label="From date">
+      <span class="date-sep">→</span>
+      <input type="date" id="date-to" class="date-input" aria-label="To date">
+      <button class="date-btn date-btn-nav" id="date-next" title="Next day">›</button>
+      <button class="btn btn-small" id="date-apply">Apply</button>
+    </div>
+  </div>
+  <p id="date-note" class="date-note"><!-- injected --></p>
+
+  <!-- ======================= ACCOUNT P&L ======================= -->
+  <div class="card pnl-bar" id="pnl-bar"><!-- injected --></div>
 
   <!-- ======================= COMMAND BAR ======================= -->
   <div class="card command-bar">
