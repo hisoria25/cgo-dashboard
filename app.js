@@ -857,13 +857,22 @@ function computeVerdicts() {
     c.profitableStreak = VE.countProfitableStreak(c.history, ber);
     c.berSource = source;
     c.surfedRecently = ['SURF', 'SCALE'].includes(entry.lastCode) && daysAgo(entry.last) <= 2;
+    // Spread the whole day context so accountHour/accountMinute reach the
+    // pacing projection; `window` still comes from the tab the user picked.
     c.verdict = VE.verdict(c, {
+      ...ctxDay,
       ber, grossMargin, window: win,
-      isSaturday: ctxDay.isSaturday, isSunday: ctxDay.isSunday,
       learning: c.learning,
       currency: State.currency
     });
     c.lastAction = entry.last || null;
+
+    // Was an action already applied for the exact day being judged?
+    const judged = judgedDateKey();
+    c.appliedAction = judged
+      ? (entry.applied && entry.applied[judged])
+        || (entry.last === judged ? { code: entry.lastCode || 'UNKNOWN' } : null)
+      : null;
   });
 
   State.multiAccount = new Set(State.campaigns.map(c => c.accountId).filter(Boolean)).size > 1;
@@ -909,6 +918,10 @@ function sparkline(series, ber) {
     </div>`;
 }
 
+const VERDICT_LABEL = { SCALE: 'Scale', SURF: 'Surf', DESCALE: 'Descale', KILL: 'Kill',
+  PRICE_DROP: 'Price drop', PROVE: 'Prove', HOLD: 'Hold', MONITOR: 'Watch',
+  DIAGNOSE: 'Diagnose', PAUSED: 'Paused', NEEDS_SETUP: 'Setup', UNKNOWN: 'an action' };
+
 function renderVerdicts() {
   const grid = document.getElementById('verdict-grid');
   if (!State.campaigns.length) {
@@ -942,7 +955,7 @@ function renderVerdicts() {
     const roasTone = m.ber && m.roas >= m.ber ? 'success' : 'danger';
 
     return `
-      <article class="card verdict-card tone-${v.tone}">
+      <article class="card verdict-card tone-${v.tone}${c.appliedAction ? ' is-applied' : ''}${isPastWindow() ? ' is-past' : ''}">
         <header class="verdict-head">
           <div class="verdict-name">
             <h3>${esc(VE.productLabel(c.name))}</h3>
@@ -953,6 +966,12 @@ function renderVerdicts() {
         </header>
 
         ${budgetLine}
+
+        ${c.appliedAction ? `<div class="applied-note">
+            \u2713 <strong>Already applied.</strong> You marked ${esc(VERDICT_LABEL[c.appliedAction.code] || c.appliedAction.code)} as done for ${esc(windowLabel())}. The budget above is what you changed it to \u2014 not a new instruction.
+          </div>` : isPastWindow() ? `<div class="past-note">
+            \u1F4C5 Reviewing a closed window. This is what the rule said at the time; it is not something to act on now.
+          </div>` : ''}
 
         <div class="verdict-stats">
           <div class="vstat tone-${roasTone}"><span class="vstat-val">${m.roas.toFixed(2)}</span><span class="vstat-cap">ROAS</span></div>
@@ -995,7 +1014,9 @@ function renderVerdicts() {
           <span class="verdict-rule">📖 ${esc(v.rule)}</span>
           <div class="verdict-actions">
             <button class="btn-mini" onclick="editBer('${c.id}')">Set BER</button>
-            ${v.budgetTo !== null ? `<button class="btn-mini primary" onclick="markApplied('${c.id}','${v.code}')">${c.lastAction === todayKey() ? '✓ Done today' : 'Mark applied'}</button>` : ''}
+            ${v.budgetTo !== null && isSingleDayWindow()
+              ? `<button class="btn-mini ${c.appliedAction ? '' : 'primary'}" onclick="markApplied('${c.id}','${v.code}')">${c.appliedAction ? '\u2713 Applied \u00b7 undo' : 'Mark applied'}</button>`
+              : ''}
           </div>
         </footer>
       </article>`;
@@ -1003,6 +1024,29 @@ function renderVerdicts() {
 }
 
 function todayKey() { return new Date().toISOString().slice(0, 10); }
+
+/* The day a verdict actually belongs to — the last day inside the window
+   being judged, on the ACCOUNT's calendar. Applied actions are logged
+   against this, never against "today". Logging against today meant that
+   opening yesterday tomorrow showed the action as undone, and the card
+   cheerfully told you to scale a budget you had already scaled.
+   A multi-day window returns null: there is no single day to apply an
+   action to, so those windows are review-only. */
+function judgedDateKey() {
+  if (State.range) return State.range.since === State.range.until ? State.range.until : null;
+  const preset = LS.get('meta_date_preset', 'today');
+  if (preset === 'today') return todayInAccountTz(0);
+  if (preset === 'yesterday') return todayInAccountTz(-1);
+  return null;
+}
+function isSingleDayWindow() { return judgedDateKey() !== null; }
+
+/* Reading a window that has already closed. The budget numbers on those
+   cards are a record of what the rule said that day, not an instruction. */
+function isPastWindow() {
+  const day = judgedDateKey();
+  return day ? day < todayInAccountTz(0) : LS.get('meta_date_preset', 'today') !== 'today';
+}
 function daysAgo(key) {
   if (!key) return 999;
   const d = (Date.now() - new Date(key + 'T00:00:00').getTime()) / 86400000;
@@ -1010,12 +1054,34 @@ function daysAgo(key) {
 }
 
 function markApplied(id, code) {
+  const day = judgedDateKey();
+  if (!day) return;                         // multi-day windows are review-only
   const log = actionLog();
   const entry = log[id] || { descaleCount: 0 };
-  entry.last = todayKey();
-  entry.lastCode = code;
-  if (code === 'DESCALE') entry.descaleCount = (entry.descaleCount || 0) + 1;
-  if (code === 'SCALE' || code === 'SURF') entry.descaleCount = 0;
+  entry.applied = entry.applied || {};
+
+  // Carry forward the old single-slot shape so nothing already logged is lost.
+  if (entry.last && !entry.applied[entry.last]) {
+    entry.applied[entry.last] = { code: entry.lastCode || 'UNKNOWN' };
+  }
+
+  // Clicking again un-marks it — a mis-click should be recoverable.
+  if (entry.applied[day]) delete entry.applied[day];
+  else entry.applied[day] = { code, at: new Date().toISOString() };
+
+  const days = Object.keys(entry.applied).sort();
+  const latest = days[days.length - 1];
+  entry.last = latest || null;
+  entry.lastCode = latest ? entry.applied[latest].code : null;
+
+  // Consecutive descales, counted from what was actually applied.
+  entry.descaleCount = days.reduce((n, k) => {
+    const cd = entry.applied[k].code;
+    if (cd === 'DESCALE') return n + 1;
+    if (cd === 'SCALE' || cd === 'SURF') return 0;
+    return n;
+  }, 0);
+
   log[id] = entry;
   saveActionLog(log);
   renderAll();
