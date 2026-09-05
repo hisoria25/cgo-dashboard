@@ -74,6 +74,11 @@
       maxActiveCampaignsPerAccount: 3,      // ban prevention
       creativeRefreshAfterProfitableDays: 3
     },
+    /* Refunds and chargebacks. Meta books revenue at the moment of purchase
+       and never takes it back; your bank does. Everything the engine judges is
+       computed on revenue AFTER this haircut, so ROAS, margin, profit and CPA
+       headroom all describe money you keep rather than money that arrived. */
+    refunds: { rate: 0, max: 0.9 },
     // Consistency floor: never act on noise
     minSpendForVerdict: 5
   };
@@ -88,7 +93,7 @@
      The last identity is what makes the sheet self-consistent:
      ROAS > BER  <=>  netMargin > 0.
      ------------------------------------------------------------------ */
-  function economics({ price = 0, cogs = 0, shipping = 0, feePct = 0 }) {
+  function economics({ price = 0, cogs = 0, shipping = 0, feePct = 0, refundRate = 0 }) {
     const p = num(price);
     if (p <= 0) return { price: 0, grossMargin: 0, ber: 0, valid: false };
     const fees = p * (num(feePct) / 100);
@@ -103,7 +108,51 @@
       grossMargin: grossMargin,
       grossMarginPct: round1(grossMargin * 100),
       ber: grossMargin > 0 ? round2(1 / grossMargin) : 0,
+      refundRate: clampRate(refundRate),
+      berAfterRefunds: grossMargin > 0 ? berAfterRefunds(1 / grossMargin, refundRate) : 0,
       valid: grossMargin > 0
+    };
+  }
+
+  /* Break-even ROAS once refunds are taken out.
+
+       break-even means   revenue x (1 - r) x grossMargin = spend
+       so                 revenue / spend = 1 / ((1 - r) x grossMargin) = BER / (1 - r)
+
+     A 12% refund rate on a 1.58 break-even means you actually need 1.80 to
+     stand still. This is the number the sheet's rules should be read against.
+
+     It is deliberately the CONSERVATIVE form: a partial refund gives money
+     back without returning the goods, so the product and shipping you already
+     paid for are gone too. The true damage is a little worse than this. */
+  function berAfterRefunds(ber, rate) {
+    const b = num(ber), r = clampRate(rate);
+    if (b <= 0 || r <= 0) return b;
+    return round2(b / (1 - r));
+  }
+
+  function clampRate(r) {
+    const v = num(r);
+    if (!isFinite(v) || v <= 0) return 0;
+    return Math.min(v > 1 ? v / 100 : v, RULES.refunds.max);   // accept 12 or 0.12
+  }
+
+  /* Revenue you actually keep, and the ROAS that follows from it. */
+  function netOfRefunds(campaign, rate) {
+    const r = clampRate(rate);
+    if (!r) return campaign;
+    const revenue = round2(num(campaign.revenue) * (1 - r));
+    const spend = num(campaign.spend);
+    return {
+      ...campaign,
+      revenue,
+      roas: spend > 0 ? revenue / spend : 0,
+      grossRevenue: num(campaign.revenue),
+      refundRate: r,
+      history: (campaign.history || []).map(d => {
+        const rev = num(d.revenue) * (1 - r);
+        return { ...d, revenue: round2(rev), roas: num(d.spend) > 0 ? rev / num(d.spend) : 0 };
+      })
     };
   }
 
@@ -393,8 +442,9 @@
   let _ctx = null;   // set by verdict(), read by build() for pacing/economics
 
   function verdict(campaign, ctx) {
-    const c = normalizeCampaign(campaign);
     _ctx = ctx || {};
+    // Judge what you keep, not what Meta reported.
+    const c = normalizeCampaign(netOfRefunds(campaign, (ctx || {}).refundRate));
     const ber = num(ctx.ber);
     const gm = ctx.grossMargin || grossMarginFromBer(ber);
     const win = ctx.window || 'midnight';
@@ -940,6 +990,7 @@
   return {
     RULES, economics, netMarginPct, grossMarginFromBer, parseCampaignName,
     clockIn, detectWindow, dayContext, funnel, biggestLeak,
+    berAfterRefunds, netOfRefunds, clampRate,
     cpaPicture, dayPacing, brokenStage, verdict, guardrails, deliveryAlarms, productLabel,
     countUnprofitableStreak, countProfitableStreak, money
   };
