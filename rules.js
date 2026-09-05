@@ -95,7 +95,11 @@
      ------------------------------------------------------------------ */
   function economics({ price = 0, cogs = 0, shipping = 0, feePct = 0, refundRate = 0 }) {
     const p = num(price);
-    if (p <= 0) return { price: 0, grossMargin: 0, ber: 0, valid: false };
+    // The refund rate is independent of whether a price is set — it must
+    // survive this early exit, or it is silently dropped for anyone whose
+    // break-even comes from campaign names rather than this panel.
+    if (p <= 0) return { price: 0, grossMargin: 0, ber: 0,
+      refundRate: clampRate(refundRate), berAfterRefunds: 0, valid: false };
     const fees = p * (num(feePct) / 100);
     const contribution = p - num(cogs) - num(shipping) - fees;
     const grossMargin = contribution / p;
