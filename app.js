@@ -91,10 +91,11 @@ function initTheme() {
  *  UNIT ECONOMICS
  * ========================================================================== */
 function loadEconomics() {
-  const saved = LS.json('cgo_econ', { price: 29.95, cogs: 7, shipping: 2, feePct: 3 });
-  ['price', 'cogs', 'shipping', 'fees'].forEach(k => {
+  const saved = LS.json('cgo_econ', { price: 29.95, cogs: 7, shipping: 2, feePct: 3, refundRate: 0 });
+  ['price', 'cogs', 'shipping', 'fees', 'refunds'].forEach(k => {
     const el = document.getElementById('econ-' + k);
-    if (el) el.value = saved[k === 'fees' ? 'feePct' : k];
+    if (!el) return;
+    el.value = k === 'fees' ? saved.feePct : k === 'refunds' ? (saved.refundRate || 0) : saved[k];
   });
   State.econ = VE.economics(saved);
 }
@@ -104,7 +105,8 @@ function readEconomicsInputs() {
     price: parseFloat(document.getElementById('econ-price').value) || 0,
     cogs: parseFloat(document.getElementById('econ-cogs').value) || 0,
     shipping: parseFloat(document.getElementById('econ-shipping').value) || 0,
-    feePct: parseFloat(document.getElementById('econ-fees').value) || 0
+    feePct: parseFloat(document.getElementById('econ-fees').value) || 0,
+    refundRate: parseFloat((document.getElementById('econ-refunds') || {}).value) || 0
   };
 }
 
@@ -117,14 +119,23 @@ function renderEconomicsPreview() {
     return;
   }
   box.className = 'econ-result';
+  const r = e.refundRate || 0;
   box.innerHTML = `
     <div class="econ-headline">
-      <div><span class="econ-big">${e.ber.toFixed(2)}</span><span class="econ-cap">Break-even ROAS</span></div>
+      <div><span class="econ-big">${r ? e.berAfterRefunds.toFixed(2) : e.ber.toFixed(2)}</span><span class="econ-cap">${r ? 'Break-even ROAS after refunds' : 'Break-even ROAS'}</span></div>
       <div><span class="econ-big">${e.grossMarginPct}%</span><span class="econ-cap">Gross margin</span></div>
       <div><span class="econ-big">${fmtMoney(e.contribution)}</span><span class="econ-cap">Profit per order before ads</span></div>
     </div>
+    ${r ? `<p class="econ-note refunds">
+      At a <strong>${Math.round(r * 100)}%</strong> refund rate you need
+      <strong>${e.berAfterRefunds.toFixed(2)}</strong> to stand still, not ${e.ber.toFixed(2)}.
+      Every ROAS, margin and profit figure on the dashboard is now net of refunds.
+      This is the kind estimate \u2014 a partial refund returns money without returning the goods,
+      so the real damage is a little worse.
+    </p>` : ''}
     <p class="econ-note">
       Name campaigns <code>Product | ${e.ber.toFixed(2)} | ${e.grossMarginPct}</code> and every verdict reads it automatically.
+      Put the <em>full-price</em> break-even in the name \u2014 the refund rate is applied on top.
     </p>`;
 }
 
@@ -141,7 +152,7 @@ function setupModals() {
   document.querySelectorAll('.modal-overlay').forEach(m =>
     m.addEventListener('click', e => { if (e.target === m) m.classList.remove('show'); }));
 
-  ['econ-price', 'econ-cogs', 'econ-shipping', 'econ-fees'].forEach(id =>
+  ['econ-price', 'econ-cogs', 'econ-shipping', 'econ-fees', 'econ-refunds'].forEach(id =>
     document.getElementById(id).addEventListener('input', renderEconomicsPreview));
 
   document.getElementById('btn-save-econ').addEventListener('click', () => {
@@ -862,6 +873,7 @@ function computeVerdicts() {
     c.verdict = VE.verdict(c, {
       ...ctxDay,
       ber, grossMargin, window: win,
+      refundRate: (State.econ && State.econ.refundRate) || 0,
       learning: c.learning,
       currency: State.currency
     });
@@ -1777,11 +1789,13 @@ function renderPnl() {
   if (!live.length) { el.innerHTML = ''; el.style.display = 'none'; return; }
   el.style.display = '';
 
+  const refundRate = (State.econ && State.econ.refundRate) || 0;
   let spend = 0, revenue = 0, purchases = 0, profit = 0, haveMargin = false;
   live.forEach(c => {
     const { ber } = berFor(c);
-    spend += c.spend || 0; revenue += c.revenue || 0; purchases += c.purchases || 0;
-    if (ber > 0) { haveMargin = true; profit += (c.revenue || 0) / ber - (c.spend || 0); }
+    const net = (c.revenue || 0) * (1 - refundRate);      // money you keep
+    spend += c.spend || 0; revenue += net; purchases += c.purchases || 0;
+    if (ber > 0) { haveMargin = true; profit += net / ber - (c.spend || 0); }
   });
 
   const roas = spend > 0 ? revenue / spend : 0;
@@ -1794,7 +1808,9 @@ function renderPnl() {
 
   el.innerHTML =
     cell('Spend', fmtMoney(spend), `${live.length} campaign${live.length > 1 ? 's' : ''} · ${esc(windowLabel())}`, 'lead') +
-    cell('Revenue', fmtMoney(revenue), `${purchases} order${purchases === 1 ? '' : 's'}`) +
+    cell('Revenue', fmtMoney(revenue), refundRate
+        ? `${purchases} orders \u00b7 net of ${Math.round(refundRate * 100)}% refunds`
+        : `${purchases} order${purchases === 1 ? '' : 's'}`) +
     cell('Blended ROAS', roas ? roas.toFixed(2) : '—', roas ? 'revenue ÷ spend' : 'no sales yet') +
     (haveMargin
       ? cell('Profit', (profit >= 0 ? '+' : '') + fmtMoney(profit),
