@@ -671,3 +671,16 @@ th.highlight-col { border-bottom: 2px solid var(--accent-primary) !important; }
 .broken-alert strong{display:block;margin-bottom:2px}
 .vstat.tone-good .vstat-val{color:var(--success,#1f9d55)}
 .vstat.tone-bad .vstat-val{color:var(--danger,#d64545)}
+/* ==========================================================================
+   ALREADY-APPLIED / CLOSED-WINDOW STATES
+   A card whose action you have already taken must not read like a fresh
+   instruction. Mute the budget line and say so in words.
+   ========================================================================== */
+.applied-note,.past-note{margin:8px 0 2px;padding:9px 13px;border-radius:9px;
+  font-size:12.5px;line-height:1.5}
+.applied-note{background:rgba(31,157,85,.10);border:1px solid rgba(31,157,85,.32);color:var(--success,#177243)}
+.past-note{background:rgba(120,130,145,.12);border:1px solid rgba(120,130,145,.3);opacity:.9}
+.verdict-card.is-applied .verdict-budget,
+.verdict-card.is-past .verdict-budget{opacity:.45;filter:grayscale(1)}
+.verdict-card.is-applied .verdict-badge,
+.verdict-card.is-past .verdict-badge{opacity:.55}
