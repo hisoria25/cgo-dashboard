@@ -20,6 +20,7 @@ const State = {
   lpvEstimated: false,
   accountTz: null,
   range: null,          // {since,until} when a custom date range is picked
+  dateManual: false,    // true once the user picks a window themselves
   tokenInfo: null,      // ad account timezone — the only clock the daily rules mean anything against
 };
 
@@ -54,6 +55,7 @@ document.addEventListener('DOMContentLoaded', () => {
   setupDateBar();
   setupTableControls();
   setupGrader();
+  applyAutoWindow();
   loadData();
   renderTokenStatus();
   startAutoRefresh();
@@ -63,6 +65,18 @@ document.addEventListener('DOMContentLoaded', () => {
    minutes when live, and re-renders anyway so the check window rolls over on
    its own at 09:00 / 15:00 / 23:30. */
 function startAutoRefresh() {
+  /* The read window has to change by itself at 09:00, 15:00 and 23:30 on the
+     account clock. Checking once a minute costs nothing and means the page is
+     never showing yesterday's read when you glance at it. */
+  let lastAuto = autoWindow();
+  setInterval(() => {
+    if (document.hidden || State.window) return;
+    const now = autoWindow();
+    if (now === lastAuto) return;
+    lastAuto = now;
+    if (!applyAutoWindow()) renderAll();
+  }, 60 * 1000);
+
   setInterval(() => {
     if (document.hidden) return;
     if (State.live) syncMetaAPI();
@@ -225,12 +239,39 @@ function accountClock(d = new Date()) {
   return tz && tz !== localTz ? `${t} ${tz.split('/').pop().replace(/_/g, ' ')}` : t;
 }
 
-function activeWindow() { return State.window || VE.detectWindow(new Date(), State.accountTz); }
+function autoWindow() { return VE.detectWindow(new Date(), State.accountTz); }
+function activeWindow() { return State.window || autoWindow(); }
+
+/* The read window and the day being read belong together. At 00:15 the
+   midnight read is judging the day that just CLOSED, not the fifteen minutes
+   of the new one — so the date bar has to move to Yesterday with it. Getting
+   this wrong is what made "mark applied" appear not to stick: the action was
+   logged against one day and the verdict re-read on another. */
+function autoDatePresetFor(win) {
+  const h = VE.clockIn(new Date(), State.accountTz).h;
+  return (win === 'midnight' && h < 9) ? 'yesterday' : 'today';
+}
+
+/* Returns true when it kicked off a re-sync, so the caller does not also
+   re-render on top of it. */
+function applyAutoWindow() {
+  if (State.window || State.dateManual) return false;      // user is driving
+  const want = autoDatePresetFor(autoWindow());
+  if (LS.get('meta_date_preset', 'today') === want && !State.range) return false;
+  State.range = null;
+  LS.set('meta_date_preset', want);
+  const sel = document.getElementById('meta-date-preset');
+  if (sel) sel.value = want;
+  if (State.live) syncMetaAPI(); else loadData();
+  return true;
+}
 
 function setupWindowTabs() {
   document.querySelectorAll('.command-tabs .playbook-tab').forEach(tab => {
     tab.addEventListener('click', () => {
-      State.window = tab.dataset.window;
+      // Clicking the window you are actually in means "follow the clock again".
+      State.window = tab.dataset.window === autoWindow() ? null : tab.dataset.window;
+      if (!State.window) { State.dateManual = false; if (applyAutoWindow()) return; }
       renderAll();
     });
   });
@@ -239,10 +280,12 @@ function setupWindowTabs() {
 function renderCommandBar() {
   const win = activeWindow();
   const meta = WINDOW_META[win];
-  const auto = VE.detectWindow(new Date(), State.accountTz);
+  const auto = autoWindow();
+  const tzName = State.accountTz ? State.accountTz.split('/').pop().replace(/_/g, ' ') : 'account';
   document.getElementById('command-title').innerText = meta.title;
-  document.getElementById('command-sub').innerText =
-    meta.sub + (win === auto ? ' · this is where you are now' : ' · viewing out of hours');
+  document.getElementById('command-sub').innerHTML = State.window
+    ? `${esc(meta.sub)} · <strong>held open manually</strong> — tap ${esc(WINDOW_META[auto].title.replace(/^\S+\s/, ''))} to follow the clock again`
+    : `${esc(meta.sub)} · switching automatically on ${esc(tzName)} time`;
 
   document.querySelectorAll('.command-tabs .playbook-tab').forEach(t =>
     t.classList.toggle('active', t.dataset.window === win));
@@ -974,7 +1017,7 @@ function renderVerdicts() {
             <span class="verdict-fullname" title="${esc(c.name)}">${esc(c.name)}</span>
             <span class="verdict-meta">Day ${m.daysLive} · ${esc(c.status || '—')}${c.learning ? ' · <b class="learning-chip">learning</b>' : ''}${State.multiAccount && c.accountName ? ' · ' + esc(c.accountName) : ''}</span>
           </div>
-          <div class="verdict-badge tone-${v.tone}">${VERDICT_ICON[v.code] || ''} ${esc(v.headline)}</div>
+          <div class="verdict-badge tone-${c.appliedAction ? 'neutral' : v.tone}">${c.appliedAction ? '\u2713' : (VERDICT_ICON[v.code] || '')} ${esc(c.appliedAction ? v.headline + ' — done' : v.headline)}</div>
         </header>
 
         ${budgetLine}
@@ -992,6 +1035,7 @@ function renderVerdicts() {
           <div class="vstat"><span class="vstat-val">${fmtMoney(m.spend, 0)}</span><span class="vstat-cap">Spent</span></div>
           <div class="vstat"><span class="vstat-val">${m.purchases}</span><span class="vstat-cap">Sales</span></div>
           <div class="vstat ${m.frequency > VE.RULES.frequency.fatigue ? 'tone-warning' : ''}"><span class="vstat-val">${m.frequency.toFixed(2)}</span><span class="vstat-cap">Freq</span></div>
+          <div class="vstat ${m.cpa !== null && m.maxCpa ? (m.cpa <= m.maxCpa ? 'tone-good' : 'tone-bad') : ''}"><span class="vstat-val">${m.cpa === null ? '—' : fmtMoney(m.cpa)}</span><span class="vstat-cap">Cost / purchase</span></div>
           ${m.profit !== null && m.profit !== undefined
             ? `<div class="vstat tone-${m.profit >= 0 ? 'good' : 'bad'}"><span class="vstat-val">${(m.profit >= 0 ? '+' : '') + fmtMoney(m.profit, 0)}</span><span class="vstat-cap">Profit</span></div>` : ''}
           ${m.headroomPct !== null && m.headroomPct !== undefined
@@ -1711,6 +1755,7 @@ function setupDateBar() {
   document.querySelectorAll('.date-btn[data-preset]').forEach(btn => {
     btn.addEventListener('click', () => {
       State.range = null;
+      State.dateManual = true;
       LS.set('meta_date_preset', btn.dataset.preset);
       const sel = document.getElementById('meta-date-preset');
       if (sel) sel.value = btn.dataset.preset;
@@ -1727,6 +1772,7 @@ function setupDateBar() {
     const since = from.value;
     const until = to.value && to.value >= since ? to.value : since;
     State.range = { since, until };
+    State.dateManual = true;
     refreshWindow();
   });
 
@@ -1739,6 +1785,7 @@ function setupDateBar() {
     const day = d.toISOString().slice(0, 10);
     if (day > todayInAccountTz(0)) return;         // no future days
     State.range = { since: day, until: day };
+    State.dateManual = true;
     from.value = day; to.value = day;
     refreshWindow();
   };
