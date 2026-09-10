@@ -687,3 +687,33 @@ th.highlight-col { border-bottom: 2px solid var(--accent-primary) !important; }
 /* Refund note in the economics panel — the one number that changes verdicts. */
 .econ-note.refunds{background:var(--warning-soft,rgba(201,138,18,.12));
   border-left:3px solid var(--warning,#c98a12);padding:10px 13px;border-radius:0 8px 8px 0;margin-bottom:8px}
+
+/* ==========================================================================
+   CREATIVE HEALTH
+   Read before ROAS moves. Colour carries the urgency; the words carry the
+   instruction. Kept quiet on a fresh campaign so the loud states stay loud.
+   ========================================================================== */
+.creative-block{margin:12px 0 4px;padding:11px 13px;border-radius:var(--radius-sm);
+  border:1px solid var(--border-color);background:var(--color-neutral-bg);font-size:12.5px;line-height:1.55}
+.creative-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.creative-head strong{font-weight:600}
+.creative-icon{font-size:13px;line-height:1}
+.creative-days{margin-left:auto;font-size:10.5px;color:var(--text-muted);white-space:nowrap}
+.creative-detail{margin:5px 0 0;color:var(--text-secondary)}
+.creative-signals{margin:7px 0 0;padding-left:17px;color:var(--text-secondary)}
+.creative-signals li{margin:3px 0}
+.creative-angles{margin:9px 0 0;padding-top:8px;border-top:1px solid var(--border-color);color:var(--text-secondary)}
+.creative-angles strong{color:var(--text-primary);font-weight:600}
+.creative-caveat{display:block;margin-top:3px;font-size:10.5px;color:var(--text-muted)}
+
+.creative-fresh{background:var(--color-success-bg);border-color:rgba(16,185,129,.28)}
+.creative-fresh .creative-head strong,.creative-fresh .creative-icon{color:var(--color-success)}
+.creative-fading{background:var(--color-warning-bg);border-color:rgba(245,158,11,.32)}
+.creative-fading .creative-head strong,.creative-fading .creative-icon{color:var(--color-warning)}
+.creative-worn{background:var(--color-danger-bg);border-color:rgba(239,68,68,.35)}
+.creative-worn .creative-head strong,.creative-worn .creative-icon{color:var(--color-danger)}
+.creative-new .creative-head strong,.creative-new .creative-icon{color:var(--text-muted)}
+
+/* A closed window is a record, not an instruction — mute it like the rest. */
+.verdict-card.is-past .creative-block,
+.verdict-card.is-applied .creative-block{opacity:.72}
