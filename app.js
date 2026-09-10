@@ -1010,7 +1010,18 @@ function renderVerdicts() {
     const v = c.verdict;
     const m = v.metrics;
     let budgetLine;
-    if (v.budgetTo === null) {
+    if (c.appliedAction) {
+      /* The trap this closes: the verdict is recomputed from the budget Meta
+         reports NOW. Once he has applied +35% and moved €135 to €182, the next
+         read of the same day recomputes +35% ON €182 and draws "€182 → €246".
+         Marked done, and still showing a bigger number to move to — which is
+         exactly how a campaign gets scaled twice off one night's numbers.
+         An applied card shows what the budget IS, and nothing to do. */
+      budgetLine = `<div class="verdict-budget applied-budget">
+          <span class="bud-to">${c.budget ? fmtMoney(c.budget, 0) + '/day' : 'Applied'}</span>
+          <span class="bud-delta">already set${c.budgetSource === 'adset' ? ' · ad-set budget' : ''} — nothing to change</span>
+        </div>`;
+    } else if (v.budgetTo === null) {
       budgetLine = `<div class="verdict-budget none">No budget change at this read</div>`;
     } else if (v.code === 'KILL') {
       budgetLine = `<div class="verdict-budget danger">
@@ -1045,7 +1056,7 @@ function renderVerdicts() {
         ${budgetLine}
 
         ${c.appliedAction ? `<div class="applied-note">
-            \u2713 <strong>Already applied.</strong> You marked ${esc(VERDICT_LABEL[c.appliedAction.code] || c.appliedAction.code)} as done for ${esc(windowLabel())}. The budget above is what you changed it to \u2014 not a new instruction.
+            \u2713 <strong>Already done.</strong> You marked ${esc(VERDICT_LABEL[c.appliedAction.code] || c.appliedAction.code)} as applied for ${esc(windowLabel())}${c.budget ? `, and the budget is now ${fmtMoney(c.budget, 0)}/day` : ''}. The reasons below are the record of why \u2014 there is nothing left to act on here. Your next move comes at the next read.
           </div>` : isPastWindow() ? `<div class="past-note">
             \u1F4C5 Reviewing a closed window. This is what the rule said at the time; it is not something to act on now.
           </div>` : ''}
