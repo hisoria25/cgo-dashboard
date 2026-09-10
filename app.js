@@ -450,8 +450,10 @@ async function fetchAccount(acc, preset) {
     graph(`${acc}/adsets`, { fields: 'id,campaign_id,daily_budget,effective_status,learning_stage_info', limit: 300 }),
     // the window being judged, aggregated by Meta — not summed by us
     graph(`${acc}/insights`, { level: 'campaign', fields: CAMPAIGN_FIELDS, ...win, limit: 200 }),
-    // history for sparklines and streaks (ends yesterday, which is what we want)
-    graph(`${acc}/insights`, { level: 'campaign', fields: 'campaign_id,spend,actions,action_values,purchase_roas', date_preset: 'last_30d', time_increment: 1, limit: 800 }),
+    // History for sparklines, streaks and creative fatigue (ends yesterday,
+    // which is what we want). CTR/CPM/frequency ride along because fatigue is
+    // a TREND — a single day's CTR says nothing on its own.
+    graph(`${acc}/insights`, { level: 'campaign', fields: 'campaign_id,spend,actions,action_values,purchase_roas,inline_link_click_ctr,cpm,frequency', date_preset: 'last_30d', time_increment: 1, limit: 800 }),
     graph(`${acc}/insights`, { level: 'ad', fields: AD_FIELDS, ...win, limit: 300 }),
     graph(`${acc}/ads`, { fields: 'id,name,campaign_id,effective_status,creative{id,title,body,object_type}', limit: 300 })
   ]);
@@ -698,11 +700,30 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
 
   const judgingToday = preset === 'today';
 
+  // Ad copy grouped by campaign, so the card can say which angles this
+  // product has already been sold on and which it has not.
+  const adCopyByCampaign = {};
+  adsMeta.forEach(a => {
+    const cid = a.campaign_id || '';
+    if (!cid) return;
+    (adCopyByCampaign[cid] = adCopyByCampaign[cid] || []).push({
+      headline: (a.creative && a.creative.title) || '',
+      body: (a.creative && a.creative.body) || '',
+      name: a.name || ''
+    });
+  });
+
   const built = campaigns.map(c => {
     const daily = (historyByCampaign[c.id] || []).map(r => {
       const conv = conversions(r);
       const spend = parseFloat(r.spend) || 0;
-      return { date: r.date_start, spend, revenue: conv.revenue, roas: spend > 0 ? conv.revenue / spend : 0 };
+      return {
+        date: r.date_start, spend, revenue: conv.revenue,
+        roas: spend > 0 ? conv.revenue / spend : 0,
+        ctr: parseFloat(r.inline_link_click_ctr) || 0,
+        cpm: parseFloat(r.cpm) || 0,
+        frequency: parseFloat(r.frequency) || 0
+      };
     });
 
     const j = judgedByCampaign[c.id] || {};
@@ -754,6 +775,7 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       ctr: parseFloat(j.inline_link_click_ctr) || 0,
       cpc: parseFloat(j.cost_per_inline_link_click) || 0,
       cpm: parseFloat(j.cpm) || 0,
+      adCopy: adCopyByCampaign[c.id] || [],
       // Streaks judge closed days only — never the day still in progress.
       history: daily
     };
@@ -1066,6 +1088,8 @@ function renderVerdicts() {
             </span>`).join('')}
         </div>
 
+        ${creativeBlock(c, m)}
+
         <footer class="verdict-foot">
           <span class="verdict-rule">📖 ${esc(v.rule)}</span>
           <div class="verdict-actions">
@@ -1077,6 +1101,52 @@ function renderVerdicts() {
         </footer>
       </article>`;
   }).join('');
+}
+
+/* ---------------------------------------------------------- creative health --
+   The budget verdict answers "how much". This answers "with what". A campaign
+   can be perfectly scalable on the numbers and still be three days from death
+   because the creative is spent — and no budget move fixes that.             */
+const CREATIVE_ICON = { fresh: '✓', fading: '◑', worn: '⚠', new: '○' };
+
+function creativeBlock(c, m) {
+  const h = m && m.creative;
+  if (!h) return '';
+
+  // A worn-out creative on a campaign you already switched off is history,
+  // not an instruction. Say nothing.
+  if (/PAUSED/i.test(c.status || '')) return '';
+
+  const signals = (h.signals || []).map(s => `<li>${esc(s)}</li>`).join('');
+
+  // Angles are only useful when he actually has to shoot something. On a
+  // healthy campaign the list is noise, and noise is how a card stops
+  // getting read.
+  let angleLine = '';
+  if (h.state === 'fading' || h.state === 'worn') {
+    const cov = VE.angleCoverage(c.adCopy || []);
+    if (cov.adsRead) {
+      const tested = cov.tested.map(a => a.label).join(', ');
+      const untested = cov.untested.map(a => a.label).join(', ');
+      angleLine = `<p class="creative-angles">
+        ${tested ? `<strong>Running:</strong> ${esc(tested)}.` : '<strong>Running:</strong> no angle recognised from the ad copy.'}
+        ${untested ? ` <strong>Not tried on this product:</strong> ${esc(untested)}.` : ' Every angle in your library has been tried — the next test is a new hook inside one of them, not a new angle.'}
+        <span class="creative-caveat">Read from ad copy, so it sees the words and not the footage.</span>
+      </p>`;
+    }
+  }
+
+  return `
+    <div class="creative-block creative-${h.state}">
+      <div class="creative-head">
+        <span class="creative-icon">${CREATIVE_ICON[h.state] || ''}</span>
+        <strong>Creative — ${esc(h.headline)}</strong>
+        ${h.days ? `<span class="creative-days">${h.days} day${h.days === 1 ? '' : 's'} of data</span>` : ''}
+      </div>
+      <p class="creative-detail">${esc(h.detail)}</p>
+      ${signals ? `<ul class="creative-signals">${signals}</ul>` : ''}
+      ${angleLine}
+    </div>`;
 }
 
 function todayKey() { return new Date().toISOString().slice(0, 10); }
