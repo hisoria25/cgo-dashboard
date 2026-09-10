@@ -54,6 +54,19 @@
       ]
     },
     frequency: { fatigue: 2.5 },
+    /* Creative fatigue. ROAS is the LAST thing to fall — by the time it moves
+       you have already paid for the decline. Link CTR sags first, then CPM
+       climbs (Meta charges more to keep pushing a tired ad at the same people),
+       then frequency stacks up. These read those three in that order, so the
+       warning lands while there is still time to shoot something new. */
+    creative: {
+      minDays: 3,          // below this there is no trend, only noise
+      window: 7,           // days of history to judge against
+      ctrDropWorn: 25,     // % below its best day → worn out
+      ctrFallDays: 3,      // consecutive falling days → fading
+      cpmRise: 20,         // % above its opening days → fading
+      freqFading: 2.0      // frequency.fatigue (2.5) is the worn-out line
+    },
     // Learning phase. Meta resets learning on a "significant edit", and a
     // budget change above roughly 20% counts as one. That does NOT mean never
     // scale — it means know the cost. Blocking scaling outright would stop a
@@ -428,6 +441,165 @@
       return { from: st.from, to: st.to, upCount: st.up, message: st.msg, purchaseStep: !!st.purchaseStep };
     }
     return null;
+  }
+
+  /* ------------------------------------------------------------------
+     5c. CREATIVE HEALTH
+     ------------------------------------------------------------------
+     Whether the creative still has life in it, read from the three things
+     that move BEFORE ROAS does: link CTR, CPM, frequency.
+
+     States:
+       new     — under minDays of data. Say so; do not guess a trend.
+       fresh   — nothing is decaying. Leave it alone.
+       fading  — CTR falling, or CPM climbing, or frequency stacking up.
+                 Shoot new creatives NOW, while the campaign still pays.
+       worn    — frequency past the fatigue line, or CTR well off its best.
+                 Upload today or watch it die.
+
+     Deliberately generous with "fresh": a false fatigue warning costs a
+     shooting day on a campaign that was fine, and he only has so many.
+     ------------------------------------------------------------------ */
+  function creativeHealth(campaign, opts) {
+    const o = opts || {};
+    const R = RULES.creative;
+    const c = campaign || {};
+
+    // Only days that actually ran and actually reported a CTR can be judged.
+    const rows = (c.history || [])
+      .filter(d => num(d.spend) > 0 && num(d.ctr) > 0)
+      .slice(-R.window);
+
+    // The day being judged belongs on the end — it is the freshest reading.
+    if (num(c.spend) > 0 && num(c.ctr) > 0) {
+      rows.push({ date: 'judged', spend: num(c.spend), ctr: num(c.ctr), cpm: num(c.cpm), frequency: num(c.frequency) });
+    }
+
+    const freq = num(c.frequency) || (rows.length ? num(rows[rows.length - 1].frequency) : 0);
+    const signals = [];
+
+    if (rows.length < R.minDays) {
+      return {
+        state: 'new',
+        days: rows.length,
+        headline: 'Too early to read fatigue',
+        detail: `Needs ${R.minDays} days of delivery before a trend means anything. ${rows.length} so far.`,
+        signals: freq >= RULES.frequency.fatigue
+          ? [`Frequency ${round2(freq)} already — the same people are seeing it a lot for a new campaign.`]
+          : [],
+        ctrNow: rows.length ? round2(rows[rows.length - 1].ctr) : null,
+        ctrBest: null, ctrDropPct: null, cpmRisePct: null, frequency: round2(freq)
+      };
+    }
+
+    const ctrs = rows.map(d => num(d.ctr));
+    const ctrNow = ctrs[ctrs.length - 1];
+    const ctrBest = Math.max.apply(null, ctrs);
+    const ctrDropPct = ctrBest > 0 ? round1(((ctrBest - ctrNow) / ctrBest) * 100) : 0;
+
+    // Consecutive falling days, counted back from the newest.
+    let fallDays = 0;
+    for (let i = ctrs.length - 1; i > 0; i--) {
+      if (ctrs[i] < ctrs[i - 1]) fallDays++; else break;
+    }
+
+    // CPM now against the opening third of the window — "since it started".
+    const cpms = rows.map(d => num(d.cpm)).filter(v => v > 0);
+    let cpmRisePct = 0, cpmNow = 0, cpmBase = 0;
+    if (cpms.length >= R.minDays) {
+      const baseCount = Math.max(1, Math.floor(cpms.length / 3));
+      cpmBase = cpms.slice(0, baseCount).reduce((a, b) => a + b, 0) / baseCount;
+      cpmNow = cpms[cpms.length - 1];
+      if (cpmBase > 0) cpmRisePct = round1(((cpmNow - cpmBase) / cpmBase) * 100);
+    }
+
+    const wornFreq = freq >= RULES.frequency.fatigue;
+    const wornCtr = ctrDropPct >= R.ctrDropWorn;
+    const fadeCtr = fallDays >= R.ctrFallDays;
+    const fadeCpm = cpmRisePct >= R.cpmRise;
+    const fadeFreq = freq >= R.freqFading;
+
+    if (wornFreq) signals.push(`Frequency ${round2(freq)} — past the ${RULES.frequency.fatigue} fatigue line. The same people keep seeing it.`);
+    else if (fadeFreq) signals.push(`Frequency ${round2(freq)} — climbing toward the ${RULES.frequency.fatigue} fatigue line.`);
+
+    if (wornCtr) signals.push(`Link CTR ${round2(ctrNow)}% — down ${ctrDropPct}% from its best day (${round2(ctrBest)}%). The hook has stopped working.`);
+    else if (fadeCtr) signals.push(`Link CTR falling ${fallDays} days running — now ${round2(ctrNow)}%, best was ${round2(ctrBest)}%.`);
+
+    if (fadeCpm) signals.push(`CPM ${round2(cpmNow)} — up ${cpmRisePct}% since it started. Meta is charging more to keep showing this ad.`);
+
+    let state, headline, detail;
+    if (wornFreq || wornCtr) {
+      state = 'worn';
+      headline = 'Worn out — upload fresh creatives today';
+      detail = 'This is no longer a budget decision. New creatives now, or this campaign dies whatever you do to the budget.';
+    } else if (fadeCtr || fadeCpm || fadeFreq) {
+      state = 'fading';
+      headline = 'Fading — start shooting now';
+      detail = 'Still paying, but decaying. Get new creatives ready while it is profitable, not after it drops.';
+    } else {
+      state = 'fresh';
+      headline = 'Fresh — leave it alone';
+      detail = 'CTR is holding and the auction is not getting more expensive. No creative work needed.';
+      if (!signals.length) signals.push(`Link CTR ${round2(ctrNow)}%, frequency ${round2(freq)} — both steady.`);
+    }
+
+    return {
+      state, headline, detail, signals,
+      days: rows.length,
+      ctrNow: round2(ctrNow),
+      ctrBest: round2(ctrBest),
+      ctrDropPct,
+      cpmNow: round2(cpmNow),
+      cpmRisePct,
+      fallDays,
+      frequency: round2(freq)
+    };
+  }
+
+  /* The angle library — his own standing creative prompt systems. Classified
+     from ad copy, which sees the WORDS, not the footage: treat a match as
+     "he has probably run this angle", not as proof. Naming an untested angle
+     is the useful half; a dashboard cannot pick the next winner for him. */
+  const ANGLES = [
+    { key: 'before-after', label: 'Before / after split',
+      hints: ['ohne', 'vorher', 'nachher', 'unterschied', 'vergleich', 'before', 'after'] },
+    { key: 'lifestyle', label: 'Lifestyle aspiration',
+      hints: ['endlich', 'gefühl', 'jeden morgen', 'ritual', 'alltag', 'selbstbewusst', 'genießen', 'wohl'] },
+    { key: 'problem-relief', label: 'Problem / relief',
+      hints: ['schluss', 'nie wieder', 'schmerz', 'schmerzen', 'problem', 'stört', 'nervt', 'endlich frei'] },
+    { key: 'testimonial', label: 'Personal story',
+      hints: ['ich', 'mein', 'meine', 'seitdem', 'bei mir', 'monaten', 'wochen'] },
+    { key: 'offer', label: 'Offer / discount',
+      hints: ['rabatt', 'gratis', 'kostenlos', 'sale', 'nur heute', 'spare', 'versandkostenfrei', 'prozent'] }
+  ];
+
+  /* German is full of short words that live inside longer ones — "ich" sits
+     inside "endlich", "mit" inside "damit". Substring matching therefore reads
+     a personal-story angle into copy that has none, so every hint is matched on
+     word boundaries. Percent signs are matched separately, having none. */
+  function hintHit(text, hint) {
+    const esc = hint.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp('(^|[^\\p{L}\\p{N}])' + esc + '($|[^\\p{L}\\p{N}])', 'u').test(text);
+  }
+
+  /** Which angles this campaign's ads cover, and which are untested. */
+  function angleCoverage(ads) {
+    const list = Array.isArray(ads) ? ads : [];
+    const seen = {};
+    list.forEach(a => {
+      const text = ((a.headline || '') + ' ' + (a.body || '')).toLowerCase();
+      if (!text.trim()) return;
+      // A number next to a percent sign is an offer, wherever it sits.
+      if (/\d\s*%|\d+\s*(€|eur)\b/.test(text)) seen.offer = (seen.offer || 0) + 1;
+      ANGLES.forEach(ang => {
+        if (ang.hints.some(h => hintHit(text, h))) seen[ang.key] = (seen[ang.key] || 0) + 1;
+      });
+    });
+    return {
+      tested: ANGLES.filter(a => seen[a.key]).map(a => ({ ...a, count: seen[a.key] })),
+      untested: ANGLES.filter(a => !seen[a.key]).map(a => ({ key: a.key, label: a.label })),
+      adsRead: list.length
+    };
   }
 
   /* ------------------------------------------------------------------
@@ -916,6 +1088,9 @@
       roas: num(c.roas) || (spend > 0 ? revenue / spend : 0),
       purchases: num(c.purchases),
       frequency: num(c.frequency),
+      // Fatigue reads these; they must survive normalization.
+      ctr: num(c.ctr),
+      cpm: num(c.cpm),
       clicks: num(c.clicks),
       lpv: num(c.lpv),
       atc: num(c.atc),
@@ -971,7 +1146,9 @@
         headroomPct: cpaPicture(c, ber > 0 ? 1 / ber : 0).headroomPct,
         profit: cpaPicture(c, ber > 0 ? 1 / ber : 0).profit,
         pacing: dayPacing(c, _ctx),
-        broken: brokenStage(c)
+        broken: brokenStage(c),
+        // Whether the creative still has life in it — read before ROAS moves.
+        creative: creativeHealth(c)
       },
       funnel: f
     };
@@ -995,7 +1172,8 @@
     RULES, economics, netMarginPct, grossMarginFromBer, parseCampaignName,
     clockIn, detectWindow, dayContext, funnel, biggestLeak,
     berAfterRefunds, netOfRefunds, clampRate,
-    cpaPicture, dayPacing, brokenStage, verdict, guardrails, deliveryAlarms, productLabel,
+    cpaPicture, dayPacing, brokenStage, creativeHealth, angleCoverage, ANGLES,
+    verdict, guardrails, deliveryAlarms, productLabel,
     countUnprofitableStreak, countProfitableStreak, money
   };
 });
