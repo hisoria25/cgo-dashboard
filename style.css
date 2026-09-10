@@ -717,3 +717,12 @@ th.highlight-col { border-bottom: 2px solid var(--accent-primary) !important; }
 /* A closed window is a record, not an instruction — mute it like the rest. */
 .verdict-card.is-past .creative-block,
 .verdict-card.is-applied .creative-block{opacity:.72}
+
+/* The applied budget line: a statement of fact, not a target. It must never
+   look like the arrow that means "move this number" — no from → to, no delta
+   in green, and it stays legible rather than greyed into invisibility. */
+.verdict-budget.applied-budget{opacity:1;filter:none;background:var(--color-neutral-bg);
+  border:1px dashed var(--border-color)}
+.verdict-card.is-applied .verdict-budget.applied-budget{opacity:1;filter:none}
+.verdict-budget.applied-budget .bud-to{color:var(--text-secondary);font-weight:600}
+.verdict-budget.applied-budget .bud-delta{color:var(--text-muted)}
