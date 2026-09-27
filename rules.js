@@ -54,18 +54,27 @@
       ]
     },
     frequency: { fatigue: 2.5 },
-    /* Creative fatigue. ROAS is the LAST thing to fall — by the time it moves
-       you have already paid for the decline. Link CTR sags first, then CPM
-       climbs (Meta charges more to keep pushing a tired ad at the same people),
-       then frequency stacks up. These read those three in that order, so the
-       warning lands while there is still time to shoot something new. */
+    /* Creative fatigue.
+
+       FREQUENCY IS THE GATE. Everything here was rebuilt after the engine
+       called six campaigns "worn" on the same Saturday — a day every one of
+       them had been surf-scaled. Frequency sat between 1.08 and 1.39 the
+       whole time. Nobody was sick of anything; the budget had moved.
+
+       A falling CTR on its own is almost never fatigue. It is the budget mix
+       shifting between ads, a hard scale reaching colder audience, or one odd
+       day. So CTR can no longer convict alone: either frequency corroborates,
+       or CPM has to be climbing at the same time — two independent signals. */
     creative: {
-      minDays: 3,          // below this there is no trend, only noise
-      window: 7,           // days of history to judge against
-      ctrDropWorn: 25,     // % below its best day → worn out
-      ctrFallDays: 3,      // consecutive falling days → fading
-      cpmRise: 20,         // % above its opening days → fading
-      freqFading: 2.0      // frequency.fatigue (2.5) is the worn-out line
+      minDays: 6,          // closed days needed before any trend is claimed
+      window: 14,          // 7 was too short: one odd day swung the verdict
+      recentDays: 3,       // "now" = median of the last 3 closed days
+      ctrDropWorn: 25,     // % below baseline, WITH frequency >= freqFading
+      ctrDropFade: 20,     // % below baseline, WITH cpm also climbing
+      cpmRise: 20,         // % above baseline — the corroborating signal
+      freqFading: 2.0,     // frequency.fatigue (2.5) is the worn-out line
+      adCtrSpread: 0.4,    // ads this far apart ⇒ campaign CTR is a blend
+      adMinSpendShare: 0.05 // ignore ads under 5% of spend — they prove nothing
     },
     // Learning phase. Meta resets learning on a "significant edit", and a
     // budget change above roughly 20% counts as one. That does NOT mean never
@@ -446,114 +455,177 @@
   /* ------------------------------------------------------------------
      5c. CREATIVE HEALTH
      ------------------------------------------------------------------
-     Whether the creative still has life in it, read from the three things
-     that move BEFORE ROAS does: link CTR, CPM, frequency.
+     Whether the creative still has life left in it.
+
+     THE RULE THAT GOVERNS EVERYTHING HERE: frequency is the gate. If the
+     same people are not seeing the ad repeatedly, the creative is not worn
+     out — whatever the click-through is doing. A CTR slide at low frequency
+     is the budget mix moving between ads, or a hard scale reaching colder
+     audience. Neither is fixed by shooting new creatives.
+
+     Three earlier mistakes this version corrects:
+       1. A 7-day window let one odd day swing the verdict. Now 14.
+       2. It compared today to the BEST day ever. A high-water mark is
+          usually a fluke, so every ordinary day looked like decay. Now it
+          compares the median of the last 3 closed days to the median of
+          the days before them.
+       3. It read the campaign's blended CTR as if it were one creative's
+          health. A campaign CTR is a weighted average of its ads: move
+          budget from a 5% ad to a 3% ad and the line falls with nothing
+          having aged. Now the ads are read individually.
 
      States:
-       new     — under minDays of data. Say so; do not guess a trend.
-       fresh   — nothing is decaying. Leave it alone.
-       fading  — CTR falling, or CPM climbing, or frequency stacking up.
-                 Shoot new creatives NOW, while the campaign still pays.
-       worn    — frequency past the fatigue line, or CTR well off its best.
-                 Upload today or watch it die.
-
-     Deliberately generous with "fresh": a false fatigue warning costs a
-     shooting day on a campaign that was fine, and he only has so many.
+       new     — under minDays of CLOSED days. Say so; never guess a trend.
+       fresh   — frequency low. Leave it alone.
+       fading  — frequency building, or CTR down AND CPM up together.
+       worn    — frequency past the fatigue line. Shoot today.
      ------------------------------------------------------------------ */
-  function creativeHealth(campaign, opts) {
-    const o = opts || {};
+  function median(values) {
+    const a = (values || []).filter(v => isFinite(v)).slice().sort((x, y) => x - y);
+    if (!a.length) return 0;
+    const m = Math.floor(a.length / 2);
+    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+  }
+
+  /* Per-ad read. This is the piece that stops a budget shift masquerading as
+     fatigue: it names the ad whose own frequency is past the line, and warns
+     when the ads are far enough apart that the campaign average means little. */
+  function adFatigue(adStats) {
+    const all = (adStats || []).filter(a => num(a.spend) > 0);
+    if (all.length < 2) return { worstAd: null, mixWarning: null };
+    const FAT = RULES.frequency.fatigue;
     const R = RULES.creative;
+
+    /* Only ads carrying real budget count. An ad on €4 with a 0% CTR is not
+       evidence of anything — including it made the spread warning fire on
+       every campaign in the account, which is the same as not firing at all. */
+    const totalSpend = all.reduce((t, a) => t + num(a.spend), 0);
+    const ads = all.filter(a => totalSpend > 0 && num(a.spend) / totalSpend >= R.adMinSpendShare);
+
+    /* The ad heading for trouble, not just the one already there: flag from
+       freqFading up, and say which side of the fatigue line it sits on. */
+    let worst = null;
+    ads.forEach(a => {
+      if (num(a.frequency) >= R.freqFading && (!worst || num(a.frequency) > num(worst.frequency))) worst = a;
+    });
+
+    let mixWarning = null;
+    const ctrs = ads.map(a => num(a.ctr)).filter(v => v > 0);
+    if (ctrs.length >= 2) {
+      const hi = Math.max.apply(null, ctrs), lo = Math.min.apply(null, ctrs);
+      if (hi > 0 && (hi - lo) / hi >= R.adCtrSpread) {
+        mixWarning = `Ads carrying real budget here run from ${round2(lo)}% to ${round2(hi)}% CTR. The campaign average moves whenever budget moves between them — judge the ads, not the blend.`;
+      }
+    }
+
+    let worstAd = null;
+    if (worst) {
+      const f = round2(num(worst.frequency));
+      const nm = worst.name || 'One ad';
+      worstAd = {
+        name: worst.name || 'one ad',
+        frequency: f,
+        past: f >= FAT,
+        note: f >= FAT
+          ? `${nm} is at frequency ${f}, past the ${FAT} line — replace that ad, not the whole set.`
+          : `${nm} is at frequency ${f} and climbing toward ${FAT} — it will need replacing before the rest of the set does.`
+      };
+    }
+    return { worstAd, mixWarning };
+  }
+
+  function creativeHealth(campaign, opts) {
+    const R = RULES.creative;
+    const FAT = RULES.frequency.fatigue;
     const c = campaign || {};
 
-    // Only days that actually ran and actually reported a CTR can be judged.
+    /* CLOSED days only. The day still running is deliberately excluded — a
+       partial day is not a data point, and counting one is what made a
+       surf-scaled Saturday look like a dying creative. */
     const rows = (c.history || [])
       .filter(d => num(d.spend) > 0 && num(d.ctr) > 0)
       .slice(-R.window);
 
-    // The day being judged belongs on the end — it is the freshest reading.
-    if (num(c.spend) > 0 && num(c.ctr) > 0) {
-      rows.push({ date: 'judged', spend: num(c.spend), ctr: num(c.ctr), cpm: num(c.cpm), frequency: num(c.frequency) });
-    }
-
     const freq = num(c.frequency) || (rows.length ? num(rows[rows.length - 1].frequency) : 0);
-    const signals = [];
+    const adRead = adFatigue(c.adStats);
+
+    const base = {
+      days: rows.length, frequency: round2(freq),
+      ctrRecent: null, ctrBaseline: null, ctrDropPct: null,
+      cpmRecent: null, cpmBaseline: null, cpmRisePct: null,
+      worstAd: adRead.worstAd, mixWarning: adRead.mixWarning
+    };
 
     if (rows.length < R.minDays) {
-      return {
+      const sig = [];
+      if (freq >= FAT) sig.push(`Frequency ${round2(freq)} already — worth watching on a campaign this young.`);
+      if (adRead.mixWarning) sig.push(adRead.mixWarning);
+      return Object.assign(base, {
         state: 'new',
-        days: rows.length,
         headline: 'Too early to read fatigue',
-        detail: `Needs ${R.minDays} days of delivery before a trend means anything. ${rows.length} so far.`,
-        signals: freq >= RULES.frequency.fatigue
-          ? [`Frequency ${round2(freq)} already — the same people are seeing it a lot for a new campaign.`]
-          : [],
-        ctrNow: rows.length ? round2(rows[rows.length - 1].ctr) : null,
-        ctrBest: null, ctrDropPct: null, cpmRisePct: null, frequency: round2(freq)
-      };
+        detail: `Needs ${R.minDays} closed days of delivery before a trend means anything. ${rows.length} so far.`,
+        signals: sig
+      });
     }
 
+    const n = R.recentDays;
     const ctrs = rows.map(d => num(d.ctr));
-    const ctrNow = ctrs[ctrs.length - 1];
-    const ctrBest = Math.max.apply(null, ctrs);
-    const ctrDropPct = ctrBest > 0 ? round1(((ctrBest - ctrNow) / ctrBest) * 100) : 0;
+    const cpms = rows.map(d => num(d.cpm));
 
-    // Consecutive falling days, counted back from the newest.
-    let fallDays = 0;
-    for (let i = ctrs.length - 1; i > 0; i--) {
-      if (ctrs[i] < ctrs[i - 1]) fallDays++; else break;
-    }
+    const ctrRecent = median(ctrs.slice(-n));
+    const ctrBaseline = median(ctrs.slice(0, -n));
+    const ctrDropPct = ctrBaseline > 0 ? round1(((ctrBaseline - ctrRecent) / ctrBaseline) * 100) : 0;
 
-    // CPM now against the opening third of the window — "since it started".
-    const cpms = rows.map(d => num(d.cpm)).filter(v => v > 0);
-    let cpmRisePct = 0, cpmNow = 0, cpmBase = 0;
-    if (cpms.length >= R.minDays) {
-      const baseCount = Math.max(1, Math.floor(cpms.length / 3));
-      cpmBase = cpms.slice(0, baseCount).reduce((a, b) => a + b, 0) / baseCount;
-      cpmNow = cpms[cpms.length - 1];
-      if (cpmBase > 0) cpmRisePct = round1(((cpmNow - cpmBase) / cpmBase) * 100);
-    }
+    const cpmRecent = median(cpms.slice(-n).filter(v => v > 0));
+    const cpmBaseline = median(cpms.slice(0, -n).filter(v => v > 0));
+    const cpmRisePct = cpmBaseline > 0 ? round1(((cpmRecent - cpmBaseline) / cpmBaseline) * 100) : 0;
 
-    const wornFreq = freq >= RULES.frequency.fatigue;
-    const wornCtr = ctrDropPct >= R.ctrDropWorn;
-    const fadeCtr = fallDays >= R.ctrFallDays;
-    const fadeCpm = cpmRisePct >= R.cpmRise;
-    const fadeFreq = freq >= R.freqFading;
-
-    if (wornFreq) signals.push(`Frequency ${round2(freq)} — past the ${RULES.frequency.fatigue} fatigue line. The same people keep seeing it.`);
-    else if (fadeFreq) signals.push(`Frequency ${round2(freq)} — climbing toward the ${RULES.frequency.fatigue} fatigue line.`);
-
-    if (wornCtr) signals.push(`Link CTR ${round2(ctrNow)}% — down ${ctrDropPct}% from its best day (${round2(ctrBest)}%). The hook has stopped working.`);
-    else if (fadeCtr) signals.push(`Link CTR falling ${fallDays} days running — now ${round2(ctrNow)}%, best was ${round2(ctrBest)}%.`);
-
-    if (fadeCpm) signals.push(`CPM ${round2(cpmNow)} — up ${cpmRisePct}% since it started. Meta is charging more to keep showing this ad.`);
+    const ctrFalling = ctrDropPct >= R.ctrDropFade;
+    const cpmClimbing = cpmRisePct >= R.cpmRise;
 
     let state, headline, detail;
-    if (wornFreq || wornCtr) {
+    if (freq >= FAT) {
       state = 'worn';
       headline = 'Worn out — upload fresh creatives today';
-      detail = 'This is no longer a budget decision. New creatives now, or this campaign dies whatever you do to the budget.';
-    } else if (fadeCtr || fadeCpm || fadeFreq) {
+      detail = 'Frequency is past the fatigue line: the same people keep seeing this. No budget change fixes that.';
+    } else if (freq >= R.freqFading && ctrDropPct >= R.ctrDropWorn) {
+      state = 'worn';
+      headline = 'Worn out — upload fresh creatives today';
+      detail = 'Frequency is climbing and click-through has fallen hard. Two signals agreeing is real fatigue.';
+    } else if (freq >= R.freqFading) {
       state = 'fading';
       headline = 'Fading — start shooting now';
-      detail = 'Still paying, but decaying. Get new creatives ready while it is profitable, not after it drops.';
+      detail = 'Frequency is building toward the fatigue line. Get new creatives ready while this still pays.';
+    } else if (ctrFalling && cpmClimbing) {
+      state = 'fading';
+      headline = 'Fading — start shooting now';
+      detail = 'Click-through is down and the auction is getting more expensive at the same time. Two independent signals, so this is decay rather than noise.';
     } else {
       state = 'fresh';
       headline = 'Fresh — leave it alone';
-      detail = 'CTR is holding and the auction is not getting more expensive. No creative work needed.';
-      if (!signals.length) signals.push(`Link CTR ${round2(ctrNow)}%, frequency ${round2(freq)} — both steady.`);
+      detail = `Frequency ${round2(freq)} is below ${R.freqFading}. At this level a CTR move is the budget mix or the audience, not a tired creative.`;
     }
 
-    return {
+    const signals = [`Frequency ${round2(freq)} — the fatigue line is ${FAT}.`];
+    if (ctrDropPct >= R.ctrDropFade) {
+      signals.push(`Link CTR ${round2(ctrRecent)}% over the last ${n} closed days against ${round2(ctrBaseline)}% before — down ${ctrDropPct}%.`);
+    } else if (ctrDropPct <= -5) {
+      signals.push(`Link CTR ${round2(ctrRecent)}% — up on its own baseline of ${round2(ctrBaseline)}%.`);
+    }
+    if (cpmClimbing) {
+      signals.push(`CPM ${round2(cpmRecent)} — up ${cpmRisePct}% on its baseline. Meta is charging more to keep placing this.`);
+    }
+    if (state === 'fresh' && ctrFalling) {
+      signals.push(`Watch only: CTR is off ${ctrDropPct}%, but with frequency at ${round2(freq)} that is the mix moving, not the creative dying.`);
+    }
+    if (adRead.mixWarning) signals.push(adRead.mixWarning);
+    if (adRead.worstAd) signals.push(adRead.worstAd.note);
+
+    return Object.assign(base, {
       state, headline, detail, signals,
-      days: rows.length,
-      ctrNow: round2(ctrNow),
-      ctrBest: round2(ctrBest),
-      ctrDropPct,
-      cpmNow: round2(cpmNow),
-      cpmRisePct,
-      fallDays,
-      frequency: round2(freq)
-    };
+      ctrRecent: round2(ctrRecent), ctrBaseline: round2(ctrBaseline), ctrDropPct,
+      cpmRecent: round2(cpmRecent), cpmBaseline: round2(cpmBaseline), cpmRisePct
+    });
   }
 
   /* The angle library — his own standing creative prompt systems. Classified
@@ -1091,6 +1163,8 @@
       // Fatigue reads these; they must survive normalization.
       ctr: num(c.ctr),
       cpm: num(c.cpm),
+      // Per-ad rows, so fatigue is judged on the ads and not on their blend.
+      adStats: c.adStats || [],
       clicks: num(c.clicks),
       lpv: num(c.lpv),
       atc: num(c.atc),
@@ -1172,7 +1246,7 @@
     RULES, economics, netMarginPct, grossMarginFromBer, parseCampaignName,
     clockIn, detectWindow, dayContext, funnel, biggestLeak,
     berAfterRefunds, netOfRefunds, clampRate,
-    cpaPicture, dayPacing, brokenStage, creativeHealth, angleCoverage, ANGLES,
+    cpaPicture, dayPacing, brokenStage, creativeHealth, adFatigue, median, angleCoverage, ANGLES,
     verdict, guardrails, deliveryAlarms, productLabel,
     countUnprofitableStreak, countProfitableStreak, money
   };
