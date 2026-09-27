@@ -418,7 +418,9 @@ const CAMPAIGN_FIELDS = [
 ].join(',');
 
 const AD_FIELDS = [
-  'ad_id', 'ad_name', 'campaign_name', 'spend', 'impressions', 'reach', 'frequency',
+  // campaign_id is needed to group ads back onto their campaign for the
+  // per-ad fatigue read — campaign_name alone cannot be matched reliably.
+  'ad_id', 'ad_name', 'campaign_id', 'campaign_name', 'spend', 'impressions', 'reach', 'frequency',
   'inline_link_clicks', 'inline_link_click_ctr', 'cost_per_inline_link_click',
   'cpc', 'cpm', 'ctr', 'actions', 'action_values', 'purchase_roas',
   'video_play_actions', 'video_thruplay_watched_actions'
@@ -713,6 +715,24 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
     });
   });
 
+  /* Per-ad delivery stats grouped by campaign. A campaign's CTR is a weighted
+     average of its ads: when Meta moves budget from a 5% ad to a 3% one the
+     campaign line falls without a single creative having aged. The fatigue
+     engine needs the ads themselves to tell those two apart. */
+  const adStatsByCampaign = {};
+  adInsights.forEach(r => {
+    const cid = r.campaign_id || '';
+    if (!cid) return;
+    (adStatsByCampaign[cid] = adStatsByCampaign[cid] || []).push({
+      name: r.ad_name || r.ad_id,
+      spend: parseFloat(r.spend) || 0,
+      ctr: parseFloat(r.inline_link_click_ctr) || 0,
+      cpm: parseFloat(r.cpm) || 0,
+      frequency: parseFloat(r.frequency) || 0,
+      impressions: parseInt(r.impressions) || 0
+    });
+  });
+
   const built = campaigns.map(c => {
     const daily = (historyByCampaign[c.id] || []).map(r => {
       const conv = conversions(r);
@@ -776,6 +796,7 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       cpc: parseFloat(j.cost_per_inline_link_click) || 0,
       cpm: parseFloat(j.cpm) || 0,
       adCopy: adCopyByCampaign[c.id] || [],
+      adStats: adStatsByCampaign[c.id] || [],
       // Streaks judge closed days only — never the day still in progress.
       history: daily
     };
