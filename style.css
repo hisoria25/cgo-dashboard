@@ -726,3 +726,38 @@ th.highlight-col { border-bottom: 2px solid var(--accent-primary) !important; }
 .verdict-card.is-applied .verdict-budget.applied-budget{opacity:1;filter:none}
 .verdict-budget.applied-budget .bud-to{color:var(--text-secondary);font-weight:600}
 .verdict-budget.applied-budget .bud-delta{color:var(--text-muted)}
+
+/* ---------- Break-even benchmarks -------------------------------------
+   One row per product, sorted worst headroom first, because the row that
+   needs attention should not be the one you have to scroll for. */
+.bench-card { margin-bottom: 20px; }
+.bench { width: 100%; border-collapse: collapse; font-size: 13px; }
+.bench th {
+  text-align: left; font-size: 11px; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--text-secondary); font-weight: 600; padding: 0 10px 8px;
+  border-bottom: 1px solid var(--border, rgba(128,128,128,.25));
+}
+.bench td { padding: 11px 10px; border-bottom: 1px solid var(--border, rgba(128,128,128,.14)); vertical-align: middle; }
+.bench tbody tr:last-child td { border-bottom: none; }
+.bench-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bench-name { font-weight: 600; }
+/* The BER rides under the name so the row can be read without the header. */
+.bench-ber { display: block; font-size: 11px; font-weight: 400; color: var(--text-secondary); margin-top: 2px; }
+/* "Can afford" is the line everything else is measured against — give it weight. */
+.bench-line { font-weight: 700; }
+.bench-over { color: var(--danger, #d64545); font-weight: 700; }
+.bench-under { color: var(--success, #1f9d55); font-weight: 700; }
+.bench-say { color: var(--text-secondary); }
+/* A tint rather than a block of colour: the numbers stay the loudest thing. */
+.bench tr.tone-good { background: color-mix(in srgb, var(--success, #1f9d55) 7%, transparent); }
+.bench tr.tone-warning { background: color-mix(in srgb, var(--color-warning, #d08700) 9%, transparent); }
+.bench tr.tone-bad { background: color-mix(in srgb, var(--danger, #d64545) 9%, transparent); }
+.bench-foot { font-size: 12px; color: var(--text-secondary); margin-top: 14px; }
+.bench-empty { font-size: 13px; color: var(--text-secondary); }
+
+@media (max-width: 760px) {
+  /* The sentence is the first thing to go: the numbers carry the row. */
+  .bench-say, .bench th:last-child { display: none; }
+  .bench td, .bench th { padding-left: 6px; padding-right: 6px; }
+  .bench { font-size: 12px; }
+}
