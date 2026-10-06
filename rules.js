@@ -1228,16 +1228,20 @@
      Returns null when there is not enough history to say anything. */
   function trailingRoas(history, days) {
     if (!Array.isArray(history) || !(days > 0)) return null;
-    let spend = 0, revenue = 0, n = 0;
+    let spend = 0, revenue = 0, purchases = 0, n = 0;
     for (let i = history.length - 1; i >= 0 && n < days; i--) {
       const s = num(history[i].spend);
       if (s <= 0) continue;
       spend += s;
       revenue += num(history[i].revenue);
+      // Orders ride along so a caller can work out a basket size over the
+      // same window. Older history rows may not carry them; those sum to 0,
+      // and a caller that needs orders checks for 0 rather than assuming.
+      purchases += num(history[i].purchases);
       n++;
     }
     if (n === 0 || spend <= 0) return null;
-    return { roas: revenue / spend, spend, revenue, days: n };
+    return { roas: revenue / spend, spend, revenue, purchases, days: n };
   }
 
   function countProfitableStreak(history, ber) {
