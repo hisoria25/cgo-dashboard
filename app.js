@@ -1268,6 +1268,76 @@ function editBer(id) {
 /* ========================================================================== *
  *  GUARDRAILS
  * ========================================================================== */
+/* Break-even benchmarks, one row per product.
+
+   Every media buyer carries a table that says "CPA under €20 is good, over €40
+   kill it". It cannot be right, because it does not know the product. On this
+   account the true break-even CPA runs from about €18 to about €35 — a flat
+   €20 line calls a loss on one product "good" and lets another bleed for days
+   before it trips.
+
+   So this prints the real line per product. Nothing here is a new rule: it is
+   the same cpaPicture() the verdict already uses, shown instead of implied. */
+function renderBenchmarks() {
+  const host = document.getElementById('bench-table');
+  if (!host) return;
+
+  const rows = State.campaigns
+    .filter(c => !/PAUSED|ARCHIVED|DELETED/i.test(c.status || ''))
+    .map(c => {
+      const { ber, grossMargin } = berFor(c);
+      const pic = VE.cpaPicture(c, grossMargin);
+      return { c, ber, pic };
+    })
+    // A campaign with no orders yet has no basket size, so no line to draw.
+    .filter(r => r.ber > 0 && r.pic.maxCPA)
+    .sort((a, b) => (a.pic.headroomPct ?? 999) - (b.pic.headroomPct ?? 999));
+
+  if (!rows.length) {
+    host.innerHTML = `<p class="bench-empty">No campaign has enough orders yet to work out a basket size. The line appears as soon as a product has its first sale.</p>`;
+    return;
+  }
+
+  const body = rows.map(({ c, ber, pic }) => {
+    const over = pic.cpa > pic.maxCPA;
+    const room = pic.headroomPct;
+    const tone = room === null ? '' : room >= 25 ? 'tone-good' : room >= 0 ? 'tone-warning' : 'tone-bad';
+    /* The sentence is the point of the row. A number without it is another
+       benchmark to memorise; with it, the row says what to do. */
+    const verdict = over
+      ? `Paying ${fmtMoney(pic.cpa - pic.maxCPA)} too much on every order.`
+      : `${fmtMoney(pic.maxCPA - pic.cpa)} of room left per order.`;
+    return `
+      <tr class="${tone}">
+        <td class="bench-name">${esc(VE.productLabel(c.name))}<span class="bench-ber">BER ${ber.toFixed(2)}</span></td>
+        <td class="bench-num">${fmtMoney(pic.aov)}</td>
+        <td class="bench-num bench-line">${fmtMoney(pic.maxCPA)}</td>
+        <td class="bench-num ${over ? 'bench-over' : 'bench-under'}">${pic.cpa === null ? '—' : fmtMoney(pic.cpa)}</td>
+        <td class="bench-num">${room === null ? '—' : room + '%'}</td>
+        <td class="bench-say">${verdict}</td>
+      </tr>`;
+  }).join('');
+
+  host.innerHTML = `
+    <table class="bench">
+      <thead>
+        <tr>
+          <th>Product</th>
+          <th class="bench-num">Basket</th>
+          <th class="bench-num">Can afford</th>
+          <th class="bench-num">Paying</th>
+          <th class="bench-num">Room</th>
+          <th>What that means</th>
+        </tr>
+      </thead>
+      <tbody>${body}</tbody>
+    </table>
+    <p class="bench-foot">
+      Can afford = basket × (1 ÷ BER). It moves when your basket moves, so a product
+      that starts selling a bigger bundle can carry a higher cost per order than it could last week.
+    </p>`;
+}
+
 function renderGuardrails() {
   const preset = LS.get('meta_date_preset', 'today');
   const dayIsOver = activeWindow() === 'midnight' || preset === 'yesterday';
@@ -1984,6 +2054,7 @@ function renderAll() {
   renderCommandBar();
   renderVerdicts();
   renderGuardrails();
+  renderBenchmarks();
   renderKpis();
   renderFunnel();
   renderTable();
