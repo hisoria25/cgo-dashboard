@@ -38,7 +38,32 @@
       pct: 40,                              // "DESCALE WITH 40%"
       hardDescalePct: 60,                   // "if it's SUPER unprofitable"
       superUnprofitableRatio: 0.5,          // ROAS below 50% of BER
-      killAfterUnprofitableDays: 2          // "unprofitable 2 days in a row"
+      killAfterUnprofitableDays: 2,         // "unprofitable 2 days in a row"
+
+      /* THE LOOK-BACK. Added after the EcomLiberty SOP, which says it in one
+         line: "use a 3-7 day look-back (not a single bad day) to avoid
+         reacting to noise."
+
+         Until now one unprofitable day cut the budget 40%. That is the same
+         mistake that had me recommending a pause on an ad that went on to
+         return 4x three days later — judging a campaign on a window too
+         narrow to hold its variance. A single day on €90 of spend is five
+         or six purchases. Five purchases is not a trend.
+
+         So the day no longer cuts on its own. The trailing window decides,
+         and when the window still clears break-even the verdict is HOLD. */
+      lookbackDays: 3,
+      lookbackMinDays: 2                    // fewer closed days than this ⇒ no window, fall through
+    },
+    /* Budget floor. Descaling a loaded campaign by 40% does not just lower
+       the number — it starves every ad set under it at once, and ad sets that
+       drop below roughly €25/day stop gathering enough conversions to stay
+       optimised. The SOP's instruction is to trim or consolidate ad sets
+       BEFORE cutting spend. The engine cannot do that for him, so it warns,
+       and it refuses to draw a budget that breaks the floor. */
+    budgetFloor: {
+      loadedBudget: 150,   // €/day — above this, a hard cut destabilises delivery
+      perAdset: 25         // €/day each live ad set needs to keep learning
     },
     weekend: {
       // "ROAS = 3+, Budget x5 | ROAS = 5+, Budget x10"
@@ -901,6 +926,19 @@
        ================================================================= */
     if (profitable) {
       const tier = RULES.scale.tiers.find(t => margin > t.minMargin) || RULES.scale.tiers[RULES.scale.tiers.length - 1];
+
+      /* The look-back cuts both ways. A good day on top of a bad week is the
+         mirror image of a bad day on a good week, and it is the more
+         expensive one to miss: the day says "fine", the budget stays, and the
+         campaign keeps bleeding behind a reassuring number.
+
+         This does NOT move the budget — a profitable day is not grounds for a
+         cut. It warns, loudly, and leaves the decision where it belongs. */
+      const back = trailingRoas(c.history, RULES.descale.lookbackDays);
+      if (back && back.days >= RULES.descale.lookbackMinDays && back.roas < ber) {
+        notes.push(`Careful — the day is green but the week is not. The last ${back.days} closed days pooled are ROAS ${back.roas.toFixed(2)} against break-even ${ber.toFixed(2)}, on ${money(back.spend, ctx.currency)} of spend. Yesterday alone looks profitable. Do not read that as recovery off one day: if the window is still under break-even tomorrow, this is a relaunch candidate, not a scale.`);
+      }
+
       if (ctx.learning && tier.pct > RULES.learning.safeBudgetChangePct) {
         notes.push(`Still in learning. A +${tier.pct}% change counts as a significant edit and restarts it — +${RULES.learning.safeBudgetChangePct}% (${money(c.budget * 1.2, ctx.currency)}) stays under the threshold if you would rather protect the learning it has already done.`);
       } else if (ctx.learning && tier.pct > 0) {
@@ -954,19 +992,64 @@
       }, f, margin, ber, notes);
     }
 
+    /* ---- THE LOOK-BACK GATE ------------------------------------------
+       The day was unprofitable. Before any money moves, ask the wider
+       window whether that day was the campaign or just the weather. */
+    const window = trailingRoas(c.history, RULES.descale.lookbackDays);
+    /* One closed day is not a window — it is the same day the verdict is
+       already judging, wearing a different hat. Below the minimum, there is
+       no second opinion to appeal to and the engine must say so rather than
+       dress a single day up as a trend. */
+    const trail = window && window.days >= RULES.descale.lookbackMinDays ? window : null;
+
+    if (trail && trail.roas >= ber) {
+      return build('HOLD', c, {
+        headline: 'Bad day, good week — hold the budget',
+        newBudget: c.budget,
+        reasons: [
+          `Yesterday closed at ROAS ${c.roas.toFixed(2)}, under break-even ${ber.toFixed(2)}.`,
+          `But the last ${trail.days} closed days pooled together are ROAS ${trail.roas.toFixed(2)} on ${money(trail.spend, ctx.currency)} — still above break-even.`,
+          'One day is five or six purchases. That is noise, not a trend. Leave the budget alone and read it again tomorrow.'
+        ],
+        rule: 'Use a 3-day look-back, not a single bad day. Day under BER but window above BER → HOLD, do not descale.'
+      }, f, margin, ber, notes.concat(creativeNote(c)));
+    }
+
     const superBad = c.roas < ber * RULES.descale.superUnprofitableRatio && unprofitableStreak >= 2;
     const pct = superBad ? RULES.descale.hardDescalePct : RULES.descale.pct;
+
+    /* ---- THE BUDGET FLOOR --------------------------------------------
+       How far the cut is allowed to go. Below roughly €25 per live ad set
+       the ad sets stop collecting enough conversions to stay optimised, so
+       a 40% cut on a loaded campaign can do more damage than the bad day
+       it is answering. */
+    const liveAdsets = Math.max(1, c.adsetCount || 1);
+    const floor = liveAdsets * RULES.budgetFloor.perAdset;
+    const wanted = c.budget * (1 - pct / 100);
+    const clamped = wanted < floor && c.budget > floor;
+    const newBudget = clamped ? floor : wanted;
+
+    if (c.budget >= RULES.budgetFloor.loadedBudget && liveAdsets > 1) {
+      notes.push(`This campaign is carrying ${money(c.budget, ctx.currency)}/day across ${liveAdsets} ad sets. Cutting ${pct}% starves all of them at once. Trim or consolidate the weakest ad set FIRST, then take the budget down — otherwise delivery destabilises and tomorrow's number tells you nothing.`);
+    }
+    if (clamped) {
+      notes.push(`A straight −${pct}% would land on ${money(wanted, ctx.currency)}, under the ${money(floor, ctx.currency)} floor for ${liveAdsets} live ad set${liveAdsets > 1 ? 's' : ''} (${money(RULES.budgetFloor.perAdset, ctx.currency)} each). Held at the floor instead. If it needs to go lower than this, cut ad sets, not the budget.`);
+    }
+
     return build('DESCALE', c, {
-      headline: `Descale −${pct}%`,
-      newBudget: c.budget * (1 - pct / 100),
+      headline: clamped ? `Descale to the floor — ${money(newBudget, ctx.currency)}` : `Descale −${pct}%`,
+      newBudget,
       reasons: [
         `ROAS ${c.roas.toFixed(2)} is below break-even ${ber.toFixed(2)} (margin ${margin}%).`,
+        trail
+          ? `The last ${trail.days} closed days pooled are ROAS ${trail.roas.toFixed(2)} on ${money(trail.spend, ctx.currency)} — also under break-even, so this is the campaign, not one bad day.`
+          : 'Not enough closed history for a look-back window yet, so the day stands on its own.',
         superBad
           ? 'Deeply unprofitable and never consistent — cut harder than the standard 40%.'
-          : 'Cut 40% and let it re-optimise tomorrow.',
+          : `Cut ${pct}% and let it re-optimise tomorrow.`,
         unprofitableStreak >= 1 ? `Unprofitable ${unprofitableStreak} day(s) running. One more and it dies.` : ''
       ].filter(Boolean),
-      rule: 'ROAS < BER (unprofitable) → DESCALE WITH 40%, let it optimize the next day'
+      rule: 'Day AND 3-day window both under BER → descale. The window is what makes the cut, not the day.'
     }, f, margin, ber, notes);
   }
 
@@ -1134,6 +1217,29 @@
     return streak;
   }
 
+  /* Trailing ROAS over the last `days` CLOSED days with spend.
+
+     Pooled, never an average of daily ratios. A €12 day and a €300 day are
+     not two equal opinions: averaging their ROAS lets the small day shout.
+     Sum the money, then divide — that is the ROAS he actually got.
+
+     Zero-spend days are skipped rather than counted as zeros; a day the
+     campaign was off is not evidence about the creative or the offer.
+     Returns null when there is not enough history to say anything. */
+  function trailingRoas(history, days) {
+    if (!Array.isArray(history) || !(days > 0)) return null;
+    let spend = 0, revenue = 0, n = 0;
+    for (let i = history.length - 1; i >= 0 && n < days; i--) {
+      const s = num(history[i].spend);
+      if (s <= 0) continue;
+      spend += s;
+      revenue += num(history[i].revenue);
+      n++;
+    }
+    if (n === 0 || spend <= 0) return null;
+    return { roas: revenue / spend, spend, revenue, days: n };
+  }
+
   function countProfitableStreak(history, ber) {
     if (!Array.isArray(history) || !ber) return 0;
     let streak = 0;
@@ -1170,6 +1276,9 @@
       atc: num(c.atc),
       ic: num(c.ic),
       history: c.history || [],
+      // How many ad sets the budget has to feed — the budget floor is per ad
+      // set, so one number cannot answer it.
+      adsetCount: num(c.adsetCount),
       descaleCount: num(c.descaleCount),
       profitableStreak: num(c.profitableStreak),
       surfedRecently: !!c.surfedRecently,
@@ -1248,6 +1357,6 @@
     berAfterRefunds, netOfRefunds, clampRate,
     cpaPicture, dayPacing, brokenStage, creativeHealth, adFatigue, median, angleCoverage, ANGLES,
     verdict, guardrails, deliveryAlarms, productLabel,
-    countUnprofitableStreak, countProfitableStreak, money
+    countUnprofitableStreak, countProfitableStreak, trailingRoas, money
   };
 });
