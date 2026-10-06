@@ -761,3 +761,9 @@ th.highlight-col { border-bottom: 2px solid var(--accent-primary) !important; }
   .bench td, .bench th { padding-left: 6px; padding-right: 6px; }
   .bench { font-size: 12px; }
 }
+/* The window note has to read as a condition on the table, not as more prose,
+   so it sits tight above it with a rule down the side. */
+.bench-window-note {
+  font-size: 12px; color: var(--text-secondary); margin: -6px 0 14px;
+  padding-left: 10px; border-left: 2px solid var(--border, rgba(128,128,128,.35));
+}
