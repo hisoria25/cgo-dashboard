@@ -746,6 +746,10 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       const spend = parseFloat(r.spend) || 0;
       return {
         date: r.date_start, spend, revenue: conv.revenue,
+        // Orders per day. The API already returns them; they were being
+        // dropped. The benchmarks panel needs them to work out a basket size
+        // over a fixed window rather than over whatever date the user picked.
+        purchases: conv.purchases,
         roas: spend > 0 ? conv.revenue / spend : 0,
         ctr: parseFloat(r.inline_link_click_ctr) || 0,
         cpm: parseFloat(r.cpm) || 0,
@@ -1282,21 +1286,42 @@ function renderBenchmarks() {
   const host = document.getElementById('bench-table');
   if (!host) return;
 
+  /* THE WINDOW IS FIXED, AND DELIBERATELY NOT THE ONE IN THE DATE BAR.
+
+     This panel first shipped reading whatever range was selected. On "today"
+     at 16:00 it said AtemFrei was overpaying €9.35 an order; over seven closed
+     days the same campaign had €5.57 of room. Both numbers were arithmetically
+     right. Spend lands the moment it is spent and orders attribute back over
+     the following hours, so any partial day shows all of the cost against part
+     of the revenue, and every campaign looks like it is bleeding.
+
+     A break-even line is a property of the product, not of an afternoon. So it
+     is read over the last 7 CLOSED days — the partial day never enters it, and
+     the figure does not swing when the date bar moves. */
+  const WINDOW_DAYS = 7;
+
   const rows = State.campaigns
     .filter(c => !/PAUSED|ARCHIVED|DELETED/i.test(c.status || ''))
     .map(c => {
       const { ber, grossMargin } = berFor(c);
-      const pic = VE.cpaPicture(c, grossMargin);
-      return { c, ber, pic };
+      const w = VE.trailingRoas(c.history, WINDOW_DAYS);
+      if (!w || !w.purchases) return null;
+      // cpaPicture works on a {spend, revenue, purchases} shape — hand it the
+      // window instead of the campaign so it reads closed days only.
+      const pic = VE.cpaPicture(w, grossMargin);
+      return { c, ber, pic, days: w.days };
     })
-    // A campaign with no orders yet has no basket size, so no line to draw.
+    .filter(Boolean)
+    // A product with no orders in the window has no basket size, so no line.
     .filter(r => r.ber > 0 && r.pic.maxCPA)
     .sort((a, b) => (a.pic.headroomPct ?? 999) - (b.pic.headroomPct ?? 999));
 
   if (!rows.length) {
-    host.innerHTML = `<p class="bench-empty">No campaign has enough orders yet to work out a basket size. The line appears as soon as a product has its first sale.</p>`;
+    host.innerHTML = `<p class="bench-empty">No campaign has an order in the last ${WINDOW_DAYS} closed days, so there is no basket size to work from yet. The line appears as soon as a product sells.</p>`;
     return;
   }
+
+  const spanDays = Math.max(...rows.map(r => r.days));
 
   const body = rows.map(({ c, ber, pic }) => {
     const over = pic.cpa > pic.maxCPA;
@@ -1336,6 +1361,12 @@ function renderBenchmarks() {
       Can afford = basket × (1 ÷ BER). It moves when your basket moves, so a product
       that starts selling a bigger bundle can carry a higher cost per order than it could last week.
     </p>`;
+  /* Said on the card, not only in the code: the panel ignores the date bar on
+     purpose, and a reader who does not know that will think it is broken. */
+  const note = document.getElementById('bench-window-note');
+  if (note) {
+    note.textContent = `Last ${spanDays} closed day${spanDays === 1 ? '' : 's'} — not the date range above. Today is left out until it closes, because a half-finished day shows all of the cost against part of the sales and makes every product look like it is losing money.`;
+  }
 }
 
 function renderGuardrails() {
