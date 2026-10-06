@@ -681,12 +681,19 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
   // campaign must not have its budget touched.
   const adsetBudget = {};
   const learningByCampaign = {};
+  // How many ad sets are actually DELIVERING. The descale floor is per ad set:
+  // the same €40 cut is harmless on one ad set and starves four. Paused and
+  // deleted ad sets are not fed, so they must not count toward the floor.
+  const liveAdsetsByCampaign = {};
   (adsets || []).forEach(s => {
     if ((s.effective_status || '').toUpperCase() === 'DELETED') return;
     const b = s.daily_budget ? parseFloat(s.daily_budget) / 100 : 0;
     if (b) adsetBudget[s.campaign_id] = (adsetBudget[s.campaign_id] || 0) + b;
     const stage = s.learning_stage_info && s.learning_stage_info.status;
     if (/^LEARNING$/i.test(stage || '')) learningByCampaign[s.campaign_id] = true;
+    if (/^ACTIVE$/i.test(s.effective_status || '')) {
+      liveAdsetsByCampaign[s.campaign_id] = (liveAdsetsByCampaign[s.campaign_id] || 0) + 1;
+    }
   });
 
   // History, day by day, per campaign. This range ends yesterday, which is
@@ -780,6 +787,7 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       learning: !!learningByCampaign[c.id],
       budget,
       budgetSource,
+      adsetCount: liveAdsetsByCampaign[c.id] || 0,
       series,
       createdTime: c.created_time,
       daysLive: Math.max(1, closedDays + (judgingToday && spend > 0 ? 1 : 0)),
