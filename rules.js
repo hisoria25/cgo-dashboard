@@ -53,7 +53,27 @@
          So the day no longer cuts on its own. The trailing window decides,
          and when the window still clears break-even the verdict is HOLD. */
       lookbackDays: 3,
-      lookbackMinDays: 2                    // fewer closed days than this ⇒ no window, fall through
+      lookbackMinDays: 2,                   // fewer closed days than this ⇒ no window, fall through
+
+      /* How loud one day is allowed to be inside the window, as a multiple
+         of the median day's spend. At 2, a day can carry twice the weight of
+         a normal day and no more — enough that a genuinely busy day still
+         counts for more, not enough that one runaway budget decides the
+         verdict on its own. Set this to Infinity to pool with no cap. */
+      dayWeightCap: 2,
+
+      /* THE DEAD ZONE, in % below break-even.
+
+         Celsior came up for a 40% cut on a window of 1.54 against a
+         break-even of 1.55 — six tenths of one percent under. One extra
+         order would have flipped it the other way. A 40% budget cut is a
+         large, destabilising move; "almost exactly break-even" is not
+         evidence for it, it is evidence that the campaign is sitting on the
+         line and the next few days will say which side it falls.
+
+         So inside this band the answer is HOLD and watch. Below it, the
+         decline is bigger than the noise and the cut stands. */
+      holdBandPct: 10
     },
     /* Budget floor. Descaling a loaded campaign by 40% does not just lower
        the number — it starves every ad set under it at once, and ad sets that
@@ -1002,6 +1022,23 @@
        dress a single day up as a trend. */
     const trail = window && window.days >= RULES.descale.lookbackMinDays ? window : null;
 
+    /* Sitting on the line. Not profitable, but not far enough under for a
+       40% cut to be the proportionate answer. */
+    const band = ber * (1 - RULES.descale.holdBandPct / 100);
+    if (trail && trail.roas < ber && trail.roas >= band) {
+      const shortBy = round1((1 - trail.roas / ber) * 100);
+      return build('HOLD', c, {
+        headline: 'On the line — hold and watch',
+        newBudget: c.budget,
+        reasons: [
+          `The last ${trail.days} closed days pooled are ROAS ${trail.roas.toFixed(2)} against break-even ${ber.toFixed(2)} — short by ${shortBy}%.`,
+          `That is inside the ${RULES.descale.holdBandPct}% band where a day's noise is bigger than the gap. A 40% cut is a large move to make on a difference this small.`,
+          'Leave it. If it is still under tomorrow, the gap will have widened and the cut becomes the right call.'
+        ],
+        rule: `Window within ${RULES.descale.holdBandPct}% of break-even → HOLD, not descale.`
+      }, f, margin, ber, notes.concat(creativeNote(c)));
+    }
+
     if (trail && trail.roas >= ber) {
       return build('HOLD', c, {
         headline: 'Bad day, good week — hold the budget',
@@ -1228,20 +1265,61 @@
      Returns null when there is not enough history to say anything. */
   function trailingRoas(history, days) {
     if (!Array.isArray(history) || !(days > 0)) return null;
-    let spend = 0, revenue = 0, purchases = 0, n = 0;
-    for (let i = history.length - 1; i >= 0 && n < days; i--) {
-      const s = num(history[i].spend);
-      if (s <= 0) continue;
-      spend += s;
-      revenue += num(history[i].revenue);
+
+    const picked = [];
+    for (let i = history.length - 1; i >= 0 && picked.length < days; i--) {
+      if (num(history[i].spend) > 0) picked.push(history[i]);
+    }
+    if (!picked.length) return null;
+
+    /* ---- THE OUTLIER CAP ------------------------------------------------
+       Pooling is right: sum the money, then divide, so a €12 day cannot
+       shout as loudly as a €300 one. But it has a mirror failure nobody
+       hit until a €3,000 budget went in by mistake.
+
+       On 11 Oct the account spent €4,184 against a normal €1,100. That one
+       day was 65% of the three-day window, so the "3-day look-back" was
+       really one day wearing a trenchcoat, and it marked four profitable
+       campaigns for a 40% cut.
+
+       A day far outside the normal range is not a bigger version of the
+       same experiment — it is a different one. Four times the budget buys
+       much colder audience, so its ROAS describes that day's reach, not the
+       offer. It still gets a vote; it does not get to outvote the week.
+
+       So each day's weight is capped at a multiple of the MEDIAN day. The
+       median is used rather than the mean because the outlier would drag a
+       mean upwards and quietly raise its own ceiling. Revenue and orders
+       scale by the same factor, so the day keeps its ROAS and its basket
+       size — only its loudness is reduced. */
+    const med = median(picked.map(d => num(d.spend)));
+    const cap = med > 0 ? med * RULES.descale.dayWeightCap : 0;
+
+    let spend = 0, revenue = 0, purchases = 0, rawSpend = 0, rawRevenue = 0, capped = 0;
+    for (const d of picked) {
+      const s = num(d.spend);
+      const w = (cap > 0 && s > cap) ? cap / s : 1;
+      if (w < 1) capped++;
+      spend += s * w;
+      revenue += num(d.revenue) * w;
       // Orders ride along so a caller can work out a basket size over the
       // same window. Older history rows may not carry them; those sum to 0,
       // and a caller that needs orders checks for 0 rather than assuming.
-      purchases += num(history[i].purchases);
-      n++;
+      purchases += num(d.purchases) * w;
+      rawSpend += s;
+      rawRevenue += num(d.revenue);
     }
-    if (n === 0 || spend <= 0) return null;
-    return { roas: revenue / spend, spend, revenue, purchases, days: n };
+    if (spend <= 0) return null;
+
+    return {
+      roas: revenue / spend,
+      spend, revenue, purchases, days: picked.length,
+      // What it would have said without the cap, and how many days were
+      // turned down. A verdict that hinges on this should be able to say so.
+      cappedDays: capped,
+      rawRoas: rawSpend > 0 ? rawRevenue / rawSpend : 0,
+      rawSpend
+    };
   }
 
   function countProfitableStreak(history, ber) {
