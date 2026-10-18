@@ -91,6 +91,13 @@
         { minRoas: 5, multiplier: 10 },
         { minRoas: 3, multiplier: 5 }
       ],
+      /* What counts as "this was surfed", read from the spend. A surf is a
+         ×5 or ×10 move, so 1.5× is a generous floor that still excludes an
+         ordinary busy weekend. */
+      scaleUpRatio: 1.5,
+      scaleUpRecentDays: 2,   // Sat + Sun
+      scaleUpBaseDays: 5,     // the working week before them
+      scaleUpMinDays: 5,      // below this there is no baseline to compare to
       // Sunday night pull-back
       sundayNight: [
         { minRoas: 5, descalePct: 30 },
@@ -865,11 +872,25 @@
       notes.push('Weekend, but ROAS is under 3 — no surf. Normal rules apply.');
     }
 
-    // ---- SUNDAY NIGHT PULL-BACK ---------------------------------------
-    // Only winners get pulled back — they are the ones that were scaled up
-    // over the weekend. A loser on Sunday night is still a loser, and falls
-    // through to the normal kill / descale rules below.
-    if (ctx.isSunday && win === 'midnight' && profitable) {
+    /* ---- SUNDAY NIGHT PULL-BACK ---------------------------------------
+       The pull-back exists to UNDO a weekend surf. It is not a rule about
+       Sundays; it is the second half of a scale-up.
+
+       It used to fire on any profitable campaign on a Sunday, on the
+       assumption that a winner on Sunday night must have been surfed. That
+       assumption is false, and on 18 Oct it told Velmira and LidLux — both
+       profitable, neither touched all weekend — to give up 40% of their
+       budget for nothing. A note at the bottom of the card said "no weekend
+       scale-up recorded", but the headline still said −40% and the card
+       still drew the new budget, so the note was worth nothing.
+
+       Now it needs evidence that a surf actually happened: either the
+       action log says so, or the spend itself shows it. The spend test is
+       there because a surf applied by hand in Ads Manager never reaches the
+       log, and a rule that only works when he remembers to click Applied is
+       not a rule. */
+    const surfed = c.surfedRecently || weekendScaleUp(c.history);
+    if (ctx.isSunday && win === 'midnight' && profitable && surfed) {
       const tier = RULES.weekend.sundayNight.find(t => c.roas >= t.minRoas);
       return build('DESCALE', c, {
         headline: `Sunday pull-back −${tier.descalePct}%`,
@@ -879,7 +900,10 @@
           'Always scale back Sunday night — Monday brings a hard dip.'
         ],
         rule: `Sunday night ROAS ${tier.minRoas === 0 ? '<3' : tier.minRoas + '+'} → descale ${tier.descalePct}%`
-      }, f, margin, ber, c.surfedRecently ? [] : ['No weekend scale-up recorded for this one — if you never raised its budget this weekend, leave it alone.']);
+      }, f, margin, ber, c.surfedRecently ? [] : ['The weekend scale-up was spotted in the spend rather than the action log — check the budget really did go up before you take it down.']);
+    }
+    if (ctx.isSunday && win === 'midnight' && profitable && !surfed) {
+      notes.push('Sunday, but this was never scaled up over the weekend — spend is in line with its normal days. There is nothing to pull back, so the ordinary rules decide below.');
     }
 
     /* ================= MORNING READ (≈11:00) =========================
@@ -1378,6 +1402,29 @@
     };
   }
 
+  /* Did this campaign actually get scaled up over the weekend?
+
+     Read from the spend, because a surf applied by hand in Ads Manager
+     never reaches the action log. The most recent closed days are compared
+     against the quieter run before them, both as medians so one heavy day
+     on either side cannot decide it.
+
+     A surf is a multiplication — ×5 or ×10 in the sheet — so the bar is set
+     well above ordinary daily drift: nothing under half as much again
+     counts, and a campaign simply having a busy Saturday does not. */
+  function weekendScaleUp(history) {
+    if (!Array.isArray(history)) return false;
+    const spends = history.map(d => num(d.spend)).filter(s => s > 0);
+    if (spends.length < RULES.weekend.scaleUpMinDays) return false;
+    const recent = spends.slice(-RULES.weekend.scaleUpRecentDays);
+    const before = spends.slice(-(RULES.weekend.scaleUpRecentDays + RULES.weekend.scaleUpBaseDays),
+                                -RULES.weekend.scaleUpRecentDays);
+    if (!recent.length || !before.length) return false;
+    const base = median(before);
+    if (base <= 0) return false;
+    return median(recent) / base >= RULES.weekend.scaleUpRatio;
+  }
+
   function countProfitableStreak(history, ber) {
     if (!Array.isArray(history) || !ber) return 0;
     let streak = 0;
@@ -1495,6 +1542,6 @@
     berAfterRefunds, netOfRefunds, clampRate,
     cpaPicture, dayPacing, brokenStage, creativeHealth, adFatigue, median, angleCoverage, ANGLES,
     verdict, guardrails, deliveryAlarms, productLabel,
-    countUnprofitableStreak, countProfitableStreak, trailingRoas, money
+    countUnprofitableStreak, countProfitableStreak, trailingRoas, weekendScaleUp, money
   };
 });
