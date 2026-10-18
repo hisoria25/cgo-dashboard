@@ -118,6 +118,32 @@
       ctrDropFade: 20,     // % below baseline, WITH cpm also climbing
       cpmRise: 20,         // % above baseline — the corroborating signal
       freqFading: 2.0,     // frequency.fatigue (2.5) is the worn-out line
+
+      /* THE SUSTAINED SLIDE — a second route to "worn" that does not ask
+         frequency's permission.
+
+         Making frequency the gate was an over-correction. On 17 Oct the
+         engine called every campaign fresh while AtemFrei's CTR had gone
+         4.10 -> 2.61 over fourteen clean days and its CPM 21 -> 29. Four
+         campaigns were down 31-36% and all read "fresh", because none of
+         them reaches frequency 2.0.
+
+         They never will. Frequency counts how often the SAME person sees an
+         ad; on a rising budget Meta keeps finding NEW people, so frequency
+         stays near 1.1 while the creative burns out across the whole market.
+         DermaGleit sat at frequency 1.03 — almost nobody had seen it twice —
+         with CTR down 34%.
+
+         So the shape of the line gets its own vote. The window is split in
+         half and the halves' medians compared, which is slower to react than
+         three days but cannot be swung by one odd day. On top of that, most
+         of the recent half has to sit below the old median: a real decline
+         is persistent, while a spike-and-recover is not. */
+      sustainedMinDays: 10,  // closed days needed before a trend is claimed
+      ctrSlideWorn: 22,      // % the recent half is below the older half
+      ctrSlideFade: 12,
+      sustainedShare: 0.7,   // this much of the recent half must be below baseline
+
       adCtrSpread: 0.4,    // ads this far apart ⇒ campaign CTR is a blend
       adMinSpendShare: 0.05 // ignore ads under 5% of spend — they prove nothing
     },
@@ -628,6 +654,22 @@
     const ctrFalling = ctrDropPct >= R.ctrDropFade;
     const cpmClimbing = cpmRisePct >= R.cpmRise;
 
+    /* ---- the sustained slide, judged on halves of the window -----------
+       Medians, so one spike cannot manufacture a decline; and a share test,
+       so a decline that already recovered does not count as one. */
+    const half = Math.floor(rows.length / 2);
+    const earlyCtrs = ctrs.slice(0, half);
+    const lateCtrs = ctrs.slice(-half);
+    const earlyMed = median(earlyCtrs);
+    const lateMed = median(lateCtrs);
+    const slidePct = earlyMed > 0 ? round1(((earlyMed - lateMed) / earlyMed) * 100) : 0;
+    const belowShare = earlyMed > 0 && lateCtrs.length
+      ? lateCtrs.filter(v => v < earlyMed).length / lateCtrs.length : 0;
+    const longEnough = rows.length >= R.sustainedMinDays;
+    const persistent = longEnough && belowShare >= R.sustainedShare;
+    const slideWorn = persistent && slidePct >= R.ctrSlideWorn;
+    const slideFading = persistent && slidePct >= R.ctrSlideFade;
+
     let state, headline, detail;
     if (freq >= FAT) {
       state = 'worn';
@@ -637,6 +679,11 @@
       state = 'worn';
       headline = 'Worn out — upload fresh creatives today';
       detail = 'Frequency is climbing and click-through has fallen hard. Two signals agreeing is real fatigue.';
+    } else if (slideWorn) {
+      /* Frequency is not consulted here on purpose — see ctrSlideWorn. */
+      state = 'worn';
+      headline = 'Worn out — upload fresh creatives today';
+      detail = `Click-through has slid ${slidePct}% across ${rows.length} closed days and stayed down. Frequency is only ${round2(freq)}, which means the market is tiring of this creative rather than the same people seeing it twice — and a bigger budget makes that worse, not better.`;
     } else if (freq >= R.freqFading) {
       state = 'fading';
       headline = 'Fading — start shooting now';
@@ -645,10 +692,16 @@
       state = 'fading';
       headline = 'Fading — start shooting now';
       detail = 'Click-through is down and the auction is getting more expensive at the same time. Two independent signals, so this is decay rather than noise.';
+    } else if (slideFading) {
+      state = 'fading';
+      headline = 'Fading — start shooting now';
+      detail = `Click-through is ${slidePct}% below where it was earlier in the window and has not come back. Not steep enough to stop anything today, but it is going one way.`;
     } else {
       state = 'fresh';
       headline = 'Fresh — leave it alone';
-      detail = `Frequency ${round2(freq)} is below ${R.freqFading}. At this level a CTR move is the budget mix or the audience, not a tired creative.`;
+      detail = longEnough
+        ? `Click-through is holding across ${rows.length} closed days and frequency is ${round2(freq)}. Nothing here says the creative is tiring.`
+        : `Frequency ${round2(freq)} is below ${R.freqFading} and there is not yet a long enough run of days to read a trend.`;
     }
 
     const signals = [`Frequency ${round2(freq)} — the fatigue line is ${FAT}.`];
@@ -660,8 +713,11 @@
     if (cpmClimbing) {
       signals.push(`CPM ${round2(cpmRecent)} — up ${cpmRisePct}% on its baseline. Meta is charging more to keep placing this.`);
     }
-    if (state === 'fresh' && ctrFalling) {
-      signals.push(`Watch only: CTR is off ${ctrDropPct}%, but with frequency at ${round2(freq)} that is the mix moving, not the creative dying.`);
+    if (longEnough && slidePct >= R.ctrSlideFade) {
+      signals.push(`Over the window: CTR ${round2(earlyMed)}% in the first half against ${round2(lateMed)}% in the second — a ${slidePct}% slide, with ${Math.round(belowShare * 100)}% of recent days below the old level.`);
+    }
+    if (state === 'fresh' && ctrFalling && !persistent) {
+      signals.push(`Watch only: the last ${n} days are off ${ctrDropPct}%, but the slide has not held across the window — more likely the mix than the creative.`);
     }
     if (adRead.mixWarning) signals.push(adRead.mixWarning);
     if (adRead.worstAd) signals.push(adRead.worstAd.note);
