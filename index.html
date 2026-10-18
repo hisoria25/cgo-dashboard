@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CGO Media Buyer — Verdict Dashboard</title>
   <meta name="description" content="Meta ads decision dashboard running the Samuel Ecom scaling rules: scale, keep, descale or kill, with the exact new budget.">
-  <link rel="stylesheet" href="style.css?v=20261018a">
+  <link rel="stylesheet" href="style.css?v=20261018b">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
@@ -41,6 +41,13 @@
       <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle theme">☀️</button>
     </div>
   </div>
+
+  <!-- One tab per ad account. The page reads exactly one at a time, because a
+       merged picture hides which account is spending the money. -->
+  <div class="container account-tab-bar">
+    <div id="account-tabs" class="acct-tabs" role="tablist" aria-label="Ad account"></div>
+    <span id="acct-hint" class="acct-hint">Reading one account at a time</span>
+  </div>
 </header>
 
 <!-- ======================= META API MODAL ======================= -->
@@ -54,9 +61,16 @@
       <p class="modal-intro">Credentials are stored in this browser only. Nothing is sent anywhere except Meta.</p>
 
       <div class="form-group mb14">
-        <label for="meta-account-id">Ad Account IDs</label>
-        <textarea id="meta-account-id" class="sandbox-textarea acct-input" placeholder="act_1234567890, act_9876543210"></textarea>
-        <span class="hint">Keep the <code>act_</code> prefix. Running several accounts for ban prevention? Separate them with commas — the dashboard merges them into one picture.</span>
+        <label>Ad accounts</label>
+        <div id="acct-manager" class="acct-manager"><!-- injected: one row per tab --></div>
+        <div class="acct-add-row">
+          <input type="text" id="acct-new-id" class="search-input" placeholder="act_1234567890" />
+          <input type="text" id="acct-new-label" class="search-input" placeholder="Tab name" />
+          <button id="btn-acct-add" class="btn btn-secondary">Add</button>
+        </div>
+        <span class="hint">Each account gets its own tab, and its own margins, break-even overrides and action log.
+          The dashboard reads one at a time — it never merges them, because a campaign in one account
+          must not be judged against another account's economics.</span>
       </div>
 
       <div class="form-group mb14">
@@ -434,7 +448,7 @@
 <!-- The ?v= token is what stops the browser serving yesterday's engine.
      Bump it on every deploy; without it a rules.js change can sit invisible
      in cache for days while the page quietly runs the old logic. -->
-<script src="rules.js?v=20261018a"></script>
-<script src="app.js?v=20261018a"></script>
+<script src="rules.js?v=20261018b"></script>
+<script src="app.js?v=20261018b"></script>
 </body>
 </html>
