@@ -49,8 +49,11 @@ const CTA_VERBS_LIST = ['shop', 'buy', 'get', 'claim', 'download', 'learn', 'try
  * ========================================================================== */
 document.addEventListener('DOMContentLoaded', () => {
   initTheme();
+  migrateAccountState();     // must run before anything reads a scoped key
   loadEconomics();
   setupModals();
+  setupAccountTabs();
+  setupAccountManager();
   setupWindowTabs();
   setupDateBar();
   setupTableControls();
@@ -105,7 +108,7 @@ function initTheme() {
  *  UNIT ECONOMICS
  * ========================================================================== */
 function loadEconomics() {
-  const saved = LS.json('cgo_econ', { price: 29.95, cogs: 7, shipping: 2, feePct: 3, refundRate: 0 });
+  const saved = acctJson('cgo_econ', { price: 29.95, cogs: 7, shipping: 2, feePct: 3, refundRate: 0 });
   ['price', 'cogs', 'shipping', 'fees', 'refunds'].forEach(k => {
     const el = document.getElementById('econ-' + k);
     if (!el) return;
@@ -160,7 +163,7 @@ function setupModals() {
   const open = (id) => document.getElementById(id).classList.add('show');
   const close = (id) => document.getElementById(id).classList.remove('show');
 
-  document.getElementById('settings-toggle').addEventListener('click', () => open('settings-modal'));
+  document.getElementById('settings-toggle').addEventListener('click', () => { renderAccountManager(); open('settings-modal'); });
   document.getElementById('econ-toggle').addEventListener('click', () => { renderEconomicsPreview(); open('econ-modal'); });
   document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => close(b.dataset.close)));
   document.querySelectorAll('.modal-overlay').forEach(m =>
@@ -171,25 +174,22 @@ function setupModals() {
 
   document.getElementById('btn-save-econ').addEventListener('click', () => {
     const inputs = readEconomicsInputs();
-    LS.set('cgo_econ', JSON.stringify(inputs));
+    acctSet('cgo_econ', JSON.stringify(inputs));
     State.econ = VE.economics(inputs);
     close('econ-modal');
+    renderAccountTabs();       // clears the "no economics yet" warning
     renderAll();
   });
 
   // Meta API settings
-  const accEl = document.getElementById('meta-account-id');
   const tokEl = document.getElementById('meta-access-token');
   const dateEl = document.getElementById('meta-date-preset');
-  accEl.value = LS.get('meta_account_ids', '') || LS.get('meta_account_id', '');
   tokEl.value = LS.get('meta_access_token', '');
   dateEl.value = LS.get('meta_date_preset', 'today');
 
   document.getElementById('btn-save-settings').addEventListener('click', () => {
-    const acc = accEl.value.trim(), tok = tokEl.value.trim();
-    if (!acc || !tok) { showModal('Missing details', 'Both the Ad Account ID and the Access Token are needed.'); return; }
-    LS.set('meta_account_ids', acc);
-    LS.del('meta_account_id');
+    const tok = tokEl.value.trim();
+    if (!tok) { showModal('Missing token', 'An access token is needed. The accounts themselves are managed in the list above.'); return; }
     LS.set('meta_access_token', tok);
     LS.set('meta_date_preset', dateEl.value);
     State.range = null;              // an explicit preset overrides any custom range
@@ -199,8 +199,10 @@ function setupModals() {
   });
 
   document.getElementById('btn-disconnect-settings').addEventListener('click', () => {
-    LS.del('meta_account_ids'); LS.del('meta_account_id'); LS.del('meta_access_token');
-    accEl.value = ''; tokEl.value = '';
+    /* Disconnect drops the token only. The account tabs and their economics
+       stay — pasting a fresh token puts everything back as it was. */
+    LS.del('meta_access_token');
+    tokEl.value = '';
     close('settings-modal');
     setApiStatus('offline');
     loadData();
@@ -398,12 +400,197 @@ async function graph(path, params) {
   throw new Error(lastErr || 'Graph API unreachable');
 }
 
-/* Ban prevention means several small ad accounts, so the dashboard reads all
-   of them and shows one merged picture. */
+/* Ban prevention means several small ad accounts. Merging them into one
+   picture used to hide which account was actually burning the money, and a
+   campaign in one account would be judged against another account's margins.
+   So the header carries one tab per account and the page reads exactly one
+   at a time. */
+const DEFAULT_ACCOUNTS = [
+  { id: 'act_2995536273958154', label: 'Chic-Shop' },
+  { id: 'act_1679754109728357', label: 'Main 1' },
+  { id: 'act_1563288332017037', label: 'Main 2' }
+];
+
+const normAcc = (a) => (String(a).startsWith('act_') ? String(a) : 'act_' + a);
+const shortLabel = (id) => 'Account ' + String(id).replace(/^act_/, '').slice(-4);
+
+/* The registry is seeded once from whatever was already connected, so nobody
+   loses the account they were reading when this shipped. */
+function accountRegistry() {
+  let list = null;
+  try { list = JSON.parse(LS.get('cgo_accounts', '')); } catch (e) { list = null; }
+  if (!Array.isArray(list) || !list.length) {
+    list = DEFAULT_ACCOUNTS.slice();
+    (LS.get('meta_account_ids', '') || LS.get('meta_account_id', ''))
+      .split(/[\s,;]+/).filter(Boolean).map(normAcc)
+      .forEach(id => { if (!list.some(a => normAcc(a.id) === id)) list.unshift({ id, label: shortLabel(id) }); });
+    LS.set('cgo_accounts', JSON.stringify(list));
+  }
+  return list.map(a => ({ id: normAcc(a.id), label: a.label || shortLabel(a.id) }));
+}
+
+function activeAccount() {
+  const reg = accountRegistry();
+  return reg.find(a => a.id === LS.get('cgo_active_account', '')) || reg[0];
+}
+
+function setActiveAccount(id) {
+  if (activeAccount().id === id) return;
+  LS.set('cgo_active_account', id);
+  State.range = null;          // a custom range from the old account means nothing here
+  loadEconomics();             // this account's margins, not the last one's
+  renderAccountTabs();
+  renderTokenStatus();
+  loadData();
+}
+
 function accountIds() {
-  const raw = LS.get('meta_account_ids', '') || LS.get('meta_account_id', '');
-  return raw.split(/[\s,;]+/).filter(Boolean)
-    .map(a => (a.startsWith('act_') ? a : 'act_' + a));
+  const acct = activeAccount();
+  return acct ? [acct.id] : [];
+}
+
+/* ---------------------------------------------------------------------------
+   Everything below is per account, not per dashboard. Margins, break-even
+   overrides and the applied-action log all describe ONE account's products.
+   Sharing them across tabs would judge a Main 1 campaign against Chic-Shop's
+   economics — a wrong verdict that looks perfectly reasonable on screen.
+
+   ACCOUNT_SCOPED names the keys that move. Each gets suffixed with the
+   account id; the first time an account is opened, whatever was stored
+   globally is copied in, so nothing is lost on upgrade. */
+const ACCOUNT_SCOPED = ['cgo_econ', 'cgo_ber_overrides', 'cgo_action_log'];
+
+function acctKey(base, id) { return `${base}::${id || activeAccount().id}`; }
+
+/* The old global value belongs to the account that was connected when it was
+   written — the one seeded first in the registry. It is copied, never moved,
+   so a downgrade still finds its data where it left it. */
+function migrateAccountState() {
+  const first = accountRegistry()[0];
+  if (!first || LS.get('cgo_scoped_v1', '')) return;
+  ACCOUNT_SCOPED.forEach(base => {
+    const legacy = LS.get(base, '');
+    if (legacy && !LS.get(acctKey(base, first.id), '')) LS.set(acctKey(base, first.id), legacy);
+  });
+  LS.set('cgo_scoped_v1', '1');
+}
+
+const acctJson = (base, dflt) => LS.json(acctKey(base), dflt);
+const acctSet = (base, value) => LS.set(acctKey(base), value);
+
+function renderAccountTabs() {
+  const host = document.getElementById('account-tabs');
+  if (!host) return;
+  const act = activeAccount();
+  host.innerHTML = accountRegistry().map(a =>
+    `<button class="acct-tab${a.id === act.id ? ' active' : ''}" data-acct="${esc(a.id)}"
+             title="${esc(a.id)}">${esc(a.label)}</button>`).join('');
+
+  /* An account nobody has configured yet is being judged against the default
+     €29.95 economics. Saying so out loud is the difference between a verdict
+     you can trust and one that merely looks confident. */
+  const hint = document.getElementById('acct-hint');
+  if (!hint) return;
+  const configured = !!LS.get(acctKey('cgo_econ', act.id), '');
+  hint.innerHTML = configured
+    ? 'Reading one account at a time'
+    : `<strong>${esc(act.label)}</strong> has no unit economics yet — verdicts use the defaults until you set them`;
+  hint.classList.toggle('acct-hint-warn', !configured);
+}
+
+/* ---------------------------------------------------------------------------
+   The account manager inside the settings modal. Rename a tab, remove one,
+   add one — without needing the code changed.
+
+   Removing a tab deliberately leaves that account's margins and logs in
+   storage. Someone who removes a tab by accident, or who adds the same
+   account back next month, gets their numbers back rather than a silent
+   reset to the €29.95 defaults. */
+function saveRegistry(list) { LS.set('cgo_accounts', JSON.stringify(list)); }
+
+function renderAccountManager() {
+  const host = document.getElementById('acct-manager');
+  if (!host) return;
+  const reg = accountRegistry();
+  const act = activeAccount().id;
+  host.innerHTML = reg.map((a, i) => `
+    <div class="acct-row${a.id === act ? ' acct-row-active' : ''}">
+      <input type="text" class="search-input acct-row-label" data-i="${i}"
+             value="${esc(a.label)}" aria-label="Tab name for ${esc(a.id)}" />
+      <code class="acct-row-id">${esc(a.id)}</code>
+      <button class="btn btn-secondary acct-row-del" data-i="${i}"
+              ${reg.length < 2 ? 'disabled title="The last account cannot be removed"' : ''}>Remove</button>
+    </div>`).join('');
+}
+
+function setupAccountManager() {
+  const host = document.getElementById('acct-manager');
+  if (!host) return;
+
+  host.addEventListener('input', (e) => {
+    const el = e.target.closest('.acct-row-label');
+    if (!el) return;
+    const reg = accountRegistry();
+    const i = Number(el.dataset.i);
+    if (!reg[i]) return;
+    reg[i].label = el.value.trim() || shortLabel(reg[i].id);
+    saveRegistry(reg);
+    renderAccountTabs();
+  });
+
+  host.addEventListener('click', (e) => {
+    const btn = e.target.closest('.acct-row-del');
+    if (!btn) return;
+    const reg = accountRegistry();
+    const i = Number(btn.dataset.i);
+    if (!reg[i] || reg.length < 2) return;
+    const gone = reg[i];
+    reg.splice(i, 1);
+    saveRegistry(reg);
+    /* If the tab you were reading just disappeared, land on a real one rather
+       than leaving the page pointed at an account that no longer has a tab. */
+    if (LS.get('cgo_active_account', '') === gone.id) {
+      LS.set('cgo_active_account', reg[0].id);
+      loadEconomics();
+      loadData();
+    }
+    renderAccountManager();
+    renderAccountTabs();
+  });
+
+  const addBtn = document.getElementById('btn-acct-add');
+  if (!addBtn) return;
+  addBtn.addEventListener('click', () => {
+    const idEl = document.getElementById('acct-new-id');
+    const labEl = document.getElementById('acct-new-label');
+    const raw = (idEl.value || '').trim();
+    if (!/^(act_)?\d{6,}$/.test(raw)) {
+      showModal('That does not look like an account ID',
+        'A Meta ad account ID is a long number, with or without the <code>act_</code> prefix — for example <code>act_1234567890123456</code>.');
+      return;
+    }
+    const id = normAcc(raw);
+    const reg = accountRegistry();
+    if (reg.some(a => a.id === id)) {
+      showModal('Already added', 'That account already has a tab.');
+      return;
+    }
+    reg.push({ id, label: (labEl.value || '').trim() || shortLabel(id) });
+    saveRegistry(reg);
+    idEl.value = ''; labEl.value = '';
+    renderAccountManager();
+    renderAccountTabs();
+  });
+}
+
+function setupAccountTabs() {
+  const host = document.getElementById('account-tabs');
+  if (!host) return;
+  host.addEventListener('click', (e) => {
+    const btn = e.target.closest('.acct-tab');
+    if (btn) setActiveAccount(btn.dataset.acct);
+  });
+  renderAccountTabs();
 }
 
 /* Meta's `last_14d` and friends END YESTERDAY — today is not in them. So the
@@ -939,12 +1126,12 @@ function normalizeAd(ad) {
 /* ========================================================================== *
  *  VERDICTS
  * ========================================================================== */
-function actionLog() { return LS.json('cgo_action_log', {}); }
-function saveActionLog(l) { LS.set('cgo_action_log', JSON.stringify(l)); }
+function actionLog() { return acctJson('cgo_action_log', {}); }
+function saveActionLog(l) { acctSet('cgo_action_log', JSON.stringify(l)); }
 
 function berFor(campaign) {
   const parsed = VE.parseCampaignName(campaign.name);
-  const override = LS.json('cgo_ber_overrides', {})[campaign.id];
+  const override = acctJson('cgo_ber_overrides', {})[campaign.id];
   const ber = override || parsed.ber || (State.econ && State.econ.valid ? State.econ.ber : 0);
   return {
     ber,
@@ -1262,10 +1449,10 @@ function editBer(id) {
   const current = berFor(c).ber;
   const val = prompt(`Break-even ROAS for "${c.name}"\n\nLeave empty to go back to the campaign name / your unit economics.`, current ? current.toFixed(2) : '');
   if (val === null) return;
-  const overrides = LS.json('cgo_ber_overrides', {});
+  const overrides = acctJson('cgo_ber_overrides', {});
   const n = parseFloat(String(val).replace(',', '.'));
   if (!val.trim() || !(n > 0)) delete overrides[id]; else overrides[id] = n;
-  LS.set('cgo_ber_overrides', JSON.stringify(overrides));
+  acctSet('cgo_ber_overrides', JSON.stringify(overrides));
   renderAll();
 }
 
