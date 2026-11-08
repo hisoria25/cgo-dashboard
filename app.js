@@ -25,6 +25,8 @@ const State = {
   sort: { column: 'Score (1-10)', direction: 'desc' },
   live: false,
   lastSync: 0,
+  range: null,          // {since,until} as YYYY-MM-DD when a custom span is picked
+  dateManual: false,    // the user chose the window; stop auto-rolling it
   lpvEstimated: false,
   accountTz: null,      // ad account timezone — the only clock the daily rules mean anything against
   source: 'demo',       // 'api' | 'csv' | 'demo'
@@ -61,10 +63,14 @@ const CTA_VERBS_LIST = ['shop', 'buy', 'get', 'claim', 'download', 'learn', 'try
 document.addEventListener('DOMContentLoaded', () => {
   injectStyles();
   initTheme();
+  migrateAccountState();   // must run before anything reads account-scoped keys
+  renderAccountTabs();
+  setupAccountTabs();
   loadEconomics();
   setupModals();
   setupTruthSettings();
   setupWindowTabs();
+  setupDateBar();
   setupTableControls();
   setupGrader();
   loadData();
@@ -103,15 +109,29 @@ function initTheme() {
    — a campaign at 40% of budget at lunchtime is pacing normally, not failing
    to fill the auction. */
 function dayIsOver() {
+  /* A custom span that ends before today is finished by definition, whatever
+     time it is now — reviewing last Tuesday must not be treated as a
+     part-day. */
+  if (State.range) return State.range.until < todayInAccountTz(0);
   const preset = LS.get('meta_date_preset', 'today');
   return preset !== 'today' || activeWindow() === 'midnight';
+}
+
+/* Today's date on the AD ACCOUNT's clock. Reading the laptop clock instead
+   silently shifts the window by the Cairo/Berlin offset. */
+function todayInAccountTz(offsetDays = 0) {
+  const tz = State.accountTz;
+  const d = new Date(Date.now() + offsetDays * 86400000);
+  if (!tz) return d.toISOString().slice(0, 10);
+  try { return d.toLocaleDateString('en-CA', { timeZone: tz }); }
+  catch (e) { return d.toISOString().slice(0, 10); }
 }
 
 /* ========================================================================== *
  *  UNIT ECONOMICS
  * ========================================================================== */
 function loadEconomics() {
-  const saved = LS.json('cgo_econ', { price: 29.95, cogs: 7, shipping: 2, feePct: 3 });
+  const saved = acctJson('cgo_econ', { price: 29.95, cogs: 7, shipping: 2, feePct: 3 });
   ['price', 'cogs', 'shipping', 'fees'].forEach(k => {
     const el = document.getElementById('econ-' + k);
     if (el) el.value = saved[k === 'fees' ? 'feePct' : k];
@@ -167,7 +187,7 @@ function setupModals() {
 
   document.getElementById('btn-save-econ').addEventListener('click', () => {
     const inputs = readEconomicsInputs();
-    LS.set('cgo_econ', JSON.stringify(inputs));
+    acctSet('cgo_econ', JSON.stringify(inputs));
     State.econ = VE.economics(inputs);
     close('econ-modal');
     renderAll();
@@ -186,6 +206,16 @@ function setupModals() {
     if (!acc || !tok) { showModal('Missing details', 'Both the Ad Account ID and the Access Token are needed.'); return; }
     LS.set('meta_account_ids', acc);
     LS.del('meta_account_id');
+    /* Anything typed here that is not already a tab becomes one, so the box
+       and the tab bar can never disagree about which accounts exist. */
+    (() => {
+      const reg = accountRegistry();
+      acc.split(/[\s,;]+/).filter(Boolean).map(normAcc).forEach(id => {
+        if (!reg.some(a => a.id === id)) reg.push({ id, label: shortLabel(id) });
+      });
+      LS.set('cgo_accounts', JSON.stringify(reg));
+      renderAccountTabs();
+    })();
     LS.set('meta_access_token', tok);
     LS.set('meta_date_preset', dateEl.value);
     saveTruthSettings();
@@ -413,12 +443,114 @@ async function graph(path, params) {
   throw new Error(lastErr || 'Graph API unreachable');
 }
 
-/* Ban prevention means several small ad accounts, so the dashboard reads all
-   of them and shows one merged picture. */
+/* ==========================================================================
+   ACCOUNT REGISTRY — one account at a time
+   ==========================================================================
+   Ban prevention means several small ad accounts, and merging them into one
+   picture hides which account is spending the money. Worse, each account
+   sells different products, so one set of unit economics cannot describe
+   them all: a merged view judges a Main 1 campaign against Chic-Shop's
+   margins and returns a wrong verdict that looks perfectly reasonable.
+   So the page reads exactly one account, and the header carries a tab per
+   account to switch. */
+const DEFAULT_ACCOUNTS = [
+  { id: 'act_2995536273958154', label: 'Chic-Shop' },
+  { id: 'act_1679754109728357', label: 'Main 1' },
+  { id: 'act_1563288332017037', label: 'Main 2' }
+];
+
+const normAcc = (a) => (String(a).startsWith('act_') ? String(a) : 'act_' + a);
+const shortLabel = (id) => 'Account ' + String(id).replace(/^act_/, '').slice(-4);
+
+/* Seeded once from whatever was already connected, so nobody loses the
+   account they were reading when this shipped. */
+function accountRegistry() {
+  let list = null;
+  try { list = JSON.parse(LS.get('cgo_accounts', '')); } catch (e) { list = null; }
+  if (!Array.isArray(list) || !list.length) {
+    list = DEFAULT_ACCOUNTS.slice();
+    (LS.get('meta_account_ids', '') || LS.get('meta_account_id', ''))
+      .split(/[\s,;]+/).filter(Boolean).map(normAcc)
+      .forEach(id => { if (!list.some(a => normAcc(a.id) === id)) list.unshift({ id, label: shortLabel(id) }); });
+    LS.set('cgo_accounts', JSON.stringify(list));
+  }
+  return list.map(a => ({ id: normAcc(a.id), label: a.label || shortLabel(a.id) }));
+}
+
+function activeAccount() {
+  const reg = accountRegistry();
+  return reg.find(a => a.id === LS.get('cgo_active_account', '')) || reg[0];
+}
+
+function setActiveAccount(id) {
+  if (activeAccount().id === id) return;
+  LS.set('cgo_active_account', id);
+  State.truth = null;          // another account's order book is not this one's
+  State.truthStatus = null;
+  State.truthMatch = null;
+  loadEconomics();             // this account's margins, not the last one's
+  renderAccountTabs();
+  loadData();
+}
+
 function accountIds() {
-  const raw = LS.get('meta_account_ids', '') || LS.get('meta_account_id', '');
-  return raw.split(/[\s,;]+/).filter(Boolean)
-    .map(a => (a.startsWith('act_') ? a : 'act_' + a));
+  const acct = activeAccount();
+  return acct ? [acct.id] : [];
+}
+
+/* Margins, break-even overrides and the applied-action log all describe ONE
+   account's products, so each key is suffixed with the account id. The first
+   time an account is opened, whatever was stored globally is copied in, so
+   nothing is lost on upgrade. */
+const ACCOUNT_SCOPED = ['cgo_econ', 'cgo_ber_overrides', 'cgo_action_log'];
+
+function acctKey(base, id) { return `${base}::${id || activeAccount().id}`; }
+
+/* The old global value belongs to the account that was connected when it was
+   written — the one seeded first in the registry. It is copied, never moved,
+   so a downgrade still finds its data where it left it. */
+function migrateAccountState() {
+  const first = accountRegistry()[0];
+  if (!first || LS.get('cgo_scoped_v1', '')) return;
+  ACCOUNT_SCOPED.forEach(base => {
+    const legacy = LS.get(base, '');
+    if (legacy && !LS.get(acctKey(base, first.id), '')) LS.set(acctKey(base, first.id), legacy);
+  });
+  LS.set('cgo_scoped_v1', '1');
+}
+
+const acctJson = (base, dflt) => LS.json(acctKey(base), dflt);
+const acctSet = (base, value) => LS.set(acctKey(base), value);
+
+/* Delegated, because the tabs are re-rendered whenever the registry or the
+   active account changes. */
+function setupAccountTabs() {
+  const host = document.getElementById('account-tabs');
+  if (!host) return;
+  host.addEventListener('click', e => {
+    const btn = e.target.closest('.acct-tab');
+    if (btn) setActiveAccount(btn.dataset.acct);
+  });
+}
+
+function renderAccountTabs() {
+  const host = document.getElementById('account-tabs');
+  if (!host) return;
+  const act = activeAccount();
+  host.innerHTML = accountRegistry().map(a =>
+    `<button class="acct-tab${a.id === act.id ? ' active' : ''}" data-acct="${esc(a.id)}"
+             title="${esc(a.id)}">${esc(a.label)}</button>`).join('');
+
+  /* An account nobody has configured yet is being judged against the default
+     €29.95 economics. Saying so out loud is the difference between a verdict
+     you can trust and one that merely looks confident. */
+  const hint = document.getElementById('acct-hint');
+  if (!hint) return;
+  const configured = !!LS.get(acctKey('cgo_econ', act.id), '');
+  hint.innerHTML = configured
+    ? 'Reading one account at a time'
+    : `<strong>${esc(act.label)}</strong> has no unit economics yet — verdicts use the defaults until you set them`;
+  hint.classList.toggle('acct-hint-warn', !configured);
 }
 
 /* Meta's `last_14d` and friends END YESTERDAY — today is not in them. So the
@@ -446,16 +578,35 @@ const AD_FIELDS = [
   'video_avg_time_watched_actions'
 ].join(',');
 
+/* Meta accepts either a named preset or an explicit {since,until}. The date
+   bar uses the second form so any day or span can be judged, not just the
+   handful of presets. */
+function windowParams() {
+  return State.range
+    ? { time_range: JSON.stringify(State.range) }
+    : { date_preset: LS.get('meta_date_preset', 'today') };
+}
+
+function windowLabel() {
+  if (State.range) {
+    const { since, until } = State.range;
+    const fmt = d => new Date(d + 'T12:00:00').toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+    return since === until ? fmt(since) : `${fmt(since)} – ${fmt(until)}`;
+  }
+  return LS.get('meta_date_preset', 'today').replace(/_/g, ' ');
+}
+
 async function fetchAccount(acc, preset) {
+  const win = windowParams();
   const [account, campaigns, adsets, judged, history, adInsights, adsMeta] = await Promise.all([
     graph(acc, { fields: 'name,currency,timezone_name' }),
     graph(`${acc}/campaigns`, { fields: 'id,name,status,effective_status,daily_budget,lifetime_budget,created_time', limit: 200 }),
     graph(`${acc}/adsets`, { fields: 'id,campaign_id,daily_budget,effective_status,learning_stage_info', limit: 300 }),
     // the window being judged, aggregated by Meta — not summed by us
-    graph(`${acc}/insights`, { level: 'campaign', fields: CAMPAIGN_FIELDS, date_preset: preset, limit: 200 }),
+    graph(`${acc}/insights`, Object.assign({ level: 'campaign', fields: CAMPAIGN_FIELDS, limit: 200 }, win)),
     // history for sparklines and streaks (ends yesterday, which is what we want)
     graph(`${acc}/insights`, { level: 'campaign', fields: 'campaign_id,spend,actions,action_values,purchase_roas', date_preset: 'last_30d', time_increment: 1, limit: 800 }),
-    graph(`${acc}/insights`, { level: 'ad', fields: AD_FIELDS, date_preset: preset, limit: 300 }),
+    graph(`${acc}/insights`, Object.assign({ level: 'ad', fields: AD_FIELDS, limit: 300 }, win)),
     graph(`${acc}/ads`, { fields: 'id,name,campaign_id,effective_status,creative{id,title,body,object_type,video_id,thumbnail_url}', limit: 300 })
   ]);
 
@@ -539,6 +690,7 @@ async function syncMetaAPI() {
     document.getElementById('brand-sub').innerText = ok.length === 1
       ? `${ok[0].account.name || acc} · ${State.currency} · ${ok[0].account.timezone_name || ''}`
       : `${ok.length} ad accounts · ${State.currency}`;
+    renderAccountTabs();   // the "no economics yet" warning is per account
     renderAll();
 
   } catch (err) {
@@ -594,6 +746,7 @@ async function syncTruth(preset) {
   const res = await TR.fetchTruth({
     workerUrl, dashKey,
     preset: preset || LS.get('meta_date_preset', 'today'),
+    range: State.range,            // a custom span wins over the preset
     tz: State.accountTz || 'Europe/Berlin'
   });
 
@@ -885,12 +1038,12 @@ function normalizeAd(ad) {
 /* ========================================================================== *
  *  VERDICTS
  * ========================================================================== */
-function actionLog() { return LS.json('cgo_action_log', {}); }
-function saveActionLog(l) { LS.set('cgo_action_log', JSON.stringify(l)); }
+function actionLog() { return acctJson('cgo_action_log', {}); }
+function saveActionLog(l) { acctSet('cgo_action_log', JSON.stringify(l)); }
 
 function berFor(campaign) {
   const parsed = VE.parseCampaignName(campaign.name);
-  const override = LS.json('cgo_ber_overrides', {})[campaign.id];
+  const override = acctJson('cgo_ber_overrides', {})[campaign.id];
   const ber = override || parsed.ber || (State.econ && State.econ.valid ? State.econ.ber : 0);
   return {
     ber,
@@ -1204,10 +1357,10 @@ function editBer(id) {
   const current = berFor(c).ber;
   const val = prompt(`Break-even ROAS for "${c.name}"\n\nLeave empty to go back to the campaign name / your unit economics.`, current ? current.toFixed(2) : '');
   if (val === null) return;
-  const overrides = LS.json('cgo_ber_overrides', {});
+  const overrides = acctJson('cgo_ber_overrides', {});
   const n = parseFloat(String(val).replace(',', '.'));
   if (!val.trim() || !(n > 0)) delete overrides[id]; else overrides[id] = n;
-  LS.set('cgo_ber_overrides', JSON.stringify(overrides));
+  acctSet('cgo_ber_overrides', JSON.stringify(overrides));
   renderAll();
 }
 
@@ -1348,6 +1501,85 @@ function renderDataStrip() {
         · Shopify ${shopAge ? 'synced ' + shopAge : 'not connected'}
       </span>
     </div>`;
+
+}
+
+/* ========================================================================== *
+ *  DATE BAR
+ * ========================================================================== *
+ * The check WINDOW (morning / evening / midnight) and the DATES being read
+ * are two different things. Keeping them separate is what lets you review
+ * last Tuesday without the engine pretending it is Tuesday morning.
+ * ========================================================================== */
+function renderDateBar() {
+  const preset = LS.get('meta_date_preset', 'today');
+  document.querySelectorAll('.date-btn[data-preset]').forEach(b =>
+    b.classList.toggle('active', !State.range && b.dataset.preset === preset));
+
+  const note = document.getElementById('date-note');
+  if (!note) return;
+  const tzName = State.accountTz ? State.accountTz.split('/').pop().replace(/_/g, ' ') : null;
+
+  if (State.range) {
+    note.innerHTML = `Showing <strong>${esc(windowLabel())}</strong>` +
+      (tzName ? ` in ${esc(tzName)} time.` : '.') +
+      ` Verdicts still follow the ${esc(activeWindow())} read.`;
+  } else if (preset === 'today') {
+    note.innerHTML = `Showing <strong>today so far</strong>` + (tzName ? ` (${esc(tzName)} time)` : '') +
+      `. This is a part-day — budget moves wait for the midnight read.`;
+  } else {
+    note.innerHTML = `Showing <strong>${esc(windowLabel())}</strong>. ` +
+      `Meta's multi-day windows <strong>end yesterday</strong> — today is not included.`;
+  }
+}
+
+function refreshWindow() {
+  renderDateBar();
+  if (State.live) syncMetaAPI(); else loadData();
+}
+
+function setupDateBar() {
+  document.querySelectorAll('.date-btn[data-preset]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      State.range = null;                 // an explicit preset clears any custom span
+      State.dateManual = true;
+      LS.set('meta_date_preset', btn.dataset.preset);
+      const sel = document.getElementById('meta-date-preset');
+      if (sel) sel.value = btn.dataset.preset;   // keep the dialog honest
+      refreshWindow();
+    });
+  });
+
+  const from = document.getElementById('date-from');
+  const to = document.getElementById('date-to');
+  const apply = document.getElementById('date-apply');
+
+  apply && apply.addEventListener('click', () => {
+    if (!from.value) return;
+    const since = from.value;
+    const until = to.value && to.value >= since ? to.value : since;
+    State.range = { since, until };
+    State.dateManual = true;
+    refreshWindow();
+  });
+
+  /* ‹ › step one day at a time through history — the fastest way to answer
+     "was yesterday a fluke, or is this a trend?" */
+  const step = dir => {
+    const base = State.range ? State.range.until : todayInAccountTz(0);
+    const d = new Date(base + 'T12:00:00');
+    d.setDate(d.getDate() + dir);
+    const day = d.toISOString().slice(0, 10);
+    if (day > todayInAccountTz(0)) return;          // no future days
+    State.range = { since: day, until: day };
+    State.dateManual = true;
+    from.value = day; to.value = day;
+    refreshWindow();
+  };
+  const prev = document.getElementById('date-prev');
+  const next = document.getElementById('date-next');
+  prev && prev.addEventListener('click', () => step(-1));
+  next && next.addEventListener('click', () => step(1));
 }
 
 function renderTruthPanel() {
@@ -2257,6 +2489,38 @@ function injectStyles() {
       color: var(--color-warning, #f59e0b); border: 1px solid rgba(245,158,11,.35); }
   .note-impossible { color: var(--color-warning, #f59e0b); }
 
+  /* Account tabs — style.css predates them, so they are defined here. */
+  .account-tab-bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .9rem;
+    padding: .55rem 0 .7rem; }
+  .acct-tabs { display: flex; flex-wrap: wrap; gap: .4rem; }
+  .acct-tab { padding: .32rem .8rem; border-radius: 999px; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--color-border, rgba(255,255,255,.14));
+    background: transparent; color: inherit; opacity: .65; transition: opacity .12s, background .12s; }
+  .acct-tab:hover { opacity: .9; }
+  .acct-tab.active { opacity: 1; font-weight: 600;
+    background: var(--accent-secondary, #8b5cf6); border-color: transparent; color: #fff; }
+  .acct-hint { font-size: 12px; opacity: .6; }
+  .acct-hint.acct-hint-warn { color: var(--color-warning, #f59e0b); opacity: 1; }
+
+  /* Date bar — style.css predates it too. */
+  .date-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: .6rem 1rem; padding: .7rem .9rem; margin: 0 0 .5rem; }
+  .date-bar-left, .date-bar-right { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
+  .date-presets { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .date-btn { padding: .3rem .7rem; border-radius: 8px; font-size: 12.5px; cursor: pointer;
+    border: 1px solid var(--color-border, rgba(255,255,255,.14));
+    background: transparent; color: inherit; opacity: .7; transition: opacity .12s, background .12s; }
+  .date-btn:hover { opacity: 1; }
+  .date-btn.active { opacity: 1; font-weight: 600; color: #fff;
+    background: var(--accent-secondary, #8b5cf6); border-color: transparent; }
+  .date-btn-nav { font-size: 16px; line-height: 1; padding: .22rem .6rem; }
+  .date-input { padding: .26rem .5rem; border-radius: 8px; font-size: 12.5px;
+    background: transparent; color: inherit;
+    border: 1px solid var(--color-border, rgba(255,255,255,.18)); }
+  .date-sep { opacity: .5; font-size: 12px; }
+  .date-note { font-size: 12.5px; opacity: .72; margin: 0 0 .85rem; }
+  @media (max-width: 760px) { .date-bar { flex-direction: column; align-items: stretch; } }
+
   /* Data strip */
   #data-strip { margin: 0 0 .85rem; }
   .dstrip { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1rem;
@@ -2393,6 +2657,7 @@ function injectStyles() {
 function renderAll() {
   computeVerdicts();
   renderCommandBar();
+  renderDateBar();
   renderDataStrip();
   renderTruthPanel();
   renderVerdicts();

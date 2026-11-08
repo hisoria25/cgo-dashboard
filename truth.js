@@ -107,11 +107,39 @@
   /* ------------------------------------------------------------------
      FETCH
      ------------------------------------------------------------------ */
-  async function fetchTruth({ workerUrl, dashKey, preset, tz }) {
+  /* `range` is an explicit {since,until} of YYYY-MM-DD account-local days,
+     set by the date bar. It wins over the preset, so any day or span the
+     dashboard shows can be reconciled against Shopify — not only the
+     handful of named presets. */
+  /* The account-local span covering `fromDay`..`toDay` inclusive (both
+     YYYY-MM-DD), as the instants the Shopify API wants. `until` is midnight
+     at the START of the day after toDay, so the last day is included whole.
+     Uses the same two-pass DST correction as the presets, so a custom span
+     and a preset can never disagree about where a day begins. */
+  function midnightInTz(ymd, tz, dayShift) {
+    const [y, m, d] = String(ymd).split('-').map(Number);
+    const wall = Date.UTC(y, m - 1, d + (dayShift || 0), 0, 0, 0);
+    let off = tzOffsetMinutes(new Date(wall), tz);
+    let real = wall - off * 60000;
+    off = tzOffsetMinutes(new Date(real), tz);
+    return new Date(wall - off * 60000);
+  }
+
+  function rangeForDays(fromDay, toDay, tz) {
+    const zone = tz || 'Europe/Berlin';
+    return {
+      since: midnightInTz(fromDay, zone, 0),
+      until: midnightInTz(toDay, zone, 1)
+    };
+  }
+
+  async function fetchTruth({ workerUrl, dashKey, preset, tz, range }) {
     if (!workerUrl || !dashKey) {
       return { ok: false, reason: 'not-configured' };
     }
-    const { since, until } = rangeForPreset(preset, tz);
+    const { since, until } = range
+      ? rangeForDays(range.since, range.until, tz)
+      : rangeForPreset(preset, tz);
 
     const base = String(workerUrl).trim().replace(/\/+$/, '');
     const url = `${base}/revenue?since=${encodeURIComponent(since.toISOString())}` +
@@ -329,5 +357,5 @@
   function round2(v) { const n = parseFloat(v); return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; }
 
   return { fetchTruth, match, rangeForPreset, tzDayRange, tzOffsetMinutes,
-           key, headKey, cmForProduct, FUNNELS, PRESET_RANGE };
+           key, headKey, cmForProduct, rangeForDays, FUNNELS, PRESET_RANGE };
 });

@@ -41,6 +41,15 @@
       <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle theme">☀️</button>
     </div>
   </div>
+
+  <!-- One tab per ad account. The page reads exactly one at a time, because a
+       merged picture hides which account is spending the money — and because
+       each account sells different products, so one set of unit economics
+       cannot describe them all. -->
+  <div class="container account-tab-bar">
+    <div id="account-tabs" class="acct-tabs" role="tablist" aria-label="Ad account"></div>
+    <span id="acct-hint" class="acct-hint">Reading one account at a time</span>
+  </div>
 </header>
 
 <!-- ======================= DATA SOURCES MODAL ======================= -->
@@ -177,6 +186,35 @@
       <!-- verdict counters injected here -->
     </div>
   </div>
+
+  <!-- ======================= DATE BAR =======================
+       The dates being read, separate from the morning/evening/midnight
+       window. Presets for the common spans, a real calendar for anything
+       else, and < > to walk back through history one day at a time. -->
+  <div class="card date-bar">
+    <div class="date-bar-left">
+      <span class="command-eyebrow">Showing</span>
+      <div class="date-presets">
+        <button class="date-btn" data-preset="today">Today</button>
+        <button class="date-btn" data-preset="yesterday">Yesterday</button>
+        <button class="date-btn" data-preset="last_3d">3 days</button>
+        <button class="date-btn" data-preset="last_7d">7 days</button>
+        <button class="date-btn" data-preset="last_14d">14 days</button>
+        <button class="date-btn" data-preset="last_30d">30 days</button>
+        <button class="date-btn" data-preset="this_month">This month</button>
+        <button class="date-btn" data-preset="last_month">Last month</button>
+      </div>
+    </div>
+    <div class="date-bar-right">
+      <button class="date-btn date-btn-nav" id="date-prev" title="Previous day">&lsaquo;</button>
+      <input type="date" id="date-from" class="date-input" aria-label="From date">
+      <span class="date-sep">&rarr;</span>
+      <input type="date" id="date-to" class="date-input" aria-label="To date">
+      <button class="date-btn date-btn-nav" id="date-next" title="Next day">&rsaquo;</button>
+      <button class="btn btn-small" id="date-apply">Apply</button>
+    </div>
+  </div>
+  <p id="date-note" class="date-note"><!-- injected --></p>
 
   <!-- ======================= ACCOUNT KPIs ======================= -->
   <div class="kpi-grid">
