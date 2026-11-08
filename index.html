@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CGO Media Buyer — Verdict Dashboard</title>
-  <meta name="description" content="Meta ads decision dashboard running the Samuel Ecom scaling rules: scale, keep, descale or kill, with the exact new budget.">
-  <link rel="stylesheet" href="style.css?v=20261018b">
+  <meta name="description" content="Meta ads decision dashboard running the Samuel Ecom scaling rules against the Shopify order book: scale, keep, descale or kill, with the exact new budget.">
+  <link rel="stylesheet" href="style.css">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
@@ -29,7 +29,7 @@
 
       <button id="api-sync-btn" class="btn btn-primary" style="display:none;">🔄 Sync</button>
       <button id="econ-toggle" class="btn btn-secondary">💶 Unit Economics</button>
-      <button id="settings-toggle" class="btn btn-secondary">⚙️ Meta API</button>
+      <button id="settings-toggle" class="btn btn-secondary">⚙️ Data sources</button>
 
       <div class="file-upload-wrapper">
         <button class="btn btn-secondary">📁 CSV
@@ -41,43 +41,31 @@
       <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle theme">☀️</button>
     </div>
   </div>
-
-  <!-- One tab per ad account. The page reads exactly one at a time, because a
-       merged picture hides which account is spending the money. -->
-  <div class="container account-tab-bar">
-    <div id="account-tabs" class="acct-tabs" role="tablist" aria-label="Ad account"></div>
-    <span id="acct-hint" class="acct-hint">Reading one account at a time</span>
-  </div>
 </header>
 
-<!-- ======================= META API MODAL ======================= -->
+<!-- ======================= DATA SOURCES MODAL ======================= -->
 <div id="settings-modal" class="modal-overlay">
   <div class="modal-card card">
     <div class="modal-header">
-      <h3>Meta Marketing API</h3>
+      <h3>Data sources</h3>
       <button class="modal-close-btn" data-close="settings-modal">&times;</button>
     </div>
     <div class="modal-body">
-      <p class="modal-intro">Credentials are stored in this browser only. Nothing is sent anywhere except Meta.</p>
+      <p class="modal-intro">
+        Meta supplies spend and delivery. Shopify supplies revenue. Credentials are stored in this
+        browser only and are sent nowhere except to Meta and to your own Truth Worker.
+      </p>
 
       <div class="form-group mb14">
-        <label>Ad accounts</label>
-        <div id="acct-manager" class="acct-manager"><!-- injected: one row per tab --></div>
-        <div class="acct-add-row">
-          <input type="text" id="acct-new-id" class="search-input" placeholder="act_1234567890" />
-          <input type="text" id="acct-new-label" class="search-input" placeholder="Tab name" />
-          <button id="btn-acct-add" class="btn btn-secondary">Add</button>
-        </div>
-        <span class="hint">Each account gets its own tab, and its own margins, break-even overrides and action log.
-          The dashboard reads one at a time — it never merges them, because a campaign in one account
-          must not be judged against another account's economics.</span>
+        <label for="meta-account-id">Ad Account IDs</label>
+        <textarea id="meta-account-id" class="sandbox-textarea acct-input" placeholder="act_1234567890, act_9876543210"></textarea>
+        <span class="hint">Keep the <code>act_</code> prefix. Running several accounts for ban prevention? Separate them with commas — the dashboard merges them into one picture.</span>
       </div>
 
       <div class="form-group mb14">
         <label for="meta-access-token">User Access Token</label>
         <input type="password" id="meta-access-token" class="search-input full" placeholder="Paste token…" />
         <span class="hint">Needs <code>ads_read</code> + <code>read_insights</code>.</span>
-        <div id="token-status" class="token-status"><!-- injected: real expiry from Meta --></div>
       </div>
 
       <div class="form-group mb14">
@@ -88,16 +76,12 @@
           <option value="last_3d">Last 3 days</option>
           <option value="last_7d">Last 7 days</option>
           <option value="last_14d">Last 14 days</option>
-          <option value="last_30d">Last 30 days</option>
-          <option value="this_month">This month</option>
-          <option value="last_month">Last month</option>
         </select>
-        <span class="hint">The kill/scale rules are daily rules. Keep this on <strong>Today</strong> unless you are reviewing history.
-          The date bar on the page changes this too.</span>
+        <span class="hint">The kill/scale rules are daily rules. Keep this on <strong>Today</strong> unless you are reviewing history. The Shopify window always matches this one, in the ad account's timezone.</span>
       </div>
 
       <div class="info-box">
-        <h4>Getting a token</h4>
+        <h4>Getting a Meta token</h4>
         <ol>
           <li>Open the <a href="https://developers.facebook.com/tools/explorer/" target="_blank" rel="noopener">Graph API Explorer</a>.</li>
           <li>Pick your Business app, add <strong>ads_read</strong> and <strong>read_insights</strong>.</li>
@@ -105,10 +89,13 @@
           <li>Short tokens expire in ~1 hour. Extend to 60 days with the <a href="https://developers.facebook.com/tools/accesstoken/" target="_blank" rel="noopener">Access Token Tool</a>.</li>
         </ol>
       </div>
+
+      <!-- The Shopify truth block is appended here by app.js, so an older
+           deployment of this file still works. -->
     </div>
     <div class="modal-footer">
       <button id="btn-save-settings" class="btn btn-primary full mb8">Save &amp; Connect</button>
-      <button id="btn-disconnect-settings" class="btn btn-secondary full danger-text">Disconnect</button>
+      <button id="btn-disconnect-settings" class="btn btn-secondary full danger-text">Disconnect Meta</button>
     </div>
   </div>
 </div>
@@ -143,11 +130,6 @@
           <label for="econ-fees">Payment fees %</label>
           <input type="number" step="0.1" id="econ-fees" class="search-input full" value="3" />
         </div>
-        <div class="form-group">
-          <label for="econ-refunds">Refund / chargeback rate %</label>
-          <input type="number" step="0.5" min="0" max="90" id="econ-refunds" class="search-input full" value="0" />
-          <span class="hint">Share of revenue you give back. Meta never subtracts it; this does.</span>
-        </div>
       </div>
 
       <div class="econ-result" id="econ-result"><!-- filled by JS --></div>
@@ -156,10 +138,15 @@
         <h4>The maths behind every verdict</h4>
         <p class="mono-line">gross margin = (price − cost − shipping − fees) ÷ price</p>
         <p class="mono-line">BER = 1 ÷ gross margin</p>
-        <p class="mono-line">profit margin = gross margin − (1 ÷ ROAS)</p>
+        <p class="mono-line">contribution margin = gross margin − (1 ÷ ROAS)</p>
         <p class="hint mt8">
-          That last line is why the sheet holds together: ROAS above BER and profit margin above zero are the same statement.
+          That last line is why the sheet holds together: ROAS above BER and contribution margin above zero are the same statement.
           The +35% / +20% / hold ladder reads this number.
+        </p>
+        <p class="hint mt8">
+          <strong>It is contribution, not profit.</strong> It deducts product cost, shipping and payment fees — nothing else.
+          Refunds are only inside it when revenue comes from Shopify, which reports net of refunds; Meta's figure does not.
+          Fixed costs are never in it.
         </p>
       </div>
     </div>
@@ -170,35 +157,6 @@
 </div>
 
 <main class="container main-content fade-in">
-
-  <!-- ======================= DATE BAR ======================= -->
-  <div class="card date-bar">
-    <div class="date-bar-left">
-      <span class="command-eyebrow">Showing</span>
-      <div class="date-presets">
-        <button class="date-btn" data-preset="today">Today</button>
-        <button class="date-btn" data-preset="yesterday">Yesterday</button>
-        <button class="date-btn" data-preset="last_3d">3 days</button>
-        <button class="date-btn" data-preset="last_7d">7 days</button>
-        <button class="date-btn" data-preset="last_14d">14 days</button>
-        <button class="date-btn" data-preset="last_30d">30 days</button>
-        <button class="date-btn" data-preset="this_month">This month</button>
-        <button class="date-btn" data-preset="last_month">Last month</button>
-      </div>
-    </div>
-    <div class="date-bar-right">
-      <button class="date-btn date-btn-nav" id="date-prev" title="Previous day">‹</button>
-      <input type="date" id="date-from" class="date-input" aria-label="From date">
-      <span class="date-sep">→</span>
-      <input type="date" id="date-to" class="date-input" aria-label="To date">
-      <button class="date-btn date-btn-nav" id="date-next" title="Next day">›</button>
-      <button class="btn btn-small" id="date-apply">Apply</button>
-    </div>
-  </div>
-  <p id="date-note" class="date-note"><!-- injected --></p>
-
-  <!-- ======================= ACCOUNT P&L ======================= -->
-  <div class="card pnl-bar" id="pnl-bar"><!-- injected --></div>
 
   <!-- ======================= COMMAND BAR ======================= -->
   <div class="card command-bar">
@@ -224,36 +182,22 @@
   <section class="section-block">
     <h2 class="section-title">⚡ Campaign Verdicts</h2>
     <p class="section-lede">
-      One card per CBO campaign. Each one is the cheat sheet applied to tonight's numbers — the action, the exact new budget,
-      and the line of the sheet it came from.
+      One card per CBO campaign. Each one is the cheat sheet applied to the Shopify order book — the action, the exact new budget,
+      and the line of the sheet it came from. Where a campaign has no Shopify match the card says so and scaling is locked.
     </p>
+    <!-- #truth-panel is inserted here by app.js -->
     <div id="verdict-grid" class="verdict-grid"><!-- injected --></div>
   </section>
 
   <!-- ======================= GUARDRAILS ======================= -->
   <div id="guardrails" class="guardrail-stack"><!-- injected --></div>
 
-  <!-- ======================= BREAK-EVEN BENCHMARKS =======================
-       Replaces the one-size-fits-all benchmark table every media buyer keeps
-       in a doc somewhere ("CPA under €20 is good"). There is no single good
-       CPA: it depends on what the product earns and what it costs. This panel
-       shows the real line for each product, and how far from it you are. -->
-  <div class="card bench-card">
-    <h2 class="section-title">🎯 What each product can afford</h2>
-    <p class="section-lede">
-      The most you can pay for one order and still break even — worked out per product
-      from its own BER and basket size, not from a shared rule of thumb. Green means you
-      are paying less than an order is worth. Red means you are paying more.
-    </p>
-    <p id="bench-window-note" class="bench-window-note"><!-- injected: which days this reads --></p>
-    <div id="bench-table"><!-- injected --></div>
-  </div>
-
   <!-- ======================= TREND ======================= -->
   <div class="card trend-card">
     <h2 class="section-title">📈 Last 14 days</h2>
     <p class="section-lede">
-      Spend against ROAS, with your break-even line. One day is noise; the shape of two weeks is the truth.
+      Spend against ROAS as <strong>Meta reported it</strong>, with your break-even line. Useful for shape and direction;
+      the per-campaign level is where Meta's attribution goes wrong, so judge money on the cards above.
     </p>
     <div class="chart-container h240"><canvas id="trendChart"></canvas></div>
   </div>
@@ -273,10 +217,10 @@
     <div class="card kpi-card">
       <span class="kpi-label">Revenue</span>
       <span class="kpi-value" id="kpi-revenue">—</span>
-      <span class="kpi-trend neutral" id="kpi-profit-sub">Profit —</span>
+      <span class="kpi-trend neutral" id="kpi-profit-sub">Contribution —</span>
     </div>
     <div class="card kpi-card">
-      <span class="kpi-label">Purchases</span>
+      <span class="kpi-label">Orders</span>
       <span class="kpi-value" id="kpi-total-purchases">0</span>
       <span class="kpi-trend neutral" id="kpi-cpa-sub">CPA —</span>
     </div>
@@ -299,6 +243,8 @@
       <p class="section-lede">
         Link Clicks → Landing Page Views → Add to Cart → Initiate Checkout → Purchase.
         The stage that breaks first is the thing to fix — before you touch any budget.
+        A stage whose event is not firing reads <strong>not tracked</strong> rather than a number, because a guess that
+        always passes is worse than no number at all.
       </p>
       <div class="funnel-container">
         <div class="funnel-row">
@@ -388,6 +334,11 @@
         <tbody id="ads-table-body"></tbody>
       </table>
     </div>
+    <p class="section-lede">
+      Ad-level revenue and ROAS here are <strong>Meta's attribution</strong>. Shopify cannot say which ad earned an order,
+      only which product sold, so use this table for creative signals — CTR, hook rate, CPM, frequency — and take the
+      money verdict from the campaign cards.
+    </p>
   </div>
 
   <!-- ======================= CHARTS + GRADER ======================= -->
@@ -441,14 +392,14 @@
   </div>
 
   <footer class="page-footer">
-    Rules encoded from the Samuel Ecom scaling cheat sheet · verdicts are decision support, you still press the button in Ads Manager.
+    Rules encoded from the Samuel Ecom scaling cheat sheet · revenue from the Shopify order book ·
+    verdicts are decision support, you still press the button in Ads Manager.
   </footer>
 </main>
 
-<!-- The ?v= token is what stops the browser serving yesterday's engine.
-     Bump it on every deploy; without it a rules.js change can sit invisible
-     in cache for days while the page quietly runs the old logic. -->
-<script src="rules.js?v=20261018b"></script>
-<script src="app.js?v=20261018b"></script>
+<script src="rules.js"></script>
+<script src="truth.js"></script>
+<script src="creative.js"></script>
+<script src="app.js"></script>
 </body>
 </html>

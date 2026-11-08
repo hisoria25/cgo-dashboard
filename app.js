@@ -1,10 +1,18 @@
 /* ==========================================================================
    CGO Media Buyer — Verdict Dashboard
-   App layer: settings, Meta Graph API, rendering. The decision logic lives
-   in rules.js (VerdictEngine) and is unit-tested separately.
+   App layer: settings, Meta Graph API, Shopify truth, rendering. The decision
+   logic lives in rules.js (VerdictEngine) and is unit-tested separately.
+
+   REVENUE OF RECORD (8 Nov 2026)
+   Meta's per-campaign revenue is not trustworthy on this account. Shopify is.
+   Revenue now arrives from the CGO Truth Worker, is matched onto campaigns by
+   product name (truth.js), and drives every verdict. Where a campaign has no
+   Shopify match, the card falls back to Meta, says so, and scaling is locked.
    ========================================================================== */
 
 const VE = window.VerdictEngine;
+const TR = window.Truth;
+const CD = window.CreativeDesk;
 
 /* ---------------------------------------------------------------- state -- */
 const State = {
@@ -18,10 +26,12 @@ const State = {
   live: false,
   lastSync: 0,
   lpvEstimated: false,
-  accountTz: null,
-  range: null,          // {since,until} when a custom date range is picked
-  dateManual: false,    // true once the user picks a window themselves
-  tokenInfo: null,      // ad account timezone — the only clock the daily rules mean anything against
+  accountTz: null,      // ad account timezone — the only clock the daily rules mean anything against
+  source: 'demo',       // 'api' | 'csv' | 'demo'
+  truth: null,          // Worker payload for the judged window
+  truthStatus: null,    // { state: 'off'|'ok'|'error', message }
+  truthMatch: null,     // output of Truth.match
+  atcBroken: false      // the ATC event does not fire on these funnels
 };
 
 const LS = {
@@ -48,19 +58,15 @@ const CTA_VERBS_LIST = ['shop', 'buy', 'get', 'claim', 'download', 'learn', 'try
  *  BOOT
  * ========================================================================== */
 document.addEventListener('DOMContentLoaded', () => {
+  injectStyles();
   initTheme();
-  migrateAccountState();     // must run before anything reads a scoped key
   loadEconomics();
   setupModals();
-  setupAccountTabs();
-  setupAccountManager();
+  setupTruthSettings();
   setupWindowTabs();
-  setupDateBar();
   setupTableControls();
   setupGrader();
-  applyAutoWindow();
   loadData();
-  renderTokenStatus();
   startAutoRefresh();
 });
 
@@ -68,18 +74,6 @@ document.addEventListener('DOMContentLoaded', () => {
    minutes when live, and re-renders anyway so the check window rolls over on
    its own at 09:00 / 15:00 / 23:30. */
 function startAutoRefresh() {
-  /* The read window has to change by itself at 09:00, 15:00 and 23:30 on the
-     account clock. Checking once a minute costs nothing and means the page is
-     never showing yesterday's read when you glance at it. */
-  let lastAuto = autoWindow();
-  setInterval(() => {
-    if (document.hidden || State.window) return;
-    const now = autoWindow();
-    if (now === lastAuto) return;
-    lastAuto = now;
-    if (!applyAutoWindow()) renderAll();
-  }, 60 * 1000);
-
   setInterval(() => {
     if (document.hidden) return;
     if (State.live) syncMetaAPI();
@@ -104,15 +98,22 @@ function initTheme() {
   });
 }
 
+/* The day being judged has closed. Several warnings are only true once it has
+   — a campaign at 40% of budget at lunchtime is pacing normally, not failing
+   to fill the auction. */
+function dayIsOver() {
+  const preset = LS.get('meta_date_preset', 'today');
+  return preset !== 'today' || activeWindow() === 'midnight';
+}
+
 /* ========================================================================== *
  *  UNIT ECONOMICS
  * ========================================================================== */
 function loadEconomics() {
-  const saved = acctJson('cgo_econ', { price: 29.95, cogs: 7, shipping: 2, feePct: 3, refundRate: 0 });
-  ['price', 'cogs', 'shipping', 'fees', 'refunds'].forEach(k => {
+  const saved = LS.json('cgo_econ', { price: 29.95, cogs: 7, shipping: 2, feePct: 3 });
+  ['price', 'cogs', 'shipping', 'fees'].forEach(k => {
     const el = document.getElementById('econ-' + k);
-    if (!el) return;
-    el.value = k === 'fees' ? saved.feePct : k === 'refunds' ? (saved.refundRate || 0) : saved[k];
+    if (el) el.value = saved[k === 'fees' ? 'feePct' : k];
   });
   State.econ = VE.economics(saved);
 }
@@ -122,8 +123,7 @@ function readEconomicsInputs() {
     price: parseFloat(document.getElementById('econ-price').value) || 0,
     cogs: parseFloat(document.getElementById('econ-cogs').value) || 0,
     shipping: parseFloat(document.getElementById('econ-shipping').value) || 0,
-    feePct: parseFloat(document.getElementById('econ-fees').value) || 0,
-    refundRate: parseFloat((document.getElementById('econ-refunds') || {}).value) || 0
+    feePct: parseFloat(document.getElementById('econ-fees').value) || 0
   };
 }
 
@@ -136,23 +136,15 @@ function renderEconomicsPreview() {
     return;
   }
   box.className = 'econ-result';
-  const r = e.refundRate || 0;
   box.innerHTML = `
     <div class="econ-headline">
-      <div><span class="econ-big">${r ? e.berAfterRefunds.toFixed(2) : e.ber.toFixed(2)}</span><span class="econ-cap">${r ? 'Break-even ROAS after refunds' : 'Break-even ROAS'}</span></div>
+      <div><span class="econ-big">${e.ber.toFixed(2)}</span><span class="econ-cap">Break-even ROAS</span></div>
       <div><span class="econ-big">${e.grossMarginPct}%</span><span class="econ-cap">Gross margin</span></div>
-      <div><span class="econ-big">${fmtMoney(e.contribution)}</span><span class="econ-cap">Profit per order before ads</span></div>
+      <div><span class="econ-big">${fmtMoney(e.contribution)}</span><span class="econ-cap">Contribution per order before ads</span></div>
     </div>
-    ${r ? `<p class="econ-note refunds">
-      At a <strong>${Math.round(r * 100)}%</strong> refund rate you need
-      <strong>${e.berAfterRefunds.toFixed(2)}</strong> to stand still, not ${e.ber.toFixed(2)}.
-      Every ROAS, margin and profit figure on the dashboard is now net of refunds.
-      This is the kind estimate \u2014 a partial refund returns money without returning the goods,
-      so the real damage is a little worse.
-    </p>` : ''}
     <p class="econ-note">
       Name campaigns <code>Product | ${e.ber.toFixed(2)} | ${e.grossMarginPct}</code> and every verdict reads it automatically.
-      Put the <em>full-price</em> break-even in the name \u2014 the refund rate is applied on top.
+      This is contribution, not profit: it deducts cost, shipping and fees, and nothing else.
     </p>`;
 }
 
@@ -163,46 +155,46 @@ function setupModals() {
   const open = (id) => document.getElementById(id).classList.add('show');
   const close = (id) => document.getElementById(id).classList.remove('show');
 
-  document.getElementById('settings-toggle').addEventListener('click', () => { renderAccountManager(); open('settings-modal'); });
+  document.getElementById('settings-toggle').addEventListener('click', () => open('settings-modal'));
   document.getElementById('econ-toggle').addEventListener('click', () => { renderEconomicsPreview(); open('econ-modal'); });
   document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => close(b.dataset.close)));
   document.querySelectorAll('.modal-overlay').forEach(m =>
     m.addEventListener('click', e => { if (e.target === m) m.classList.remove('show'); }));
 
-  ['econ-price', 'econ-cogs', 'econ-shipping', 'econ-fees', 'econ-refunds'].forEach(id =>
+  ['econ-price', 'econ-cogs', 'econ-shipping', 'econ-fees'].forEach(id =>
     document.getElementById(id).addEventListener('input', renderEconomicsPreview));
 
   document.getElementById('btn-save-econ').addEventListener('click', () => {
     const inputs = readEconomicsInputs();
-    acctSet('cgo_econ', JSON.stringify(inputs));
+    LS.set('cgo_econ', JSON.stringify(inputs));
     State.econ = VE.economics(inputs);
     close('econ-modal');
-    renderAccountTabs();       // clears the "no economics yet" warning
     renderAll();
   });
 
   // Meta API settings
+  const accEl = document.getElementById('meta-account-id');
   const tokEl = document.getElementById('meta-access-token');
   const dateEl = document.getElementById('meta-date-preset');
+  accEl.value = LS.get('meta_account_ids', '') || LS.get('meta_account_id', '');
   tokEl.value = LS.get('meta_access_token', '');
   dateEl.value = LS.get('meta_date_preset', 'today');
 
   document.getElementById('btn-save-settings').addEventListener('click', () => {
-    const tok = tokEl.value.trim();
-    if (!tok) { showModal('Missing token', 'An access token is needed. The accounts themselves are managed in the list above.'); return; }
+    const acc = accEl.value.trim(), tok = tokEl.value.trim();
+    if (!acc || !tok) { showModal('Missing details', 'Both the Ad Account ID and the Access Token are needed.'); return; }
+    LS.set('meta_account_ids', acc);
+    LS.del('meta_account_id');
     LS.set('meta_access_token', tok);
     LS.set('meta_date_preset', dateEl.value);
-    State.range = null;              // an explicit preset overrides any custom range
+    saveTruthSettings();
     close('settings-modal');
-    renderTokenStatus();
     syncMetaAPI();
   });
 
   document.getElementById('btn-disconnect-settings').addEventListener('click', () => {
-    /* Disconnect drops the token only. The account tabs and their economics
-       stay — pasting a fresh token puts everything back as it was. */
-    LS.del('meta_access_token');
-    tokEl.value = '';
+    LS.del('meta_account_ids'); LS.del('meta_account_id'); LS.del('meta_access_token');
+    accEl.value = ''; tokEl.value = '';
     close('settings-modal');
     setApiStatus('offline');
     loadData();
@@ -210,6 +202,73 @@ function setupModals() {
 
   document.getElementById('api-sync-btn').addEventListener('click', syncMetaAPI);
   document.getElementById('csv-file-input').addEventListener('change', handleCsvUpload);
+}
+
+/* The Truth Worker fields are added from JS rather than the HTML, so the
+   dashboard keeps working if an older index.html is still deployed. */
+function setupTruthSettings() {
+  const body = document.querySelector('#settings-modal .modal-body');
+  if (!body || document.getElementById('truth-worker-url')) return;
+
+  const block = document.createElement('div');
+  block.className = 'truth-settings';
+  block.innerHTML = `
+    <h4>Shopify truth <span class="truth-pill">revenue of record</span></h4>
+    <p class="truth-help">
+      Meta's per-campaign revenue has been wrong by up to €869 on this account. These two fields
+      point the dashboard at your Truth Worker so every verdict runs on the Shopify order book
+      instead. Both values stay in this browser.
+    </p>
+    <label>Worker URL
+      <input type="text" id="truth-worker-url" placeholder="https://cgo-truth.YOUR-SUBDOMAIN.workers.dev" autocomplete="off" spellcheck="false">
+    </label>
+    <label>Dashboard key
+      <input type="password" id="truth-dash-key" placeholder="the DASH_KEY secret you set in Cloudflare" autocomplete="off">
+    </label>
+    <div class="truth-actions">
+      <button class="btn-mini" id="btn-test-truth">Test connection</button>
+      <button class="btn-mini" id="btn-edit-map">Product → campaign map</button>
+    </div>
+    <div id="truth-test-result" class="truth-test"></div>`;
+  body.appendChild(block);
+
+  document.getElementById('truth-worker-url').value = LS.get('truth_worker_url', '');
+  document.getElementById('truth-dash-key').value = LS.get('truth_dash_key', '');
+
+  document.getElementById('btn-test-truth').addEventListener('click', async () => {
+    saveTruthSettings();
+    const box = document.getElementById('truth-test-result');
+    box.className = 'truth-test';
+    box.innerText = 'Asking the Worker…';
+    const res = await TR.fetchTruth({
+      workerUrl: LS.get('truth_worker_url', ''),
+      dashKey: LS.get('truth_dash_key', ''),
+      preset: LS.get('meta_date_preset', 'today'),
+      tz: State.accountTz || 'Europe/Berlin'
+    });
+    if (res.ok) {
+      const d = res.data;
+      const lines = Object.entries(d.byProduct || {})
+        .sort((a, b) => b[1].net - a[1].net)
+        .map(([t, p]) => `${esc(t)} — ${fmtMoney(p.net)} (${p.orders})`);
+      box.className = 'truth-test ok';
+      box.innerHTML = `<strong>Connected.</strong> ${d.orders} orders, ${fmtMoney(d.net)} net` +
+        (d.refunded ? `, ${fmtMoney(d.refunded)} refunded` : '') +
+        `<div class="truth-test-list">${lines.join('<br>') || 'No orders in this window.'}</div>`;
+    } else {
+      box.className = 'truth-test bad';
+      box.innerHTML = `<strong>Not connected.</strong> ${esc(res.error || res.reason)}`;
+    }
+  });
+
+  document.getElementById('btn-edit-map').addEventListener('click', editProductMap);
+}
+
+function saveTruthSettings() {
+  const u = document.getElementById('truth-worker-url');
+  const k = document.getElementById('truth-dash-key');
+  if (u) LS.set('truth_worker_url', u.value.trim());
+  if (k) LS.set('truth_dash_key', k.value.trim());
 }
 
 function setApiStatus(status, label) {
@@ -241,39 +300,12 @@ function accountClock(d = new Date()) {
   return tz && tz !== localTz ? `${t} ${tz.split('/').pop().replace(/_/g, ' ')}` : t;
 }
 
-function autoWindow() { return VE.detectWindow(new Date(), State.accountTz); }
-function activeWindow() { return State.window || autoWindow(); }
-
-/* The read window and the day being read belong together. At 00:15 the
-   midnight read is judging the day that just CLOSED, not the fifteen minutes
-   of the new one — so the date bar has to move to Yesterday with it. Getting
-   this wrong is what made "mark applied" appear not to stick: the action was
-   logged against one day and the verdict re-read on another. */
-function autoDatePresetFor(win) {
-  const h = VE.clockIn(new Date(), State.accountTz).h;
-  return (win === 'midnight' && h < 9) ? 'yesterday' : 'today';
-}
-
-/* Returns true when it kicked off a re-sync, so the caller does not also
-   re-render on top of it. */
-function applyAutoWindow() {
-  if (State.window || State.dateManual) return false;      // user is driving
-  const want = autoDatePresetFor(autoWindow());
-  if (LS.get('meta_date_preset', 'today') === want && !State.range) return false;
-  State.range = null;
-  LS.set('meta_date_preset', want);
-  const sel = document.getElementById('meta-date-preset');
-  if (sel) sel.value = want;
-  if (State.live) syncMetaAPI(); else loadData();
-  return true;
-}
+function activeWindow() { return State.window || VE.detectWindow(new Date(), State.accountTz); }
 
 function setupWindowTabs() {
   document.querySelectorAll('.command-tabs .playbook-tab').forEach(tab => {
     tab.addEventListener('click', () => {
-      // Clicking the window you are actually in means "follow the clock again".
-      State.window = tab.dataset.window === autoWindow() ? null : tab.dataset.window;
-      if (!State.window) { State.dateManual = false; if (applyAutoWindow()) return; }
+      State.window = tab.dataset.window;
       renderAll();
     });
   });
@@ -282,12 +314,10 @@ function setupWindowTabs() {
 function renderCommandBar() {
   const win = activeWindow();
   const meta = WINDOW_META[win];
-  const auto = autoWindow();
-  const tzName = State.accountTz ? State.accountTz.split('/').pop().replace(/_/g, ' ') : 'account';
+  const auto = VE.detectWindow(new Date(), State.accountTz);
   document.getElementById('command-title').innerText = meta.title;
-  document.getElementById('command-sub').innerHTML = State.window
-    ? `${esc(meta.sub)} · <strong>held open manually</strong> — tap ${esc(WINDOW_META[auto].title.replace(/^\S+\s/, ''))} to follow the clock again`
-    : `${esc(meta.sub)} · switching automatically on ${esc(tzName)} time`;
+  document.getElementById('command-sub').innerText =
+    meta.sub + (win === auto ? ' · this is where you are now' : ' · viewing out of hours');
 
   document.querySelectorAll('.command-tabs .playbook-tab').forEach(t =>
     t.classList.toggle('active', t.dataset.window === win));
@@ -295,11 +325,11 @@ function renderCommandBar() {
   // verdict tally
   const counts = {};
   State.campaigns.forEach(c => { counts[c.verdict.code] = (counts[c.verdict.code] || 0) + 1; });
-  const order = ['KILL', 'DESCALE', 'PRICE_DROP', 'SCALE', 'SURF', 'PROVE', 'HOLD', 'MONITOR', 'DIAGNOSE', 'PAUSED', 'NEEDS_SETUP'];
+  const order = ['KILL', 'DESCALE', 'PRICE_DROP', 'SCALE', 'SURF', 'PROVE', 'HOLD', 'MONITOR', 'DIAGNOSE', 'NEEDS_SETUP'];
   const labels = { KILL: 'Kill', DESCALE: 'Descale', PRICE_DROP: 'Price drop', SCALE: 'Scale', SURF: 'Surf',
-                   PROVE: 'Prove', HOLD: 'Hold', MONITOR: 'Watch', DIAGNOSE: 'Diagnose', PAUSED: 'Paused', NEEDS_SETUP: 'Setup' };
+                   PROVE: 'Prove', HOLD: 'Hold', MONITOR: 'Watch', DIAGNOSE: 'Diagnose', NEEDS_SETUP: 'Setup' };
   const tones = { KILL: 'danger', DESCALE: 'warning', PRICE_DROP: 'warning', SCALE: 'success', SURF: 'success',
-                  PROVE: 'success', HOLD: 'neutral', MONITOR: 'neutral', DIAGNOSE: 'neutral', PAUSED: 'neutral', NEEDS_SETUP: 'neutral' };
+                  PROVE: 'success', HOLD: 'neutral', MONITOR: 'neutral', DIAGNOSE: 'neutral', NEEDS_SETUP: 'neutral' };
   document.getElementById('verdict-tally').innerHTML = order
     .filter(k => counts[k])
     .map(k => `<div class="tally tally-${tones[k]}"><span class="tally-num">${counts[k]}</span><span class="tally-label">${labels[k]}</span></div>`)
@@ -315,6 +345,9 @@ function loadData() {
   State.campaigns = demo.campaigns;
   State.ads = demo.ads;
   State.currency = 'EUR';
+  State.source = 'demo';
+  State.truth = null;
+  State.truthStatus = null;
   setApiStatus('offline');
   document.getElementById('brand-sub').innerText = 'Demo data · connect the Meta API for live verdicts';
   renderAll();
@@ -350,26 +383,11 @@ async function graph(path, params) {
         const res = await fetch(`https://graph.facebook.com/${v}/${path}?${qs}`);
         body = await res.json();
       } catch (e) {
-        // A dropped connection is not a broken token. Retry before failing.
-        if (retry < 5) { await new Promise(r => setTimeout(r, 800 * Math.pow(2, retry))); continue; }
-        throw new Error(location.protocol === 'file:'
-          ? 'Could not reach Meta. The page is open as a file:// URL — open it through "Start Dashboard.command" instead.'
-          : 'Could not reach Meta after several tries. This is a network problem, not your token.');
+        throw new Error('Could not reach Meta. If the address bar starts with file://, open the dashboard through "Start Dashboard.command" instead.');
       }
 
       if (body && body.error) {
         const msg = body.error.message || 'Unknown Graph error';
-        const code = body.error.code;
-
-        // Transient: rate limits, Meta's own hiccups, "unknown error".
-        // These are NOT credential problems and must never be reported as
-        // one. Back off and try again before giving up.
-        const TRANSIENT = [1, 2, 4, 17, 32, 341, 368, 80000, 80003, 80004];
-        if (TRANSIENT.includes(code) && retry < 5) {
-          await new Promise(r => setTimeout(r, 800 * Math.pow(2, retry)));
-          continue;
-        }
-
 
         // A field this API version no longer knows — drop it and retry.
         const dead = msg.match(/\(#100\)\s*([a-zA-Z0-9_]+)\s+is not valid for fields param/i);
@@ -384,13 +402,7 @@ async function graph(path, params) {
           lastErr = msg;
           break;
         }
-        const err = new Error(msg);
-        // 190/102/463/467 and OAuthException are the only real credential
-        // failures. Everything else gets its own explanation.
-        err.isAuth = [190, 102, 463, 467, 2500].includes(code) ||
-                     /OAuthException/i.test(body.error.type || '');
-        err.graphCode = code;
-        throw err;
+        throw new Error(msg);
       }
 
       LS.set('meta_api_version', v);
@@ -400,197 +412,12 @@ async function graph(path, params) {
   throw new Error(lastErr || 'Graph API unreachable');
 }
 
-/* Ban prevention means several small ad accounts. Merging them into one
-   picture used to hide which account was actually burning the money, and a
-   campaign in one account would be judged against another account's margins.
-   So the header carries one tab per account and the page reads exactly one
-   at a time. */
-const DEFAULT_ACCOUNTS = [
-  { id: 'act_2995536273958154', label: 'Chic-Shop' },
-  { id: 'act_1679754109728357', label: 'Main 1' },
-  { id: 'act_1563288332017037', label: 'Main 2' }
-];
-
-const normAcc = (a) => (String(a).startsWith('act_') ? String(a) : 'act_' + a);
-const shortLabel = (id) => 'Account ' + String(id).replace(/^act_/, '').slice(-4);
-
-/* The registry is seeded once from whatever was already connected, so nobody
-   loses the account they were reading when this shipped. */
-function accountRegistry() {
-  let list = null;
-  try { list = JSON.parse(LS.get('cgo_accounts', '')); } catch (e) { list = null; }
-  if (!Array.isArray(list) || !list.length) {
-    list = DEFAULT_ACCOUNTS.slice();
-    (LS.get('meta_account_ids', '') || LS.get('meta_account_id', ''))
-      .split(/[\s,;]+/).filter(Boolean).map(normAcc)
-      .forEach(id => { if (!list.some(a => normAcc(a.id) === id)) list.unshift({ id, label: shortLabel(id) }); });
-    LS.set('cgo_accounts', JSON.stringify(list));
-  }
-  return list.map(a => ({ id: normAcc(a.id), label: a.label || shortLabel(a.id) }));
-}
-
-function activeAccount() {
-  const reg = accountRegistry();
-  return reg.find(a => a.id === LS.get('cgo_active_account', '')) || reg[0];
-}
-
-function setActiveAccount(id) {
-  if (activeAccount().id === id) return;
-  LS.set('cgo_active_account', id);
-  State.range = null;          // a custom range from the old account means nothing here
-  loadEconomics();             // this account's margins, not the last one's
-  renderAccountTabs();
-  renderTokenStatus();
-  loadData();
-}
-
+/* Ban prevention means several small ad accounts, so the dashboard reads all
+   of them and shows one merged picture. */
 function accountIds() {
-  const acct = activeAccount();
-  return acct ? [acct.id] : [];
-}
-
-/* ---------------------------------------------------------------------------
-   Everything below is per account, not per dashboard. Margins, break-even
-   overrides and the applied-action log all describe ONE account's products.
-   Sharing them across tabs would judge a Main 1 campaign against Chic-Shop's
-   economics — a wrong verdict that looks perfectly reasonable on screen.
-
-   ACCOUNT_SCOPED names the keys that move. Each gets suffixed with the
-   account id; the first time an account is opened, whatever was stored
-   globally is copied in, so nothing is lost on upgrade. */
-const ACCOUNT_SCOPED = ['cgo_econ', 'cgo_ber_overrides', 'cgo_action_log'];
-
-function acctKey(base, id) { return `${base}::${id || activeAccount().id}`; }
-
-/* The old global value belongs to the account that was connected when it was
-   written — the one seeded first in the registry. It is copied, never moved,
-   so a downgrade still finds its data where it left it. */
-function migrateAccountState() {
-  const first = accountRegistry()[0];
-  if (!first || LS.get('cgo_scoped_v1', '')) return;
-  ACCOUNT_SCOPED.forEach(base => {
-    const legacy = LS.get(base, '');
-    if (legacy && !LS.get(acctKey(base, first.id), '')) LS.set(acctKey(base, first.id), legacy);
-  });
-  LS.set('cgo_scoped_v1', '1');
-}
-
-const acctJson = (base, dflt) => LS.json(acctKey(base), dflt);
-const acctSet = (base, value) => LS.set(acctKey(base), value);
-
-function renderAccountTabs() {
-  const host = document.getElementById('account-tabs');
-  if (!host) return;
-  const act = activeAccount();
-  host.innerHTML = accountRegistry().map(a =>
-    `<button class="acct-tab${a.id === act.id ? ' active' : ''}" data-acct="${esc(a.id)}"
-             title="${esc(a.id)}">${esc(a.label)}</button>`).join('');
-
-  /* An account nobody has configured yet is being judged against the default
-     €29.95 economics. Saying so out loud is the difference between a verdict
-     you can trust and one that merely looks confident. */
-  const hint = document.getElementById('acct-hint');
-  if (!hint) return;
-  const configured = !!LS.get(acctKey('cgo_econ', act.id), '');
-  hint.innerHTML = configured
-    ? 'Reading one account at a time'
-    : `<strong>${esc(act.label)}</strong> has no unit economics yet — verdicts use the defaults until you set them`;
-  hint.classList.toggle('acct-hint-warn', !configured);
-}
-
-/* ---------------------------------------------------------------------------
-   The account manager inside the settings modal. Rename a tab, remove one,
-   add one — without needing the code changed.
-
-   Removing a tab deliberately leaves that account's margins and logs in
-   storage. Someone who removes a tab by accident, or who adds the same
-   account back next month, gets their numbers back rather than a silent
-   reset to the €29.95 defaults. */
-function saveRegistry(list) { LS.set('cgo_accounts', JSON.stringify(list)); }
-
-function renderAccountManager() {
-  const host = document.getElementById('acct-manager');
-  if (!host) return;
-  const reg = accountRegistry();
-  const act = activeAccount().id;
-  host.innerHTML = reg.map((a, i) => `
-    <div class="acct-row${a.id === act ? ' acct-row-active' : ''}">
-      <input type="text" class="search-input acct-row-label" data-i="${i}"
-             value="${esc(a.label)}" aria-label="Tab name for ${esc(a.id)}" />
-      <code class="acct-row-id">${esc(a.id)}</code>
-      <button class="btn btn-secondary acct-row-del" data-i="${i}"
-              ${reg.length < 2 ? 'disabled title="The last account cannot be removed"' : ''}>Remove</button>
-    </div>`).join('');
-}
-
-function setupAccountManager() {
-  const host = document.getElementById('acct-manager');
-  if (!host) return;
-
-  host.addEventListener('input', (e) => {
-    const el = e.target.closest('.acct-row-label');
-    if (!el) return;
-    const reg = accountRegistry();
-    const i = Number(el.dataset.i);
-    if (!reg[i]) return;
-    reg[i].label = el.value.trim() || shortLabel(reg[i].id);
-    saveRegistry(reg);
-    renderAccountTabs();
-  });
-
-  host.addEventListener('click', (e) => {
-    const btn = e.target.closest('.acct-row-del');
-    if (!btn) return;
-    const reg = accountRegistry();
-    const i = Number(btn.dataset.i);
-    if (!reg[i] || reg.length < 2) return;
-    const gone = reg[i];
-    reg.splice(i, 1);
-    saveRegistry(reg);
-    /* If the tab you were reading just disappeared, land on a real one rather
-       than leaving the page pointed at an account that no longer has a tab. */
-    if (LS.get('cgo_active_account', '') === gone.id) {
-      LS.set('cgo_active_account', reg[0].id);
-      loadEconomics();
-      loadData();
-    }
-    renderAccountManager();
-    renderAccountTabs();
-  });
-
-  const addBtn = document.getElementById('btn-acct-add');
-  if (!addBtn) return;
-  addBtn.addEventListener('click', () => {
-    const idEl = document.getElementById('acct-new-id');
-    const labEl = document.getElementById('acct-new-label');
-    const raw = (idEl.value || '').trim();
-    if (!/^(act_)?\d{6,}$/.test(raw)) {
-      showModal('That does not look like an account ID',
-        'A Meta ad account ID is a long number, with or without the <code>act_</code> prefix — for example <code>act_1234567890123456</code>.');
-      return;
-    }
-    const id = normAcc(raw);
-    const reg = accountRegistry();
-    if (reg.some(a => a.id === id)) {
-      showModal('Already added', 'That account already has a tab.');
-      return;
-    }
-    reg.push({ id, label: (labEl.value || '').trim() || shortLabel(id) });
-    saveRegistry(reg);
-    idEl.value = ''; labEl.value = '';
-    renderAccountManager();
-    renderAccountTabs();
-  });
-}
-
-function setupAccountTabs() {
-  const host = document.getElementById('account-tabs');
-  if (!host) return;
-  host.addEventListener('click', (e) => {
-    const btn = e.target.closest('.acct-tab');
-    if (btn) setActiveAccount(btn.dataset.acct);
-  });
-  renderAccountTabs();
+  const raw = LS.get('meta_account_ids', '') || LS.get('meta_account_id', '');
+  return raw.split(/[\s,;]+/).filter(Boolean)
+    .map(a => (a.startsWith('act_') ? a : 'act_' + a));
 }
 
 /* Meta's `last_14d` and friends END YESTERDAY — today is not in them. So the
@@ -604,54 +431,54 @@ const CAMPAIGN_FIELDS = [
   'cpc', 'cpm', 'ctr', 'actions', 'action_values', 'purchase_roas'
 ].join(',');
 
+/* The quartile fields are what make a retention curve possible. Without them
+   an ad is a single thruplay number and the only creative advice available is
+   "make it better". With them, the shape says which second loses the viewer
+   and therefore which part of the edit to change. */
 const AD_FIELDS = [
-  // campaign_id is needed to group ads back onto their campaign for the
-  // per-ad fatigue read — campaign_name alone cannot be matched reliably.
   'ad_id', 'ad_name', 'campaign_id', 'campaign_name', 'spend', 'impressions', 'reach', 'frequency',
   'inline_link_clicks', 'inline_link_click_ctr', 'cost_per_inline_link_click',
   'cpc', 'cpm', 'ctr', 'actions', 'action_values', 'purchase_roas',
-  'video_play_actions', 'video_thruplay_watched_actions'
+  'video_play_actions', 'video_thruplay_watched_actions',
+  'video_p25_watched_actions', 'video_p50_watched_actions',
+  'video_p75_watched_actions', 'video_p100_watched_actions',
+  'video_avg_time_watched_actions'
 ].join(',');
 
-/* Meta accepts either a named preset or an explicit {since,until}. The date
-   bar uses the second form so any day or span can be judged, not just the
-   handful of presets. */
-function windowParams() {
-  return State.range
-    ? { time_range: JSON.stringify(State.range) }
-    : { date_preset: LS.get('meta_date_preset', 'today') };
-}
-
-function windowLabel() {
-  if (State.range) {
-    const { since, until } = State.range;
-    const fmt = d => new Date(d + 'T12:00:00').toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
-    return since === until ? fmt(since) : `${fmt(since)} – ${fmt(until)}`;
-  }
-  return LS.get('meta_date_preset', 'today').replace(/_/g, ' ').replace(/^last /, 'last ');
-}
-
 async function fetchAccount(acc, preset) {
-  const win = windowParams();
   const [account, campaigns, adsets, judged, history, adInsights, adsMeta] = await Promise.all([
     graph(acc, { fields: 'name,currency,timezone_name' }),
     graph(`${acc}/campaigns`, { fields: 'id,name,status,effective_status,daily_budget,lifetime_budget,created_time', limit: 200 }),
     graph(`${acc}/adsets`, { fields: 'id,campaign_id,daily_budget,effective_status,learning_stage_info', limit: 300 }),
     // the window being judged, aggregated by Meta — not summed by us
-    graph(`${acc}/insights`, { level: 'campaign', fields: CAMPAIGN_FIELDS, ...win, limit: 200 }),
-    // History for sparklines, streaks and creative fatigue (ends yesterday,
-    // which is what we want). CTR/CPM/frequency ride along because fatigue is
-    // a TREND — a single day's CTR says nothing on its own.
-    graph(`${acc}/insights`, { level: 'campaign', fields: 'campaign_id,spend,actions,action_values,purchase_roas,inline_link_click_ctr,cpm,frequency', date_preset: 'last_30d', time_increment: 1, limit: 800 }),
-    graph(`${acc}/insights`, { level: 'ad', fields: AD_FIELDS, ...win, limit: 300 }),
-    graph(`${acc}/ads`, { fields: 'id,name,campaign_id,effective_status,creative{id,title,body,object_type}', limit: 300 })
+    graph(`${acc}/insights`, { level: 'campaign', fields: CAMPAIGN_FIELDS, date_preset: preset, limit: 200 }),
+    // history for sparklines and streaks (ends yesterday, which is what we want)
+    graph(`${acc}/insights`, { level: 'campaign', fields: 'campaign_id,spend,actions,action_values,purchase_roas', date_preset: 'last_30d', time_increment: 1, limit: 800 }),
+    graph(`${acc}/insights`, { level: 'ad', fields: AD_FIELDS, date_preset: preset, limit: 300 }),
+    graph(`${acc}/ads`, { fields: 'id,name,campaign_id,effective_status,creative{id,title,body,object_type,video_id,thumbnail_url}', limit: 300 })
   ]);
+
+  /* Video lengths turn the quartiles into timestamps. One batched call for
+     every video in the account, and the curve can say "they leave at 7
+     seconds" instead of "p25". If it fails, the curve still works in
+     percentages — so this never blocks a sync. */
+  const videoIds = [...new Set((adsMeta.data || [])
+    .map(a => a.creative && a.creative.video_id).filter(Boolean))].slice(0, 50);
+  let lengths = {};
+  if (videoIds.length) {
+    try {
+      const res = await graph('', { ids: videoIds.join(','), fields: 'length' });
+      Object.entries(res || {}).forEach(([id, v]) => {
+        if (v && v.length) lengths[id] = parseFloat(v.length) || 0;
+      });
+    } catch (e) { /* lengths are a nicety, not a dependency */ }
+  }
 
   const built = buildFromApi({
     campaigns: campaigns.data || [], adsets: adsets.data || [],
     judged: judged.data || [], history: history.data || [],
     adInsights: adInsights.data || [], adsMeta: adsMeta.data || [], preset,
-    accountId: acc, accountName: account.name || acc
+    accountId: acc, accountName: account.name || acc, videoLengths: lengths
   });
 
   return { ...built, account, accountId: acc };
@@ -692,23 +519,21 @@ async function syncMetaAPI() {
     State.adStatuses = ok.flatMap(r => r.adStatuses || []);
     State.lpvEstimated = ok.some(r => r.lpvEstimated);
     State.lastSync = Date.now();
+    State.source = 'api';
 
     if (!State.campaigns.length) {
-      // Connected and answering — there is simply no spend in this window.
-      // That is a real answer, not a failure, and it must not be dressed up
-      // as demo data.
-      State.live = true;
-      clearStaleBanner();
-      State.accountTz = (ok[0] && ok[0].account && ok[0].account.timezone_name) || null;
-      setApiStatus('online', `Live · ${accountClock()}`);
-      renderAll();
-      const note = document.getElementById('date-note');
-      if (note) note.innerHTML = `<strong>No spend in ${esc(windowLabel())}.</strong> The account answered fine — there is just nothing to judge in this window.`;
+      setApiStatus('offline');
+      showModal('Connected, but no spend found', `The ${accounts.length === 1 ? 'account' : 'accounts'} answered fine, but there is no campaign data for <strong>${preset.replace(/_/g, ' ')}</strong>. Pick a wider window in the Meta API panel, or wait until spend starts.`);
+      loadDemoFallback();
       return;
     }
 
-    clearStaleBanner();
     State.accountTz = (ok[0] && ok[0].account && ok[0].account.timezone_name) || null;
+
+    // Shopify is the revenue of record. Pull it for the same window, in the
+    // same timezone, before any verdict is computed.
+    await syncTruth(preset);
+
     setApiStatus('online', `Live · ${accountClock()}`);
     document.getElementById('brand-sub').innerText = ok.length === 1
       ? `${ok[0].account.name || acc} · ${State.currency} · ${ok[0].account.timezone_name || ''}`
@@ -718,15 +543,7 @@ async function syncMetaAPI() {
   } catch (err) {
     console.error(err);
     setApiStatus('offline');
-    /* If we already have real numbers on screen, KEEP them. Replacing a
-       live account with demo data mid-session is the most dangerous thing
-       this dashboard could do — you could scale a budget off invented
-       figures. Show a banner saying the data is stale and leave it alone. */
-    if (State.live && State.campaigns.length && State.lastSync) {
-      showStaleBanner(err);
-      return;
-    }
-    const expired = err.isAuth || /session|expired|access token|OAuth|190/i.test(err.message);
+    const expired = /session|expired|access token|OAuth|190/i.test(err.message);
     showModal('Sync failed', expired
       ? `<p><strong>Your access token has expired.</strong></p>
          <p>Meta said: <em>${esc(err.message)}</em></p>
@@ -745,96 +562,53 @@ async function syncMetaAPI() {
     loadDemoFallback();
   }
 }
-/* ==========================================================================
- *  STALE DATA BANNER
- *  A failed refresh is not a reason to throw away good numbers. This keeps
- *  the last real sync on screen and says plainly how old it is.
- * ========================================================================== */
-function showStaleBanner(err) {
-  const mins = Math.max(1, Math.round((Date.now() - State.lastSync) / 60000));
-  let bar = document.getElementById('stale-banner');
-  if (!bar) {
-    bar = document.createElement('div');
-    bar.id = 'stale-banner';
-    bar.className = 'stale-banner';
-    const main = document.querySelector('main.main-content');
-    main.insertBefore(bar, main.firstChild);
-  }
-  const why = err && err.isAuth
-    ? 'Your token was rejected.'
-    : 'Could not reach Meta just now.';
-  bar.innerHTML =
-    `<span>⚠️ ${esc(why)} Showing the numbers from ${esc(String(mins))} min ago — they are real, just not current.</span>` +
-    `<button class="btn btn-small" id="stale-retry">Retry now</button>`;
-  document.getElementById('stale-retry').onclick = () => { clearStaleBanner(); syncMetaAPI(); };
-}
-
-function clearStaleBanner() {
-  const bar = document.getElementById('stale-banner');
-  if (bar) bar.remove();
-}
-
-/* Ask Meta how long this token actually has left, so the panel can say so
-   instead of guessing. A short-lived token is the single most common reason
-   a working dashboard stops working a couple of hours later. */
-async function checkToken() {
-  const token = LS.get('meta_access_token');
-  if (!token) return null;
-  const v = LS.get('meta_api_version') || GRAPH_VERSIONS[0];
-  try {
-    const r = await fetch(`https://graph.facebook.com/${v}/debug_token` +
-      `?input_token=${encodeURIComponent(token)}&access_token=${encodeURIComponent(token)}`);
-    const d = (await r.json()).data;
-    if (!d) return null;
-    const expiresAt = d.expires_at ? d.expires_at * 1000 : null;
-    const hoursLeft = expiresAt ? (expiresAt - Date.now()) / 3600000 : Infinity;
-    return {
-      valid: !!d.is_valid,
-      scopes: d.scopes || [],
-      hasAdsRead: (d.scopes || []).includes('ads_read'),
-      hasInsights: (d.scopes || []).includes('read_insights'),
-      expiresAt, hoursLeft,
-      shortLived: hoursLeft < 24
-    };
-  } catch (e) { return null; }
-}
-
-async function renderTokenStatus() {
-  const el = document.getElementById('token-status');
-  if (!el) return;
-  const info = await checkToken();
-  State.tokenInfo = info;
-  if (!info) { el.innerHTML = ''; return; }
-  if (!info.valid) {
-    el.innerHTML = `<span class="token-bad">✗ Token is not valid. Generate a new one.</span>`;
-    return;
-  }
-  const missing = [!info.hasAdsRead && 'ads_read', !info.hasInsights && 'read_insights'].filter(Boolean);
-  if (missing.length) {
-    el.innerHTML = `<span class="token-bad">✗ Token is missing ${esc(missing.join(' and '))}. Regenerate it with those permissions ticked.</span>`;
-    return;
-  }
-  if (info.hoursLeft === Infinity) {
-    el.innerHTML = `<span class="token-ok">✓ Valid, does not expire.</span>`;
-  } else if (info.shortLived) {
-    const h = Math.max(0, Math.round(info.hoursLeft * 10) / 10);
-    el.innerHTML = `<span class="token-warn">⚠ Short-lived token — about ${esc(String(h))} h left.</span>
-      <span class="token-hint">Extend it to 60 days with the
-      <a href="https://developers.facebook.com/tools/accesstoken/" target="_blank" rel="noopener">Access Token Tool</a>,
-      then paste the long one back here.</span>`;
-  } else {
-    const days = Math.round(info.hoursLeft / 24);
-    el.innerHTML = `<span class="token-ok">✓ Valid for about ${esc(String(days))} more days
-      (until ${esc(new Date(info.expiresAt).toLocaleDateString())}).</span>`;
-  }
-}
-
 
 function loadDemoFallback() {
   const demo = buildDemoData();
   State.campaigns = demo.campaigns;
   State.ads = demo.ads;
+  State.source = 'demo';
+  State.truth = null;
+  State.truthStatus = null;
+  State.truthMatch = null;
   renderAll();
+}
+
+/* --------------------------------------------------- Shopify truth ------- */
+async function syncTruth(preset) {
+  State.truth = null;
+  State.truthMatch = null;
+
+  const workerUrl = LS.get('truth_worker_url', '');
+  const dashKey = LS.get('truth_dash_key', '');
+
+  if (!workerUrl || !dashKey) {
+    State.truthStatus = {
+      state: 'off',
+      message: 'No Shopify truth connected, so every verdict below runs on Meta\'s attributed revenue and scaling is locked. Add the Truth Worker in ⚙️ Settings.'
+    };
+    return;
+  }
+
+  const res = await TR.fetchTruth({
+    workerUrl, dashKey,
+    preset: preset || LS.get('meta_date_preset', 'today'),
+    tz: State.accountTz || 'Europe/Berlin'
+  });
+
+  if (!res.ok) {
+    State.truthStatus = {
+      state: 'error',
+      message: (res.error || 'The Truth Worker did not answer.') +
+               ' Verdicts below fall back to Meta revenue and scaling is locked.'
+    };
+    return;
+  }
+
+  State.truth = res.data;
+  State.truthRange = { since: res.since, until: res.until };
+  State.truthMatch = TR.match(State.campaigns, res.data.byProduct || {}, LS.json('cgo_product_map', {}));
+  State.truthStatus = { state: 'ok', message: null };
 }
 
 /* --------------------------------------------------- API → app model ----- */
@@ -859,7 +633,8 @@ function conversions(row) {
   return { purchases, revenue, atc, ic, lpvRaw };
 }
 
-function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta, preset, accountId, accountName }) {
+function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta, preset, accountId, accountName, videoLengths }) {
+  const vlen = videoLengths || {};
   let lpvEstimated = false;
 
   // Ad-set budgets, summed per campaign — the fallback when the campaign is
@@ -868,19 +643,12 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
   // campaign must not have its budget touched.
   const adsetBudget = {};
   const learningByCampaign = {};
-  // How many ad sets are actually DELIVERING. The descale floor is per ad set:
-  // the same €40 cut is harmless on one ad set and starves four. Paused and
-  // deleted ad sets are not fed, so they must not count toward the floor.
-  const liveAdsetsByCampaign = {};
   (adsets || []).forEach(s => {
     if ((s.effective_status || '').toUpperCase() === 'DELETED') return;
     const b = s.daily_budget ? parseFloat(s.daily_budget) / 100 : 0;
     if (b) adsetBudget[s.campaign_id] = (adsetBudget[s.campaign_id] || 0) + b;
     const stage = s.learning_stage_info && s.learning_stage_info.status;
     if (/^LEARNING$/i.test(stage || '')) learningByCampaign[s.campaign_id] = true;
-    if (/^ACTIVE$/i.test(s.effective_status || '')) {
-      liveAdsetsByCampaign[s.campaign_id] = (liveAdsetsByCampaign[s.campaign_id] || 0) + 1;
-    }
   });
 
   // History, day by day, per campaign. This range ends yesterday, which is
@@ -896,52 +664,11 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
 
   const judgingToday = preset === 'today';
 
-  // Ad copy grouped by campaign, so the card can say which angles this
-  // product has already been sold on and which it has not.
-  const adCopyByCampaign = {};
-  adsMeta.forEach(a => {
-    const cid = a.campaign_id || '';
-    if (!cid) return;
-    (adCopyByCampaign[cid] = adCopyByCampaign[cid] || []).push({
-      headline: (a.creative && a.creative.title) || '',
-      body: (a.creative && a.creative.body) || '',
-      name: a.name || ''
-    });
-  });
-
-  /* Per-ad delivery stats grouped by campaign. A campaign's CTR is a weighted
-     average of its ads: when Meta moves budget from a 5% ad to a 3% one the
-     campaign line falls without a single creative having aged. The fatigue
-     engine needs the ads themselves to tell those two apart. */
-  const adStatsByCampaign = {};
-  adInsights.forEach(r => {
-    const cid = r.campaign_id || '';
-    if (!cid) return;
-    (adStatsByCampaign[cid] = adStatsByCampaign[cid] || []).push({
-      name: r.ad_name || r.ad_id,
-      spend: parseFloat(r.spend) || 0,
-      ctr: parseFloat(r.inline_link_click_ctr) || 0,
-      cpm: parseFloat(r.cpm) || 0,
-      frequency: parseFloat(r.frequency) || 0,
-      impressions: parseInt(r.impressions) || 0
-    });
-  });
-
   const built = campaigns.map(c => {
     const daily = (historyByCampaign[c.id] || []).map(r => {
       const conv = conversions(r);
       const spend = parseFloat(r.spend) || 0;
-      return {
-        date: r.date_start, spend, revenue: conv.revenue,
-        // Orders per day. The API already returns them; they were being
-        // dropped. The benchmarks panel needs them to work out a basket size
-        // over a fixed window rather than over whatever date the user picked.
-        purchases: conv.purchases,
-        roas: spend > 0 ? conv.revenue / spend : 0,
-        ctr: parseFloat(r.inline_link_click_ctr) || 0,
-        cpm: parseFloat(r.cpm) || 0,
-        frequency: parseFloat(r.frequency) || 0
-      };
+      return { date: r.date_start, spend, revenue: conv.revenue, roas: spend > 0 ? conv.revenue / spend : 0 };
     });
 
     const j = judgedByCampaign[c.id] || {};
@@ -978,11 +705,15 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       learning: !!learningByCampaign[c.id],
       budget,
       budgetSource,
-      adsetCount: liveAdsetsByCampaign[c.id] || 0,
       series,
       createdTime: c.created_time,
       daysLive: Math.max(1, closedDays + (judgingToday && spend > 0 ? 1 : 0)),
       spend,
+      // Meta's figures are kept under their own names so the gap stays visible
+      // after Shopify overwrites the headline revenue.
+      metaRevenue: conv.revenue,
+      metaRoas: roas,
+      metaPurchases: conv.purchases,
       revenue: conv.revenue,
       roas,
       purchases: conv.purchases,
@@ -994,8 +725,6 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       ctr: parseFloat(j.inline_link_click_ctr) || 0,
       cpc: parseFloat(j.cost_per_inline_link_click) || 0,
       cpm: parseFloat(j.cpm) || 0,
-      adCopy: adCopyByCampaign[c.id] || [],
-      adStats: adStatsByCampaign[c.id] || [],
       // Streaks judge closed days only — never the day still in progress.
       history: daily
     };
@@ -1009,6 +738,8 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       body: (a.creative && a.creative.body) || '',
       type: decodeFormat(a.creative && a.creative.object_type),
       creativeId: (a.creative && a.creative.id) || '',
+      videoId: (a.creative && a.creative.video_id) || '',
+      thumbnail: (a.creative && a.creative.thumbnail_url) || '',
       effectiveStatus: (a.effective_status || '').toUpperCase(),
       name: a.name || ''
     };
@@ -1041,7 +772,33 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
     const metaRoas = Array.isArray(r.purchase_roas) && r.purchase_roas.length
       ? parseFloat(r.purchase_roas[0].value) || 0 : 0;
 
+    /* The structured shape the creative desk reads. Kept alongside the
+       display row rather than parsed back out of formatted strings. */
+    const creativeRow = {
+      id: r.ad_id,
+      name: r.ad_name || r.ad_id,
+      campaignId: r.campaign_id || '',
+      campaign: r.campaign_name || '',
+      type: cr.type || (v3 > 0 ? 'Video' : 'Image'),
+      impressions,
+      v3,
+      p25: actionVal(r.video_p25_watched_actions, 'video_view'),
+      p50: actionVal(r.video_p50_watched_actions, 'video_view'),
+      p75: actionVal(r.video_p75_watched_actions, 'video_view'),
+      p100: actionVal(r.video_p100_watched_actions, 'video_view'),
+      avgWatchSec: actionVal(r.video_avg_time_watched_actions, 'video_view'),
+      lengthSec: vlen[cr.videoId] || 0,
+      clicks,
+      spend,
+      purchases: conv.purchases,
+      revenue: conv.revenue,
+      thumbnail: cr.thumbnail || '',
+      status: cr.effectiveStatus || '',
+      days: 1
+    };
+
     return normalizeAd({
+      _creative: creativeRow,
       'Ad Name': r.ad_name || r.ad_id,
       'Campaign': r.campaign_name || '',
       'Creative Type': cr.type || (v3 > 0 ? 'Video' : 'Image'),
@@ -1110,7 +867,7 @@ function normalizeAd(ad) {
   if (ctr && ctr < 2) fb.push('CTR under 2% — the hook is not stopping the scroll. Change the first frame, not the offer.');
   if (ad['Creative Type'] === 'Video' && hook > 0 && hook < 25) fb.push('Hook rate under 25% — rebuild the first 3 seconds with a pattern interrupt.');
   if (clicks && lpv < clicks * 0.7) fb.push('Clicks are not reaching the page — Funnelish/Shopify load speed is leaking traffic.');
-  if (lpv && atc < lpv * 0.05) fb.push('Add-to-cart under 5% — offer or price problem, not a creative problem.');
+  if (lpv && atc < lpv * 0.05 && !State.atcBroken) fb.push('Add-to-cart under 5% — offer or price problem, not a creative problem.');
   if (atc && ic < atc * 0.3) fb.push('Carts are not starting checkout — usually shipping cost revealed too late.');
   if (ic && purchases < ic * 0.5) fb.push('Checkouts are not finishing — check Klarna/PayPal and the trust block.');
   if (freq > VE.RULES.frequency.fatigue) fb.push(`Frequency ${freq.toFixed(2)} — the same people keep seeing it. Refresh the creative.`);
@@ -1126,12 +883,12 @@ function normalizeAd(ad) {
 /* ========================================================================== *
  *  VERDICTS
  * ========================================================================== */
-function actionLog() { return acctJson('cgo_action_log', {}); }
-function saveActionLog(l) { acctSet('cgo_action_log', JSON.stringify(l)); }
+function actionLog() { return LS.json('cgo_action_log', {}); }
+function saveActionLog(l) { LS.set('cgo_action_log', JSON.stringify(l)); }
 
 function berFor(campaign) {
   const parsed = VE.parseCampaignName(campaign.name);
-  const override = acctJson('cgo_ber_overrides', {})[campaign.id];
+  const override = LS.json('cgo_ber_overrides', {})[campaign.id];
   const ber = override || parsed.ber || (State.econ && State.econ.valid ? State.econ.ber : 0);
   return {
     ber,
@@ -1140,11 +897,67 @@ function berFor(campaign) {
   };
 }
 
+/* Overlay the Shopify figures onto each campaign. Meta's numbers are kept
+   alongside so the card can show both and the gap between them — the gap is
+   the early warning that tracking has drifted again. */
+function applyTruth() {
+  const m = State.truthMatch;
+  State.campaigns.forEach(c => {
+    const row = m && m.perCampaign[c.id];
+    if (row) {
+      c.trueRevenue = row.net;
+      c.trueGross = row.gross;
+      c.trueRefunded = row.refunded;
+      c.trueOrders = row.orders;
+      c.trueProducts = row.products;
+      c.revenue = row.net;
+      c.roas = c.spend > 0 ? row.net / c.spend : 0;
+      c.purchases = row.orders;
+      c.revenueSource = 'shopify';
+      c.revenueGap = Math.round((row.net - (c.metaRevenue || 0)) * 100) / 100;
+    } else {
+      c.trueRevenue = null;
+      c.revenue = c.metaRevenue !== undefined ? c.metaRevenue : c.revenue;
+      c.roas = c.metaRoas !== undefined ? c.metaRoas : c.roas;
+      c.purchases = c.metaPurchases !== undefined ? c.metaPurchases : c.purchases;
+      c.revenueGap = null;
+      c.revenueSource = State.source === 'api' ? 'meta' : State.source;
+    }
+  });
+}
+
+/* The ATC event does not fire on these funnels. Detect it at account level —
+   no adds to cart anywhere while orders are being placed is a tracking fault,
+   not nine simultaneous offer failures. Without this flag every new campaign
+   gets killed as "nobody wants the offer", which is simply untrue. */
+function detectAtcBroken() {
+  const t = State.campaigns.reduce((a, c) => {
+    a.atc += c.atc || 0; a.purchases += c.purchases || 0; a.spend += c.spend || 0;
+    return a;
+  }, { atc: 0, purchases: 0, spend: 0 });
+  State.atcBroken = t.atc === 0 && (t.purchases > 0 || t.spend > 100);
+}
+
+/* The judged day against the trailing closed days, from the SAME source, so
+   one noisy day cannot be mistaken for a trend and a trend cannot be used to
+   excuse a bad day. Both sides are Meta history, which is why it is labelled
+   as a Meta trend and never replaces the verdict. */
+function metaTrendPool(c, days) {
+  const rows = (c.history || []).filter(d => d.spend > 0).slice(-days);
+  if (rows.length < 2) return null;
+  const spend = rows.reduce((s, d) => s + d.spend, 0);
+  const revenue = rows.reduce((s, d) => s + d.revenue, 0);
+  return { spend, revenue, purchases: 0, roas: spend > 0 ? revenue / spend : 0, days: rows.length };
+}
+
 function computeVerdicts() {
   const now = new Date();
   const ctxDay = VE.dayContext(now, State.accountTz);
   const win = activeWindow();
   const log = actionLog();
+
+  applyTruth();
+  detectAtcBroken();
 
   State.campaigns.forEach(c => {
     const { ber, grossMargin, source } = berFor(c);
@@ -1153,23 +966,26 @@ function computeVerdicts() {
     c.profitableStreak = VE.countProfitableStreak(c.history, ber);
     c.berSource = source;
     c.surfedRecently = ['SURF', 'SCALE'].includes(entry.lastCode) && daysAgo(entry.last) <= 2;
-    // Spread the whole day context so accountHour/accountMinute reach the
-    // pacing projection; `window` still comes from the tab the user picked.
-    c.verdict = VE.verdict(c, {
-      ...ctxDay,
-      ber, grossMargin, window: win,
-      refundRate: (State.econ && State.econ.refundRate) || 0,
-      learning: c.learning,
-      currency: State.currency
-    });
-    c.lastAction = entry.last || null;
 
-    // Was an action already applied for the exact day being judged?
-    const judged = judgedDateKey();
-    c.appliedAction = judged
-      ? (entry.applied && entry.applied[judged])
-        || (entry.last === judged ? { code: entry.lastCode || 'UNKNOWN' } : null)
-      : null;
+    const ctx = {
+      ber, grossMargin, window: win,
+      isSaturday: ctxDay.isSaturday, isSunday: ctxDay.isSunday,
+      learning: c.learning,
+      currency: State.currency,
+      revenueSource: c.revenueSource,
+      atcTrackingBroken: State.atcBroken
+    };
+
+    c.verdict = VE.verdict(c, ctx);
+
+    // Stability check — shown as a note, never as a second verdict.
+    const pool = metaTrendPool(c, 3);
+    c.trend = pool ? VE.windowAgreement(
+      { ...c, revenue: c.metaRevenue, roas: c.metaRoas }, pool,
+      { ...ctx, revenueSource: 'meta' }
+    ) : null;
+
+    c.lastAction = entry.last || null;
   });
 
   State.multiAccount = new Set(State.campaigns.map(c => c.accountId).filter(Boolean)).size > 1;
@@ -1205,19 +1021,50 @@ function sparkline(series, ber) {
   return `
     <div class="spark ${tone}">
       <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
-           aria-label="ROAS over the last ${days.length} days, ending at ${last.roas.toFixed(2)} against break-even ${ber.toFixed(2)}">
+           aria-label="Meta-reported ROAS over the last ${days.length} days, ending at ${last.roas.toFixed(2)} against break-even ${ber.toFixed(2)}">
         <path class="spark-area" d="${area}"/>
         <line class="spark-ber" x1="${pad}" x2="${W - pad}" y1="${berY}" y2="${berY}"/>
         <path class="spark-line" d="${line}"/>
         <circle class="spark-dot" cx="${x(days.length - 1).toFixed(1)}" cy="${y(last.roas).toFixed(1)}" r="3"/>
       </svg>
-      <span class="spark-cap">${days.length}d ROAS · dashed line is break-even · ${drift >= 0 ? '+' : ''}${drift}% since day one</span>
+      <span class="spark-cap">${days.length}d ROAS as Meta reported it · dashed line is break-even · ${drift >= 0 ? '+' : ''}${drift}% since day one</span>
     </div>`;
 }
 
-const VERDICT_LABEL = { SCALE: 'Scale', SURF: 'Surf', DESCALE: 'Descale', KILL: 'Kill',
-  PRICE_DROP: 'Price drop', PROVE: 'Prove', HOLD: 'Hold', MONITOR: 'Watch',
-  DIAGNOSE: 'Diagnose', PAUSED: 'Paused', NEEDS_SETUP: 'Setup', UNKNOWN: 'an action' };
+/* The revenue provenance strip on each card. This is the single most
+   important thing on the card, because it says whether the number underneath
+   can be trusted. */
+function revenueLine(c) {
+  if (c.revenueSource === 'shopify') {
+    const gap = c.revenueGap;
+    const gapTxt = gap === null ? '' :
+      Math.abs(gap) < 0.5 ? ' · Meta agrees' :
+      ` · Meta said ${fmtMoney(c.metaRevenue, 0)}, out by ${gap > 0 ? '−' : '+'}${fmtMoney(Math.abs(gap), 0)}`;
+    const refund = c.trueRefunded > 0 ? ` · ${fmtMoney(c.trueRefunded, 0)} refunded` : '';
+    return `<div class="rev-line verified">
+      <span class="rev-badge ok">✓ Shopify</span>
+      <span>${fmtMoney(c.trueRevenue, 0)} from ${c.trueOrders} order${c.trueOrders === 1 ? '' : 's'}${refund}${gapTxt}</span>
+    </div>`;
+  }
+  if (c.revenueSource === 'meta') {
+    return `<div class="rev-line unverified">
+      <span class="rev-badge warn">⚠ Meta only</span>
+      <span>${fmtMoney(c.revenue, 0)} attributed, unverified. No Shopify product matched this campaign — scaling is locked.</span>
+    </div>`;
+  }
+  return `<div class="rev-line demo"><span class="rev-badge">${esc(c.revenueSource || 'demo')}</span><span>Not live data.</span></div>`;
+}
+
+function trendNote(c) {
+  const t = c.trend;
+  if (!t || t.agree) return '';
+  const dir = d => d === 'up' ? 'scaling' : d === 'down' ? 'cutting' : 'holding';
+  return `<li class="note conflict">
+    This day and the ${t.pooled.days}-day Meta trend disagree: the day points at ${dir(t.conflict.day)}
+    (ROAS ${t.day.roas}), the trend at ${dir(t.conflict.pooled)} (ROAS ${t.pooled.roas}).
+    Decide on one window and say which — do not take whichever supports the answer you already wanted.
+  </li>`;
+}
 
 function renderVerdicts() {
   const grid = document.getElementById('verdict-grid');
@@ -1230,18 +1077,7 @@ function renderVerdicts() {
     const v = c.verdict;
     const m = v.metrics;
     let budgetLine;
-    if (c.appliedAction) {
-      /* The trap this closes: the verdict is recomputed from the budget Meta
-         reports NOW. Once he has applied +35% and moved €135 to €182, the next
-         read of the same day recomputes +35% ON €182 and draws "€182 → €246".
-         Marked done, and still showing a bigger number to move to — which is
-         exactly how a campaign gets scaled twice off one night's numbers.
-         An applied card shows what the budget IS, and nothing to do. */
-      budgetLine = `<div class="verdict-budget applied-budget">
-          <span class="bud-to">${c.budget ? fmtMoney(c.budget, 0) + '/day' : 'Applied'}</span>
-          <span class="bud-delta">already set${c.budgetSource === 'adset' ? ' · ad-set budget' : ''} — nothing to change</span>
-        </div>`;
-    } else if (v.budgetTo === null) {
+    if (v.budgetTo === null) {
       budgetLine = `<div class="verdict-budget none">No budget change at this read</div>`;
     } else if (v.code === 'KILL') {
       budgetLine = `<div class="verdict-budget danger">
@@ -1261,149 +1097,88 @@ function renderVerdicts() {
 
     const marginTone = m.marginPct >= 20 ? 'success' : m.marginPct >= 15 ? 'warning' : m.marginPct > 0 ? 'neutral' : 'danger';
     const roasTone = m.ber && m.roas >= m.ber ? 'success' : 'danger';
+    const lockChip = v.revenue && v.revenue.scalingLocked
+      ? '<span class="lock-chip" title="Scaling needs Shopify-verified revenue">🔒 scale locked</span>' : '';
+    /* How much evidence is behind this card, stated plainly. A verdict on
+       four orders and a verdict on four hundred should not look the same. */
+    const conf = v.confidence || {};
+    const evidenceChip = !conf.interval
+      ? '<span class="eq none">no orders yet</span>'
+      : conf.proven
+        ? `<span class="eq ok" title="Even the low end of the range clears break-even">✓ proven on ${conf.orders} orders</span>`
+        : `<span class="eq thin" title="The range still crosses break-even, so this is not yet a reliable signal">~ ${conf.orders} order${conf.orders === 1 ? '' : 's'} — not conclusive${conf.ordersNeeded ? `, needs about ${conf.ordersNeeded}` : ''}</span>`;
 
     return `
-      <article class="card verdict-card tone-${v.tone}${c.appliedAction ? ' is-applied' : ''}${isPastWindow() ? ' is-past' : ''}">
+      <article class="card verdict-card tone-${v.tone}">
         <header class="verdict-head">
           <div class="verdict-name">
             <h3>${esc(VE.productLabel(c.name))}</h3>
             <span class="verdict-fullname" title="${esc(c.name)}">${esc(c.name)}</span>
             <span class="verdict-meta">Day ${m.daysLive} · ${esc(c.status || '—')}${c.learning ? ' · <b class="learning-chip">learning</b>' : ''}${State.multiAccount && c.accountName ? ' · ' + esc(c.accountName) : ''}</span>
           </div>
-          <div class="verdict-badge tone-${c.appliedAction ? 'neutral' : v.tone}">${c.appliedAction ? '\u2713' : (VERDICT_ICON[v.code] || '')} ${esc(c.appliedAction ? v.headline + ' — done' : v.headline)}</div>
+          <div class="verdict-badge tone-${v.tone}">${VERDICT_ICON[v.code] || ''} ${esc(v.headline)} ${lockChip}</div>
         </header>
 
+        ${revenueLine(c)}
+        <div class="evidence-line">${evidenceChip}</div>
         ${budgetLine}
 
-        ${c.appliedAction ? `<div class="applied-note">
-            \u2713 <strong>Already done.</strong> You marked ${esc(VERDICT_LABEL[c.appliedAction.code] || c.appliedAction.code)} as applied for ${esc(windowLabel())}${c.budget ? `, and the budget is now ${fmtMoney(c.budget, 0)}/day` : ''}. The reasons below are the record of why \u2014 there is nothing left to act on here. Your next move comes at the next read.
-          </div>` : isPastWindow() ? `<div class="past-note">
-            \u1F4C5 Reviewing a closed window. This is what the rule said at the time; it is not something to act on now.
-          </div>` : ''}
-
         <div class="verdict-stats">
-          <div class="vstat tone-${roasTone}"><span class="vstat-val">${m.roas.toFixed(2)}</span><span class="vstat-cap">ROAS</span></div>
+          <div class="vstat tone-${roasTone}" title="${v.confidence && v.confidence.interval ? `Resting on ${v.confidence.orders} orders, so the real figure is between ${v.confidence.interval.lo} and ${v.confidence.interval.hi}` : 'No orders behind this figure'}">
+            <span class="vstat-val">${m.roas.toFixed(2)}</span>
+            <span class="vstat-cap">ROAS${v.confidence && v.confidence.interval ? ` <span class="ci">${v.confidence.interval.lo}–${v.confidence.interval.hi}</span>` : ''}</span>
+          </div>
           <div class="vstat"><span class="vstat-val">${m.ber ? m.ber.toFixed(2) : '—'}</span><span class="vstat-cap">BER</span></div>
-          <div class="vstat tone-${marginTone}"><span class="vstat-val">${m.marginPct > -100 ? m.marginPct + '%' : '—'}</span><span class="vstat-cap">Margin</span></div>
+          <div class="vstat tone-${marginTone}" title="${esc(v.revenue ? v.revenue.marginMeans : 'Contribution margin')}"><span class="vstat-val">${m.marginPct > -100 ? m.marginPct + '%' : '—'}</span><span class="vstat-cap">Contribution</span></div>
           <div class="vstat"><span class="vstat-val">${fmtMoney(m.spend, 0)}</span><span class="vstat-cap">Spent</span></div>
-          <div class="vstat"><span class="vstat-val">${m.purchases}</span><span class="vstat-cap">Sales</span></div>
+          <div class="vstat"><span class="vstat-val">${m.purchases}</span><span class="vstat-cap">Orders</span></div>
           <div class="vstat ${m.frequency > VE.RULES.frequency.fatigue ? 'tone-warning' : ''}"><span class="vstat-val">${m.frequency.toFixed(2)}</span><span class="vstat-cap">Freq</span></div>
-          <div class="vstat ${m.cpa !== null && m.maxCpa ? (m.cpa <= m.maxCpa ? 'tone-good' : 'tone-bad') : ''}"><span class="vstat-val">${m.cpa === null ? '—' : fmtMoney(m.cpa)}</span><span class="vstat-cap">Cost / purchase</span></div>
-          ${m.profit !== null && m.profit !== undefined
-            ? `<div class="vstat tone-${m.profit >= 0 ? 'good' : 'bad'}"><span class="vstat-val">${(m.profit >= 0 ? '+' : '') + fmtMoney(m.profit, 0)}</span><span class="vstat-cap">Profit</span></div>` : ''}
-          ${m.headroomPct !== null && m.headroomPct !== undefined
-            ? `<div class="vstat tone-${m.headroomPct >= 25 ? 'good' : m.headroomPct >= 0 ? 'warning' : 'bad'}"><span class="vstat-val">${m.headroomPct}%</span><span class="vstat-cap">CPA room</span></div>` : ''}
         </div>
 
         ${sparkline(c.series, m.ber)}
 
-        ${m.broken ? `<div class="broken-alert">
-            <strong>\u26d4 ${esc(m.broken.upCount + ' ' + m.broken.from)} produced 0 ${esc(m.broken.to)}.</strong>
-            ${esc(m.broken.message)}
-          </div>` : ''}
-
         <ul class="verdict-reasons">
-        
           ${v.reasons.map(r => `<li>${esc(r)}</li>`).join('')}
           ${v.notes.map(n => `<li class="note">${esc(n)}</li>`).join('')}
+          ${trendNote(c)}
           ${m.cpa && m.maxCpa ? `<li class="${m.cpa <= m.maxCpa ? 'note' : ''}">CPA ${fmtMoney(m.cpa)} against a break-even CPA of ${fmtMoney(m.maxCpa)}${m.cpa > m.maxCpa ? ' — you are paying more per order than an order is worth.' : '.'}</li>` : ''}
-          ${m.pacingPct !== null && m.pacingPct < 70 && c.budget ? `<li class="note">Spent only ${m.pacingPct}% of the ${fmtMoney(c.budget, 0)} budget — the auction cannot fill it.</li>` : ''}
-          ${m.pacing && !State.range && LS.get('meta_date_preset','today') === 'today'
-            ? `<li class="note">${m.pacing.dayFractionPct}% of the day gone. On this pace it lands near ${fmtMoney(m.pacing.projectedSpend, 0)} spend${m.pacing.projectedPurchases >= 1 ? ` and about ${Math.round(m.pacing.projectedPurchases)} orders` : ''}.${m.pacing.willUnderDeliver && c.budget ? ` It will not spend its ${fmtMoney(c.budget, 0)} budget.` : ''}</li>` : ''}
+          ${m.pacingPct !== null && m.pacingPct < 70 && c.budget && dayIsOver() ? `<li class="note">Spent only ${m.pacingPct}% of the ${fmtMoney(c.budget, 0)} budget on a closed day — the auction could not fill it.</li>` : ''}
         </ul>
 
         <div class="verdict-funnel">
-          ${['pageLoad', 'offer', 'intent', 'completion'].map(k => `
-            <span class="fchip ${v.funnel[k].status}" title="target ${v.funnel[k].target}%+">
-              ${({ pageLoad: 'Speed', offer: 'Offer', intent: 'Intent', completion: 'Close' })[k]} ${v.funnel[k].value}%
-            </span>`).join('')}
+          ${['pageLoad', 'offer', 'intent', 'completion'].map(k => funnelChip(k, v.funnel[k])).join('')}
         </div>
-
-        ${creativeBlock(c, m)}
 
         <footer class="verdict-foot">
           <span class="verdict-rule">📖 ${esc(v.rule)}</span>
           <div class="verdict-actions">
             <button class="btn-mini" onclick="editBer('${c.id}')">Set BER</button>
-            ${v.budgetTo !== null && isSingleDayWindow()
-              ? `<button class="btn-mini ${c.appliedAction ? '' : 'primary'}" onclick="markApplied('${c.id}','${v.code}')">${c.appliedAction ? '\u2713 Applied \u00b7 undo' : 'Mark applied'}</button>`
-              : ''}
+            ${v.budgetTo !== null ? `<button class="btn-mini primary" onclick="markApplied('${c.id}','${v.code}')">${c.lastAction === todayKey() ? '✓ Done today' : 'Mark applied'}</button>` : ''}
           </div>
         </footer>
       </article>`;
   }).join('');
 }
 
-/* ---------------------------------------------------------- creative health --
-   The budget verdict answers "how much". This answers "with what". A campaign
-   can be perfectly scalable on the numbers and still be three days from death
-   because the creative is spent — and no budget move fixes that.             */
-const CREATIVE_ICON = { fresh: '✓', fading: '◑', worn: '⚠', new: '○' };
+/* A funnel chip must never show a green number it guessed. When landing page
+   views are estimated at 82% of clicks, the page-speed ratio is 82% by
+   construction and the band's pass mark is 70% — so it could only ever read
+   healthy. That is not a measurement, so it is not displayed as one. The same
+   goes for the offer ratio while the add-to-cart event is dead. */
+const CHIP_LABEL = { pageLoad: 'Speed', offer: 'Offer', intent: 'Intent', completion: 'Close' };
 
-function creativeBlock(c, m) {
-  const h = m && m.creative;
-  if (!h) return '';
-
-  // A worn-out creative on a campaign you already switched off is history,
-  // not an instruction. Say nothing.
-  if (/PAUSED/i.test(c.status || '')) return '';
-
-  const signals = (h.signals || []).map(s => `<li>${esc(s)}</li>`).join('');
-
-  // Angles are only useful when he actually has to shoot something. On a
-  // healthy campaign the list is noise, and noise is how a card stops
-  // getting read.
-  let angleLine = '';
-  if (h.state === 'fading' || h.state === 'worn') {
-    const cov = VE.angleCoverage(c.adCopy || []);
-    if (cov.adsRead) {
-      const tested = cov.tested.map(a => a.label).join(', ');
-      const untested = cov.untested.map(a => a.label).join(', ');
-      angleLine = `<p class="creative-angles">
-        ${tested ? `<strong>Running:</strong> ${esc(tested)}.` : '<strong>Running:</strong> no angle recognised from the ad copy.'}
-        ${untested ? ` <strong>Not tried on this product:</strong> ${esc(untested)}.` : ' Every angle in your library has been tried — the next test is a new hook inside one of them, not a new angle.'}
-        <span class="creative-caveat">Read from ad copy, so it sees the words and not the footage.</span>
-      </p>`;
-    }
+function funnelChip(key, d) {
+  const untracked =
+    (key === 'pageLoad' && State.lpvEstimated) ||
+    (key === 'offer' && State.atcBroken) ||
+    (key === 'intent' && State.atcBroken);
+  if (untracked) {
+    return `<span class="fchip untracked" title="Not measured — the event does not fire on this funnel, so no number here would mean anything.">${CHIP_LABEL[key]} not tracked</span>`;
   }
-
-  return `
-    <div class="creative-block creative-${h.state}">
-      <div class="creative-head">
-        <span class="creative-icon">${CREATIVE_ICON[h.state] || ''}</span>
-        <strong>Creative — ${esc(h.headline)}</strong>
-        ${h.days ? `<span class="creative-days">${h.days} day${h.days === 1 ? '' : 's'} of data</span>` : ''}
-      </div>
-      <p class="creative-detail">${esc(h.detail)}</p>
-      ${signals ? `<ul class="creative-signals">${signals}</ul>` : ''}
-      ${angleLine}
-    </div>`;
+  return `<span class="fchip ${d.status}" title="target ${d.target}%+">${CHIP_LABEL[key]} ${d.value}%</span>`;
 }
 
 function todayKey() { return new Date().toISOString().slice(0, 10); }
-
-/* The day a verdict actually belongs to — the last day inside the window
-   being judged, on the ACCOUNT's calendar. Applied actions are logged
-   against this, never against "today". Logging against today meant that
-   opening yesterday tomorrow showed the action as undone, and the card
-   cheerfully told you to scale a budget you had already scaled.
-   A multi-day window returns null: there is no single day to apply an
-   action to, so those windows are review-only. */
-function judgedDateKey() {
-  if (State.range) return State.range.since === State.range.until ? State.range.until : null;
-  const preset = LS.get('meta_date_preset', 'today');
-  if (preset === 'today') return todayInAccountTz(0);
-  if (preset === 'yesterday') return todayInAccountTz(-1);
-  return null;
-}
-function isSingleDayWindow() { return judgedDateKey() !== null; }
-
-/* Reading a window that has already closed. The budget numbers on those
-   cards are a record of what the rule said that day, not an instruction. */
-function isPastWindow() {
-  const day = judgedDateKey();
-  return day ? day < todayInAccountTz(0) : LS.get('meta_date_preset', 'today') !== 'today';
-}
 function daysAgo(key) {
   if (!key) return 999;
   const d = (Date.now() - new Date(key + 'T00:00:00').getTime()) / 86400000;
@@ -1411,34 +1186,12 @@ function daysAgo(key) {
 }
 
 function markApplied(id, code) {
-  const day = judgedDateKey();
-  if (!day) return;                         // multi-day windows are review-only
   const log = actionLog();
   const entry = log[id] || { descaleCount: 0 };
-  entry.applied = entry.applied || {};
-
-  // Carry forward the old single-slot shape so nothing already logged is lost.
-  if (entry.last && !entry.applied[entry.last]) {
-    entry.applied[entry.last] = { code: entry.lastCode || 'UNKNOWN' };
-  }
-
-  // Clicking again un-marks it — a mis-click should be recoverable.
-  if (entry.applied[day]) delete entry.applied[day];
-  else entry.applied[day] = { code, at: new Date().toISOString() };
-
-  const days = Object.keys(entry.applied).sort();
-  const latest = days[days.length - 1];
-  entry.last = latest || null;
-  entry.lastCode = latest ? entry.applied[latest].code : null;
-
-  // Consecutive descales, counted from what was actually applied.
-  entry.descaleCount = days.reduce((n, k) => {
-    const cd = entry.applied[k].code;
-    if (cd === 'DESCALE') return n + 1;
-    if (cd === 'SCALE' || cd === 'SURF') return 0;
-    return n;
-  }, 0);
-
+  entry.last = todayKey();
+  entry.lastCode = code;
+  if (code === 'DESCALE') entry.descaleCount = (entry.descaleCount || 0) + 1;
+  if (code === 'SCALE' || code === 'SURF') entry.descaleCount = 0;
   log[id] = entry;
   saveActionLog(log);
   renderAll();
@@ -1449,120 +1202,310 @@ function editBer(id) {
   const current = berFor(c).ber;
   const val = prompt(`Break-even ROAS for "${c.name}"\n\nLeave empty to go back to the campaign name / your unit economics.`, current ? current.toFixed(2) : '');
   if (val === null) return;
-  const overrides = acctJson('cgo_ber_overrides', {});
+  const overrides = LS.json('cgo_ber_overrides', {});
   const n = parseFloat(String(val).replace(',', '.'));
   if (!val.trim() || !(n > 0)) delete overrides[id]; else overrides[id] = n;
-  acctSet('cgo_ber_overrides', JSON.stringify(overrides));
+  LS.set('cgo_ber_overrides', JSON.stringify(overrides));
   renderAll();
 }
+
+/* Hand-mapping a Shopify product onto a campaign, for the cases the name
+   match cannot get: a renamed product, or a campaign whose product label does
+   not resemble the Shopify title. */
+function editProductMap() {
+  const t = State.truth;
+  if (!t || !t.byProduct) {
+    showModal('No Shopify data yet', '<p>Connect the Truth Worker and sync once. The product list comes from your actual orders, so there is nothing to map until then.</p>');
+    return;
+  }
+  const map = LS.json('cgo_product_map', {});
+  const titles = Object.keys(t.byProduct).sort();
+  const opts = State.campaigns.map(c =>
+    `<option value="${esc(c.id)}">${esc(VE.productLabel(c.name))} — ${esc(c.name)}</option>`).join('');
+
+  const rows = titles.map(title => {
+    const auto = (State.truthMatch && State.truthMatch.matches.find(x => x.title === title)) || null;
+    const current = map[title] || (auto ? auto.campaignId : '');
+    return `<tr>
+      <td>${esc(title)}<div class="map-sub">${fmtMoney(t.byProduct[title].net)} · ${t.byProduct[title].orders} orders${auto ? ` · auto-matched to ${esc(auto.campaign)}` : ' · <b>unmatched</b>'}</div></td>
+      <td><select data-title="${esc(title)}"><option value="">— leave to name matching —</option>${opts}</select></td>
+    </tr>`;
+  }).join('');
+
+  showModal('Product → campaign map', `
+    <p>Every Shopify product from the current window. Anything left on name matching is matched automatically;
+    set one by hand only where the automatic match is wrong or missing.</p>
+    <table class="map-table"><tbody>${rows}</tbody></table>
+    <p class="map-foot"><button class="btn btn-primary" id="btn-save-map">Save map</button></p>`);
+
+  // Pre-select the stored overrides, then wire the save.
+  setTimeout(() => {
+    document.querySelectorAll('.map-table select').forEach(sel => {
+      const stored = map[sel.dataset.title];
+      if (stored) sel.value = stored;
+    });
+    const btn = document.getElementById('btn-save-map');
+    if (btn) btn.addEventListener('click', () => {
+      const next = {};
+      document.querySelectorAll('.map-table select').forEach(sel => {
+        if (sel.value) next[sel.dataset.title] = sel.value;
+      });
+      LS.set('cgo_product_map', JSON.stringify(next));
+      if (State.truth) {
+        State.truthMatch = TR.match(State.campaigns, State.truth.byProduct || {}, next);
+      }
+      const modal = document.getElementById('info-modal');
+      if (modal) modal.remove();
+      renderAll();
+    });
+  }, 0);
+}
+
+/* ========================================================================== *
+ *  TRUTH PANEL
+ * ========================================================================== */
+function truthPanelHost() {
+  let el = document.getElementById('truth-panel');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'truth-panel';
+    const grid = document.getElementById('verdict-grid');
+    if (grid && grid.parentNode) grid.parentNode.insertBefore(el, grid);
+    else document.body.appendChild(el);
+  }
+  return el;
+}
+
+function renderTruthPanel() {
+  const host = truthPanelHost();
+  const st = State.truthStatus;
+
+  if (!st) { host.innerHTML = ''; return; }
+
+  if (st.state !== 'ok') {
+    host.innerHTML = `
+      <div class="truth-card ${st.state === 'off' ? 'off' : 'bad'}">
+        <div class="truth-head">
+          <strong>${st.state === 'off' ? 'Shopify truth not connected' : 'Shopify truth unavailable'}</strong>
+          <span class="truth-chip warn">🔒 scaling locked</span>
+        </div>
+        <p>${esc(st.message)}</p>
+      </div>`;
+    return;
+  }
+
+  const t = State.truth;
+  const m = State.truthMatch || { attributed: 0, unattributed: 0, unmatchedProducts: [], unmatchedCampaigns: [], matches: [] };
+  const metaTotal = State.campaigns.reduce((s, c) => s + (c.metaRevenue || 0), 0);
+  const spend = State.campaigns.reduce((s, c) => s + (c.spend || 0), 0);
+  const gap = t.net - metaTotal;
+  const gapPct = metaTotal > 0 ? (gap / metaTotal) * 100 : 0;
+  const range = State.truthRange;
+  const rangeTxt = range
+    ? `${range.since.toISOString().slice(0, 10)} → ${new Date(range.until.getTime() - 1).toISOString().slice(0, 10)}`
+    : '';
+
+  const warnings = [];
+  if (Math.abs(gapPct) > 5) {
+    warnings.push(`Meta's account total is out by ${gapPct > 0 ? '−' : '+'}${Math.abs(gapPct).toFixed(1)}%. Up to about 2% is normal here; more than that means the Shopify pull is incomplete or tracking has degraded further.`);
+  }
+  if (m.unattributed > 0) {
+    warnings.push(`${fmtMoney(m.unattributed)} of real orders could not be matched to any live campaign: ${m.unmatchedProducts.map(p => esc(p.title)).join(', ')}. That revenue is counted in the account total but in no campaign's ROAS. Fix it in the product map.`);
+  }
+  if (m.unmatchedCampaigns.length) {
+    warnings.push(`${m.unmatchedCampaigns.length} campaign${m.unmatchedCampaigns.length === 1 ? '' : 's'} spent money and matched no Shopify orders: ${m.unmatchedCampaigns.map(c => esc(c.label) + ' (' + fmtMoney(c.spend, 0) + ')').join(', ')}. Either they genuinely sold nothing, or the product name does not match — check before cutting.`);
+  }
+  if (State.atcBroken) {
+    warnings.push('The add-to-cart event is not firing anywhere on this account, so no offer or checkout-intent ratio is meaningful. Day-1 kills fall back to landing-page views, and the price-drop test cannot run until the event is fixed.');
+  }
+
+  host.innerHTML = `
+    <div class="truth-card ok">
+      <div class="truth-head">
+        <strong>Shopify is the revenue of record</strong>
+        <span class="truth-chip ok">✓ ${t.orders} orders${rangeTxt ? ' · ' + rangeTxt : ''}</span>
+      </div>
+      <div class="truth-grid">
+        <div><span class="truth-big">${fmtMoney(t.net, 0)}</span><span class="truth-cap">Shopify, net of refunds</span></div>
+        <div><span class="truth-big">${fmtMoney(metaTotal, 0)}</span><span class="truth-cap">Meta reported</span></div>
+        <div><span class="truth-big ${Math.abs(gapPct) > 5 ? 'bad' : ''}">${gap >= 0 ? '+' : '−'}${fmtMoney(Math.abs(gap), 0)}</span><span class="truth-cap">Gap (${gapPct >= 0 ? '+' : '−'}${Math.abs(gapPct).toFixed(1)}%)</span></div>
+        <div><span class="truth-big">${spend > 0 ? (t.net / spend).toFixed(2) : '—'}</span><span class="truth-cap">Shopify ÷ Meta spend</span></div>
+        ${t.refunded > 0 ? `<div><span class="truth-big">${fmtMoney(t.refunded, 0)}</span><span class="truth-cap">Refunded in window</span></div>` : ''}
+      </div>
+      <p class="truth-foot">
+        Account totals have always agreed within about 2%. The per-campaign split is what was wrong, so the
+        number that matters on each card below is the one labelled ✓ Shopify.
+        <strong>Shopify ÷ Meta spend is not ROAS</strong> — it includes orders from email, organic and returning
+        customers, so it flatters paid. Judge campaigns on their own card, not on this ratio.
+      </p>
+      ${warnings.length ? `<ul class="truth-warnings">${warnings.map(w => `<li>${w}</li>`).join('')}</ul>` : ''}
+    </div>`;
+}
+
+/* ========================================================================== *
+ *  CREATIVE DESK
+ * ========================================================================== */
+function creativeHost() {
+  let el = document.getElementById('creative-desk');
+  if (!el) {
+    el = document.createElement('section');
+    el.id = 'creative-desk';
+    el.className = 'section-block';
+    const table = document.querySelector('.table-card');
+    if (table && table.parentNode) table.parentNode.insertBefore(el, table);
+    else document.body.appendChild(el);
+  }
+  return el;
+}
+
+/* The curve, drawn. A shape falls off a cliff at one of six places and the
+   cliff is the brief. */
+function retentionBar(ret) {
+  if (!ret.isVideo || ret.points.length < 2) return '';
+  const pts = ret.points;
+  const max = pts[0].viewers || 1;
+  return `
+    <div class="ret">
+      ${pts.map(p => {
+        const h = Math.max(2, Math.round((p.viewers / max) * 100));
+        const when = p.seconds !== null && p.seconds !== undefined ? `${p.seconds}s` : p.label;
+        return `<div class="ret-col" title="${esc(`${fmtInt(p.viewers)} ${p.what} (${p.pctOfImpressions}%)`)}">
+            <div class="ret-fill" style="height:${h}%"></div>
+            <span class="ret-lab">${esc(when)}</span>
+            <span class="ret-val">${p.pctOfImpressions}%</span>
+          </div>`;
+      }).join('')}
+    </div>
+    ${ret.avgWatchSec ? `<div class="ret-cap">Average viewer watches ${ret.avgWatchSec}s${ret.lengthSec ? ` of ${ret.lengthSec}s — ${ret.avgWatchPct}% of the cut` : ''}.</div>` : ''}`;
+}
+
+const AD_CODE = {
+  SCALE_SOURCE: { label: 'Make more like this', tone: 'success' },
+  KEEP:         { label: 'Keep', tone: 'neutral' },
+  KEEP_FOR_NOW: { label: 'Held — replace it', tone: 'warning' },
+  TESTING:      { label: 'Still testing', tone: 'neutral' },
+  PAUSE:        { label: 'Pause', tone: 'danger' }
+};
+
+function renderCreativeDesk() {
+  const host = creativeHost();
+  const rows = State.ads.map(a => a._creative).filter(Boolean);
+
+  if (!rows.length) {
+    host.innerHTML = `
+      <h2 class="section-title">🎬 Creative desk</h2>
+      <p class="section-lede">No ad-level data in this window.</p>`;
+    return;
+  }
+
+  /* Group by campaign so each brief is about one product and one offer. */
+  const byCampaign = {};
+  rows.forEach(r => {
+    const key = r.campaignId || r.campaign || 'Unassigned';
+    (byCampaign[key] = byCampaign[key] || { name: r.campaign || key, ads: [] }).ads.push(r);
+  });
+
+  const blocks = Object.entries(byCampaign).map(([key, group]) => {
+    const campaign = State.campaigns.find(c => c.id === key) || {};
+    const { ber } = campaign.id ? berFor(campaign) : { ber: State.econ && State.econ.valid ? State.econ.ber : 0 };
+    const cpa = campaign.purchases > 0 ? campaign.spend / campaign.purchases : 0;
+
+    const label = VE.productLabel(group.name);
+    const d = CD.desk(label, group.ads,
+      { ber, currency: State.currency, campaignCpa: cpa, fullName: group.name });
+
+    const adCards = d.verdicts.ads
+      .sort((a, b) => b.spend - a.spend)
+      .map(a => {
+        const meta = AD_CODE[a.code] || AD_CODE.KEEP;
+        const p = a.diagnosis.primary;
+        return `
+          <div class="ad-card tone-${meta.tone}">
+            <div class="ad-head">
+              <strong>${esc(a.name)}</strong>
+              <span class="ad-chip ${meta.tone}">${meta.label}</span>
+            </div>
+            <div class="ad-nums">
+              ${fmtMoney(a.spend, 0)} · ${a.purchases} order${a.purchases === 1 ? '' : 's'} · ROAS ${a.roas.toFixed(2)}
+              ${a.type === 'Video' ? ' · video' : ' · image'}
+            </div>
+            <div class="ad-why">${esc(a.why)}</div>
+            ${retentionBar(CD.retention(group.ads.find(x => x.id === a.id)))}
+            <div class="ad-stages">
+              ${a.diagnosis.stages.map(s => `
+                <span class="schip ${s.status}" title="${esc(s.measurable ? `${s.window} — target ${s.target}%+` : 'Not measurable for this ad')}">
+                  ${esc(s.label)} ${s.measurable ? s.value + '%' : '—'}
+                </span>`).join('')}
+            </div>
+            ${p ? `<div class="ad-fix"><strong>${esc(p.label)} — ${esc(p.window)}.</strong> ${esc(p.fails)}<br><em>${esc(p.fix)}</em></div>` : ''}
+          </div>`;
+      }).join('');
+
+    return `
+      <article class="card creative-card">
+        <header class="creative-head">
+          <h3>${esc(label)}</h3>
+          <span class="creative-sub">${d.verdicts.count} ads · fair test ${d.verdicts.threshold ? fmtMoney(d.verdicts.threshold, 0) : '—'}${d.verdicts.overSop ? ` · ${d.verdicts.overSop} over the SOP` : ''}</span>
+        </header>
+        <div class="brief ${d.brief.urgent ? 'urgent' : ''}">
+          <div class="brief-head">📋 ${esc(d.brief.headline)}</div>
+          <div class="brief-body">${d.brief.lines.map(l => mdLine(l)).join('')}</div>
+          <button class="btn-mini" onclick="copyBrief('${esc(key)}')">Copy brief for the team</button>
+        </div>
+        <div class="ad-grid">${adCards}</div>
+      </article>`;
+  }).join('');
+
+  host.innerHTML = `
+    <h2 class="section-title">🎬 Creative desk</h2>
+    <p class="section-lede">
+      Which ads deserve the budget, and what the editors should make next. The retention curve says
+      <em>where</em> a video loses people, and each drop has a different cause — an ad that dies at
+      3 seconds needs a new opening, not a new offer.
+    </p>
+    ${blocks}`;
+
+  State._briefs = Object.fromEntries(Object.entries(byCampaign).map(([key, group]) => {
+    const campaign = State.campaigns.find(c => c.id === key) || {};
+    const { ber } = campaign.id ? berFor(campaign) : { ber: 0 };
+    const cpa = campaign.purchases > 0 ? campaign.spend / campaign.purchases : 0;
+    const d = CD.desk(VE.productLabel(group.name), group.ads,
+      { ber, currency: State.currency, campaignCpa: cpa, fullName: group.name });
+    return [key, `${d.brief.headline}\n\n${d.brief.lines.join('\n')}`];
+  }));
+}
+
+/* The briefs use a little markdown so they can be pasted straight into
+   ClickUp without reformatting. */
+function mdLine(l) {
+  if (!l.trim()) return '<div class="brief-gap"></div>';
+  const html = esc(l)
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/^- /, '• ');
+  return `<div class="brief-line">${html}</div>`;
+}
+
+function copyBrief(key) {
+  const text = (State._briefs || {})[key] || '';
+  if (!text) return;
+  try {
+    navigator.clipboard.writeText(text);
+    showModal('Brief copied', '<p>Paste it into the ClickUp task for the editors.</p>');
+  } catch (e) {
+    showModal('Brief', `<pre class="brief-pre">${esc(text)}</pre>`);
+  }
+}
+window.copyBrief = copyBrief;
 
 /* ========================================================================== *
  *  GUARDRAILS
  * ========================================================================== */
-/* Break-even benchmarks, one row per product.
-
-   Every media buyer carries a table that says "CPA under €20 is good, over €40
-   kill it". It cannot be right, because it does not know the product. On this
-   account the true break-even CPA runs from about €18 to about €35 — a flat
-   €20 line calls a loss on one product "good" and lets another bleed for days
-   before it trips.
-
-   So this prints the real line per product. Nothing here is a new rule: it is
-   the same cpaPicture() the verdict already uses, shown instead of implied. */
-function renderBenchmarks() {
-  const host = document.getElementById('bench-table');
-  if (!host) return;
-
-  /* THE WINDOW IS FIXED, AND DELIBERATELY NOT THE ONE IN THE DATE BAR.
-
-     This panel first shipped reading whatever range was selected. On "today"
-     at 16:00 it said AtemFrei was overpaying €9.35 an order; over seven closed
-     days the same campaign had €5.57 of room. Both numbers were arithmetically
-     right. Spend lands the moment it is spent and orders attribute back over
-     the following hours, so any partial day shows all of the cost against part
-     of the revenue, and every campaign looks like it is bleeding.
-
-     A break-even line is a property of the product, not of an afternoon. So it
-     is read over the last 7 CLOSED days — the partial day never enters it, and
-     the figure does not swing when the date bar moves. */
-  const WINDOW_DAYS = 7;
-
-  const rows = State.campaigns
-    .filter(c => !/PAUSED|ARCHIVED|DELETED/i.test(c.status || ''))
-    .map(c => {
-      const { ber, grossMargin } = berFor(c);
-      const w = VE.trailingRoas(c.history, WINDOW_DAYS);
-      if (!w || !w.purchases) return null;
-      // cpaPicture works on a {spend, revenue, purchases} shape — hand it the
-      // window instead of the campaign so it reads closed days only.
-      const pic = VE.cpaPicture(w, grossMargin);
-      return { c, ber, pic, days: w.days };
-    })
-    .filter(Boolean)
-    // A product with no orders in the window has no basket size, so no line.
-    .filter(r => r.ber > 0 && r.pic.maxCPA)
-    .sort((a, b) => (a.pic.headroomPct ?? 999) - (b.pic.headroomPct ?? 999));
-
-  if (!rows.length) {
-    host.innerHTML = `<p class="bench-empty">No campaign has an order in the last ${WINDOW_DAYS} closed days, so there is no basket size to work from yet. The line appears as soon as a product sells.</p>`;
-    return;
-  }
-
-  const spanDays = Math.max(...rows.map(r => r.days));
-
-  const body = rows.map(({ c, ber, pic }) => {
-    const over = pic.cpa > pic.maxCPA;
-    const room = pic.headroomPct;
-    const tone = room === null ? '' : room >= 25 ? 'tone-good' : room >= 0 ? 'tone-warning' : 'tone-bad';
-    /* The sentence is the point of the row. A number without it is another
-       benchmark to memorise; with it, the row says what to do. */
-    const verdict = over
-      ? `Paying ${fmtMoney(pic.cpa - pic.maxCPA)} too much on every order.`
-      : `${fmtMoney(pic.maxCPA - pic.cpa)} of room left per order.`;
-    return `
-      <tr class="${tone}">
-        <td class="bench-name">${esc(VE.productLabel(c.name))}<span class="bench-ber">BER ${ber.toFixed(2)}</span></td>
-        <td class="bench-num">${fmtMoney(pic.aov)}</td>
-        <td class="bench-num bench-line">${fmtMoney(pic.maxCPA)}</td>
-        <td class="bench-num ${over ? 'bench-over' : 'bench-under'}">${pic.cpa === null ? '—' : fmtMoney(pic.cpa)}</td>
-        <td class="bench-num">${room === null ? '—' : room + '%'}</td>
-        <td class="bench-say">${verdict}</td>
-      </tr>`;
-  }).join('');
-
-  host.innerHTML = `
-    <table class="bench">
-      <thead>
-        <tr>
-          <th>Product</th>
-          <th class="bench-num">Basket</th>
-          <th class="bench-num">Can afford</th>
-          <th class="bench-num">Paying</th>
-          <th class="bench-num">Room</th>
-          <th>What that means</th>
-        </tr>
-      </thead>
-      <tbody>${body}</tbody>
-    </table>
-    <p class="bench-foot">
-      Can afford = basket × (1 ÷ BER). It moves when your basket moves, so a product
-      that starts selling a bigger bundle can carry a higher cost per order than it could last week.
-    </p>`;
-  /* Said on the card, not only in the code: the panel ignores the date bar on
-     purpose, and a reader who does not know that will think it is broken. */
-  const note = document.getElementById('bench-window-note');
-  if (note) {
-    note.textContent = `Last ${spanDays} closed day${spanDays === 1 ? '' : 's'} — not the date range above. Today is left out until it closes, because a half-finished day shows all of the cost against part of the sales and makes every product look like it is losing money.`;
-  }
-}
-
 function renderGuardrails() {
   const preset = LS.get('meta_date_preset', 'today');
-  const dayIsOver = activeWindow() === 'midnight' || preset === 'yesterday';
 
   // Delivery alarms come first — a stopped campaign matters more than a
   // mediocre one.
-  const items = VE.deliveryAlarms(State.campaigns, State.adStatuses || [], { dayIsOver })
+  const items = VE.deliveryAlarms(State.campaigns, State.adStatuses || [], { dayIsOver: dayIsOver() })
     .concat(VE.guardrails(State.campaigns));
 
   if (State.accountErrors && State.accountErrors.length) {
@@ -1583,9 +1526,9 @@ function renderGuardrails() {
 
   if (State.lpvEstimated) {
     items.push({
-      severity: 'info',
-      title: 'Landing page views are estimated',
-      body: 'Meta returned no landing_page_view events, so LPV is estimated at 82% of link clicks. Fire the LandingPageView event in Funnelish for a real page-speed reading.'
+      severity: 'warning',
+      title: 'Landing page views are not being measured',
+      body: 'Meta returned no landing_page_view events. The page-speed ratio is shown as "not tracked" rather than a number, because the only number available would be a guess that always passes. Fire the LandingPageView event in Funnelish for a real reading.'
     });
   }
   if (State.droppedFields && State.droppedFields.length) {
@@ -1617,10 +1560,15 @@ function totals() {
 
 function renderKpis() {
   const t = totals();
-  const roas = t.spend > 0 ? t.revenue / t.spend : 0;
+  const verified = State.truthStatus && State.truthStatus.state === 'ok';
+  // When Shopify is connected, the account headline is the whole order book,
+  // not just the part that matched a campaign — otherwise unattributed orders
+  // vanish from the top line and the account looks smaller than it is.
+  const revenue = verified ? State.truth.net : t.revenue;
+  const roas = t.spend > 0 ? revenue / t.spend : 0;
   const ber = State.econ && State.econ.valid ? State.econ.ber : 0;
   const gm = ber ? 1 / ber : 0;
-  const profit = gm ? t.revenue * gm - t.spend : null;
+  const contribution = gm ? revenue * gm - t.spend : null;
 
   document.getElementById('kpi-roas').innerText = roas.toFixed(2);
   const roasSub = document.getElementById('kpi-roas-sub');
@@ -1629,13 +1577,15 @@ function renderKpis() {
 
   document.getElementById('kpi-total-spend').innerText = fmtMoney(t.spend, 0);
   document.getElementById('kpi-spend-sub').innerText = `${State.campaigns.length} campaign${State.campaigns.length === 1 ? '' : 's'}`;
-  document.getElementById('kpi-revenue').innerText = fmtMoney(t.revenue, 0);
+  document.getElementById('kpi-revenue').innerText = fmtMoney(revenue, 0);
   const profitEl = document.getElementById('kpi-profit-sub');
-  profitEl.innerText = profit === null ? 'Profit —' : `Profit ${fmtMoney(profit, 0)}`;
-  profitEl.className = 'kpi-trend ' + (profit === null ? 'neutral' : profit >= 0 ? 'positive' : 'negative');
+  profitEl.innerText = contribution === null ? 'Contribution —'
+    : `Contribution ${fmtMoney(contribution, 0)}${verified ? '' : ' (Meta, unverified)'}`;
+  profitEl.className = 'kpi-trend ' + (contribution === null ? 'neutral' : contribution >= 0 ? 'positive' : 'negative');
 
-  document.getElementById('kpi-total-purchases').innerText = fmtInt(t.purchases);
-  document.getElementById('kpi-cpa-sub').innerText = t.purchases ? `CPA ${fmtMoney(t.spend / t.purchases)}` : 'CPA —';
+  const orders = verified ? State.truth.orders : t.purchases;
+  document.getElementById('kpi-total-purchases').innerText = fmtInt(orders);
+  document.getElementById('kpi-cpa-sub').innerText = orders ? `CPA ${fmtMoney(t.spend / orders)}` : 'CPA —';
 
   const imps = t.impressions || State.ads.reduce((s, a) => s + (parseInt(a['Impressions']) || 0), 0);
   const clicks = t.clicks || State.ads.reduce((s, a) => s + (parseInt(a['Link Clicks']) || 0), 0);
@@ -1651,22 +1601,26 @@ const FUNNEL_NOTES = {
   pageLoad: {
     healthy: 'Clicks are reaching the page. Nothing to fix here.',
     warning: 'Some clicks never load the page. Compress hero images and cut third-party scripts.',
-    alert: 'Most clicks never see the page. This is a speed problem, and no budget change fixes it.'
+    alert: 'Most clicks never see the page. This is a speed problem, and no budget change fixes it.',
+    untracked: 'Not measured. Meta is returning no landing-page-view events, so this ratio cannot be computed. Fire the LandingPageView event in Funnelish.'
   },
   offer: {
     healthy: 'People land and add to cart. The offer is working.',
     warning: 'Add-to-cart is soft. Test the price, the hero image and the first screen.',
-    alert: 'They look and leave. Price or first screen is wrong — creative is not the problem.'
+    alert: 'They look and leave. Price or first screen is wrong — creative is not the problem.',
+    untracked: 'Not measured. The add-to-cart event does not fire on these funnels, so a 0% here means nothing about the offer.'
   },
   intent: {
     healthy: 'Carts move into checkout cleanly.',
     warning: 'Some carts stall. Show shipping cost earlier so it is not a surprise.',
-    alert: 'Carts are not becoming checkouts. Almost always an unexpected shipping cost.'
+    alert: 'Carts are not becoming checkouts. Almost always an unexpected shipping cost.',
+    untracked: 'Not measured. Without add-to-cart there is no denominator for this ratio.'
   },
   completion: {
     healthy: 'Checkouts finish. Payment is not blocking anyone.',
     warning: 'Some checkouts drop. Check the mobile layout and trust badges.',
-    alert: 'Checkouts start and die. Verify Klarna, PayPal and Stripe are all live.'
+    alert: 'Checkouts start and die. Verify Klarna, PayPal and Stripe are all live.',
+    untracked: 'Not measured.'
   }
 };
 
@@ -1674,6 +1628,13 @@ function renderFunnel() {
   const t = totals();
   const f = VE.funnel({ clicks: t.clicks, lpv: t.lpv, atc: t.atc, ic: t.ic, purchases: t.purchases });
   const map = [['ratio-lpv-clicks', 'pageLoad'], ['ratio-atc-lpv', 'offer'], ['ratio-ic-atc', 'intent'], ['ratio-pur-ic', 'completion']];
+  const untrackedKeys = {
+    pageLoad: State.lpvEstimated,
+    offer: State.atcBroken,
+    intent: State.atcBroken,
+    completion: false
+  };
+
   map.forEach(([prefix, key]) => {
     const d = f[key];
     const bar = document.getElementById(prefix + '-bar');
@@ -1681,6 +1642,18 @@ function renderFunnel() {
     const badge = document.getElementById(prefix + '-status');
     const note = document.getElementById('note-' + prefix);
     if (!bar) return;
+
+    if (untrackedKeys[key]) {
+      bar.style.width = '0%';
+      bar.className = 'funnel-bar untracked';
+      text.innerText = '—';
+      badge.className = 'funnel-status-badge untracked';
+      badge.innerText = 'Not tracked';
+      note.className = 'funnel-diagnostic-note note-untracked';
+      note.innerText = FUNNEL_NOTES[key].untracked;
+      return;
+    }
+
     const pct = Math.min(100, (d.value / (d.target * 1.4)) * 100);
     bar.style.width = pct + '%';
     bar.className = 'funnel-bar ' + d.status;
@@ -1720,7 +1693,7 @@ function renderPlaybook() {
         ['🛒', 'ATC ÷ LPV', '5–10%. Under 5% is an offer problem — price, hero, first screen.'],
         ['💳', 'IC ÷ ATC', '30–60%. Under that, shipping cost is showing up too late.'],
         ['✅', 'Purchases ÷ IC', '50%+. Under that, the payment methods or trust block are failing.'],
-        ['💸', 'CPA', 'Compare against your profit per order, not against yesterday.']
+        ['💸', 'CPA', 'Compare against your contribution per order, not against yesterday.']
       ],
       rule: 'Evening read never changes budget. It tells you what to fix on the page tonight.'
     },
@@ -1728,7 +1701,7 @@ function renderPlaybook() {
       goal: 'Scale, keep, descale or kill.',
       checks: [
         ['📈', 'ROAS vs BER', 'Above break-even = it makes money. That is the only definition that counts.'],
-        ['💵', 'Profit margin', 'Over 20% → +35%. 15–20% → +20%. Under 15% → leave it alone.'],
+        ['💵', 'Contribution margin', 'Over 20% → +35%. 15–20% → +20%. Under 15% → leave it alone.'],
         ['📉', 'Unprofitable', 'Descale 40% and let it re-optimise. Two bad days after two descales → kill.'],
         ['🔄', 'Frequency', `Over ${VE.RULES.frequency.fatigue} means the same people keep seeing it. New creative.`]
       ],
@@ -1840,9 +1813,9 @@ function renderTable() {
         <td data-col="ctr" class="strong">${n('Link CTR (%)').toFixed(2)}%</td>
         <td data-col="cpc">${fmtMoney(n('CPC ($)'))}</td>
         <td data-col="clicks">${fmtInt(clicks)}</td>
-        <td data-col="lpv">${fmtInt(lpv)}</td>
-        <td data-col="atc">${fmtInt(atc)}</td>
-        <td data-col="ic">${fmtInt(ic)}</td>
+        <td data-col="lpv">${State.lpvEstimated ? '—' : fmtInt(lpv)}</td>
+        <td data-col="atc">${State.atcBroken ? '—' : fmtInt(atc)}</td>
+        <td data-col="ic">${State.atcBroken ? '—' : fmtInt(ic)}</td>
         <td data-col="frequency" class="${freq > VE.RULES.frequency.fatigue ? 'warn' : ''}">${freq.toFixed(2)}</td>
       </tr>
       <tr id="details-${id}" class="details-row">
@@ -1860,10 +1833,10 @@ function renderTable() {
               <div class="details-panel">
                 <h4>Funnel for this ad</h4>
                 <ul class="feedback-list small">
-                  <li class="feedback-item"><span class="feedback-bullet">⚡</span><span>LPV ÷ Clicks — <strong>${pct(lpv, clicks)}</strong></span></li>
-                  <li class="feedback-item"><span class="feedback-bullet">🛒</span><span>ATC ÷ LPV — <strong>${pct(atc, lpv)}</strong></span></li>
-                  <li class="feedback-item"><span class="feedback-bullet">💳</span><span>IC ÷ ATC — <strong>${pct(ic, atc)}</strong></span></li>
-                  <li class="feedback-item"><span class="feedback-bullet">✅</span><span>Purchases ÷ IC — <strong>${pct(pur, ic)}</strong></span></li>
+                  <li class="feedback-item"><span class="feedback-bullet">⚡</span><span>LPV ÷ Clicks — <strong>${State.lpvEstimated ? 'not tracked' : pct(lpv, clicks)}</strong></span></li>
+                  <li class="feedback-item"><span class="feedback-bullet">🛒</span><span>ATC ÷ LPV — <strong>${State.atcBroken ? 'not tracked' : pct(atc, lpv)}</strong></span></li>
+                  <li class="feedback-item"><span class="feedback-bullet">💳</span><span>IC ÷ ATC — <strong>${State.atcBroken ? 'not tracked' : pct(ic, atc)}</strong></span></li>
+                  <li class="feedback-item"><span class="feedback-bullet">✅</span><span>Purchases ÷ IC — <strong>${State.atcBroken ? 'not tracked' : pct(pur, ic)}</strong></span></li>
                 </ul>
               </div>
               <div class="details-panel">
@@ -1893,6 +1866,7 @@ function toggleRowDetails(id) {
 window.toggleRowDetails = toggleRowDetails;
 window.markApplied = markApplied;
 window.editBer = editBer;
+window.editProductMap = editProductMap;
 
 /* ========================================================================== *
  *  CHARTS
@@ -1921,7 +1895,7 @@ function renderCharts() {
         datasets: [
           { type: 'bar', label: `Spend (${sym().trim()})`, data: dates.map(d => byDate[d].spend),
             backgroundColor: 'rgba(99,102,241,.35)', borderColor: 'rgba(99,102,241,.7)', borderWidth: 1, yAxisID: 'ySpend', borderRadius: 3, order: 2 },
-          { type: 'line', label: 'ROAS', data: dates.map(d => byDate[d].spend > 0 ? byDate[d].revenue / byDate[d].spend : 0),
+          { type: 'line', label: 'ROAS (Meta-reported)', data: dates.map(d => byDate[d].spend > 0 ? byDate[d].revenue / byDate[d].spend : 0),
             borderColor: '#10b981', backgroundColor: '#10b981', borderWidth: 3, pointRadius: 3, tension: .25, yAxisID: 'yRoas', order: 1 },
           ...(ber ? [{ type: 'line', label: `Break-even ${ber.toFixed(2)}`, data: dates.map(() => ber),
             borderColor: '#ef4444', borderWidth: 1.5, borderDash: [5, 4], pointRadius: 0, yAxisID: 'yRoas', order: 0 }] : [])
@@ -1997,8 +1971,8 @@ function renderCharts() {
 function setupGrader() {
   const h = document.getElementById('sandbox-headline');
   const p = document.getElementById('sandbox-primary');
-  h.value = 'Breathe freely again';
-  p.value = 'I coughed every evening for three weeks. Since using this I sleep through. My wife noticed first.';
+  h.value = 'Endlich wieder frei atmen';
+  p.value = 'Ich habe drei Wochen lang jeden Abend gehustet. Seit ich das benutze, schlafe ich wieder durch. Meine Frau hat es zuerst gemerkt.';
   [h, p].forEach(el => el.addEventListener('input', runGrader));
   runGrader();
 }
@@ -2063,6 +2037,10 @@ function handleCsvUpload(e) {
     if (!rows.length) { showModal('Could not read that file', 'The CSV had no rows this dashboard recognises.'); return; }
     State.ads = rows.map(normalizeAd);
     State.campaigns = campaignsFromAds(State.ads);
+    State.source = 'csv';
+    State.truth = null;
+    State.truthStatus = null;
+    State.truthMatch = null;
     setApiStatus('offline');
     document.getElementById('brand-sub').innerText = `CSV: ${file.name}`;
     renderAll();
@@ -2126,153 +2104,147 @@ function showModal(title, html) {
     <div class="modal-card card">
       <div class="modal-header"><h3>${esc(title)}</h3><button class="modal-close-btn">&times;</button></div>
       <div class="modal-body info-modal-body">${html}</div>
-      <div class="modal-footer"><button class="btn btn-primary full">OK</button></div>
+      <div class="modal-footer"><button class="btn btn-primary full" data-dismiss="1">OK</button></div>
     </div>`;
   document.body.appendChild(el);
-  el.addEventListener('click', ev => { if (ev.target === el || ev.target.closest('button')) el.remove(); });
+  el.addEventListener('click', ev => {
+    if (ev.target === el || ev.target.classList.contains('modal-close-btn') || ev.target.dataset.dismiss) el.remove();
+  });
+}
+
+/* ========================================================================== *
+ *  STYLES for the pieces this file adds
+ * ========================================================================== */
+function injectStyles() {
+  if (document.getElementById('truth-styles')) return;
+  const s = document.createElement('style');
+  s.id = 'truth-styles';
+  s.textContent = `
+  #truth-panel { margin: 0 0 1rem; }
+  .truth-card { border-radius: 12px; padding: 1rem 1.15rem; border: 1px solid var(--color-border, rgba(255,255,255,.1));
+    background: var(--color-surface, rgba(255,255,255,.03)); }
+  .truth-card.ok   { border-left: 4px solid var(--color-success, #10b981); }
+  .truth-card.bad  { border-left: 4px solid var(--color-danger, #ef4444); }
+  .truth-card.off  { border-left: 4px solid var(--color-warning, #f59e0b); }
+  .truth-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: .6rem; flex-wrap: wrap; }
+  .truth-chip { font-size: .72rem; padding: .2rem .5rem; border-radius: 99px; white-space: nowrap;
+    background: rgba(148,163,184,.18); }
+  .truth-chip.ok   { background: rgba(16,185,129,.18); color: #10b981; }
+  .truth-chip.warn { background: rgba(245,158,11,.18); color: #f59e0b; }
+  .truth-grid { display: flex; flex-wrap: wrap; gap: 1.4rem; margin: .5rem 0 .75rem; }
+  .truth-grid > div { display: flex; flex-direction: column; }
+  .truth-big { font-size: 1.35rem; font-weight: 650; line-height: 1.1; }
+  .truth-big.bad { color: var(--color-danger, #ef4444); }
+  .truth-cap { font-size: .7rem; opacity: .65; margin-top: .15rem; }
+  .truth-foot { font-size: .78rem; opacity: .75; margin: .2rem 0 0; line-height: 1.5; }
+  .truth-warnings { margin: .7rem 0 0; padding-left: 1.1rem; font-size: .8rem; line-height: 1.55; }
+  .truth-warnings li { margin-bottom: .4rem; }
+
+  .rev-line { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+    font-size: .78rem; padding: .4rem .6rem; border-radius: 8px; margin-bottom: .5rem; }
+  .rev-line.verified   { background: rgba(16,185,129,.1); }
+  .rev-line.unverified { background: rgba(245,158,11,.12); }
+  .rev-line.demo       { background: rgba(148,163,184,.12); }
+  .rev-badge { font-weight: 650; white-space: nowrap; }
+  .rev-badge.ok   { color: #10b981; }
+  .rev-badge.warn { color: #f59e0b; }
+  .lock-chip { font-size: .68rem; opacity: .9; margin-left: .35rem; white-space: nowrap; }
+
+  .evidence-line { margin: 0 0 .5rem; }
+  .eq { font-size: .72rem; padding: .22rem .55rem; border-radius: 99px; display: inline-block; }
+  .eq.ok   { background: rgba(16,185,129,.14); color: #10b981; }
+  .eq.thin { background: rgba(245,158,11,.14); color: #f59e0b; }
+  .eq.none { background: rgba(148,163,184,.16); color: #94a3b8; }
+  .vstat-cap .ci { opacity: .6; font-variant-numeric: tabular-nums; }
+
+  .fchip.untracked { background: rgba(148,163,184,.16) !important; color: #94a3b8 !important;
+    border-color: transparent !important; font-style: italic; }
+  .funnel-bar.untracked { background: rgba(148,163,184,.3) !important; }
+  .funnel-status-badge.untracked { background: rgba(148,163,184,.18); color: #94a3b8; }
+  .note-untracked { opacity: .7; font-style: italic; }
+  .verdict-reasons li.conflict { color: var(--color-warning, #f59e0b); }
+
+  .truth-settings { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--color-border, rgba(255,255,255,.1)); }
+  .truth-settings h4 { margin: 0 0 .35rem; display: flex; align-items: center; gap: .5rem; }
+  .truth-pill { font-size: .65rem; font-weight: 500; padding: .15rem .45rem; border-radius: 99px;
+    background: rgba(16,185,129,.18); color: #10b981; }
+  .truth-help { font-size: .78rem; opacity: .75; line-height: 1.5; margin: 0 0 .75rem; }
+  .truth-settings label { display: block; font-size: .78rem; margin-bottom: .6rem; }
+  .truth-settings input { width: 100%; margin-top: .25rem; }
+  .truth-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+  .truth-test { font-size: .78rem; margin-top: .6rem; line-height: 1.5; }
+  .truth-test.ok  { color: #10b981; }
+  .truth-test.bad { color: #ef4444; }
+  .truth-test-list { margin-top: .4rem; opacity: .8; font-size: .74rem; }
+
+  .map-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+  .map-table td { padding: .5rem .4rem; border-bottom: 1px solid var(--color-border, rgba(255,255,255,.08)); vertical-align: top; }
+  .map-table select { width: 100%; }
+  .map-sub { font-size: .7rem; opacity: .65; margin-top: .15rem; }
+  .map-foot { margin-top: 1rem; }
+
+  /* ---- creative desk ---- */
+  .creative-card { margin-bottom: 1rem; }
+  .creative-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: .6rem; }
+  .creative-head h3 { margin: 0; }
+  .creative-sub { font-size: .75rem; opacity: .65; }
+  .brief { border-radius: 10px; padding: .8rem 1rem; margin-bottom: .9rem;
+    background: rgba(99,102,241,.1); border-left: 3px solid rgba(99,102,241,.7); }
+  .brief.urgent { background: rgba(239,68,68,.1); border-left-color: var(--color-danger, #ef4444); }
+  .brief-head { font-weight: 650; margin-bottom: .5rem; }
+  .brief-line { font-size: .82rem; line-height: 1.6; }
+  .brief-gap { height: .5rem; }
+  .brief .btn-mini { margin-top: .7rem; }
+  .brief-pre { white-space: pre-wrap; font-size: .78rem; }
+
+  .ad-grid { display: grid; gap: .75rem; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .ad-card { border-radius: 10px; padding: .7rem .85rem;
+    background: var(--color-surface, rgba(255,255,255,.03));
+    border: 1px solid var(--color-border, rgba(255,255,255,.08)); }
+  .ad-card.tone-danger  { border-left: 3px solid var(--color-danger, #ef4444); }
+  .ad-card.tone-success { border-left: 3px solid var(--color-success, #10b981); }
+  .ad-card.tone-warning { border-left: 3px solid var(--color-warning, #f59e0b); }
+  .ad-head { display: flex; justify-content: space-between; gap: .5rem; align-items: flex-start; }
+  .ad-head strong { font-size: .84rem; line-height: 1.3; }
+  .ad-chip { font-size: .68rem; padding: .15rem .45rem; border-radius: 99px; white-space: nowrap; }
+  .ad-chip.success { background: rgba(16,185,129,.18); color: #10b981; }
+  .ad-chip.danger  { background: rgba(239,68,68,.18);  color: #ef4444; }
+  .ad-chip.warning { background: rgba(245,158,11,.18); color: #f59e0b; }
+  .ad-chip.neutral { background: rgba(148,163,184,.18); color: #94a3b8; }
+  .ad-nums { font-size: .76rem; opacity: .75; margin: .3rem 0; }
+  .ad-why  { font-size: .76rem; line-height: 1.5; margin-bottom: .5rem; }
+
+  .ret { display: flex; align-items: flex-end; gap: 3px; height: 54px; margin: .4rem 0 .2rem; }
+  .ret-col { flex: 1; display: flex; flex-direction: column; justify-content: flex-end;
+    align-items: center; height: 100%; position: relative; }
+  .ret-fill { width: 100%; background: linear-gradient(180deg, rgba(99,102,241,.85), rgba(99,102,241,.35));
+    border-radius: 2px 2px 0 0; }
+  .ret-lab { font-size: .6rem; opacity: .55; margin-top: 2px; }
+  .ret-val { font-size: .58rem; opacity: .4; }
+  .ret-cap { font-size: .7rem; opacity: .6; margin-bottom: .45rem; }
+
+  .ad-stages { display: flex; flex-wrap: wrap; gap: .25rem; margin-bottom: .45rem; }
+  .schip { font-size: .64rem; padding: .12rem .4rem; border-radius: 4px; background: rgba(148,163,184,.14); }
+  .schip.healthy { background: rgba(16,185,129,.16); color: #10b981; }
+  .schip.warning { background: rgba(245,158,11,.16); color: #f59e0b; }
+  .schip.alert   { background: rgba(239,68,68,.16);  color: #ef4444; }
+  .schip.untracked { opacity: .45; font-style: italic; }
+  .ad-fix { font-size: .74rem; line-height: 1.5; padding-top: .45rem;
+    border-top: 1px solid var(--color-border, rgba(255,255,255,.07)); }
+  `;
+  document.head.appendChild(s);
 }
 
 /* ========================================================================== *
  *  RENDER ALL
- * ========================================================================== *//* ==========================================================================
- *  DATE BAR
- *  The three read windows say WHICH RULES apply. The date bar says WHICH
- *  NUMBERS they are applied to. Keeping them separate means you can review
- *  last Tuesday without the engine pretending it is Tuesday morning.
  * ========================================================================== */
-function todayInAccountTz(offsetDays = 0) {
-  const tz = State.accountTz;
-  const d = new Date(Date.now() + offsetDays * 86400000);
-  if (!tz) return d.toISOString().slice(0, 10);
-  // en-CA gives YYYY-MM-DD, which is what Meta wants.
-  try { return d.toLocaleDateString('en-CA', { timeZone: tz }); }
-  catch (e) { return d.toISOString().slice(0, 10); }
-}
-
-function setupDateBar() {
-  document.querySelectorAll('.date-btn[data-preset]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      State.range = null;
-      State.dateManual = true;
-      LS.set('meta_date_preset', btn.dataset.preset);
-      const sel = document.getElementById('meta-date-preset');
-      if (sel) sel.value = btn.dataset.preset;
-      refreshWindow();
-    });
-  });
-
-  const from = document.getElementById('date-from');
-  const to   = document.getElementById('date-to');
-  const apply = document.getElementById('date-apply');
-
-  apply && apply.addEventListener('click', () => {
-    if (!from.value) return;
-    const since = from.value;
-    const until = to.value && to.value >= since ? to.value : since;
-    State.range = { since, until };
-    State.dateManual = true;
-    refreshWindow();
-  });
-
-  // ‹ › step one day at a time through history — the fastest way to answer
-  // "was yesterday a fluke or is this a trend?"
-  const step = dir => {
-    const base = State.range ? State.range.until : todayInAccountTz(0);
-    const d = new Date(base + 'T12:00:00');
-    d.setDate(d.getDate() + dir);
-    const day = d.toISOString().slice(0, 10);
-    if (day > todayInAccountTz(0)) return;         // no future days
-    State.range = { since: day, until: day };
-    State.dateManual = true;
-    from.value = day; to.value = day;
-    refreshWindow();
-  };
-  const prev = document.getElementById('date-prev');
-  const next = document.getElementById('date-next');
-  prev && prev.addEventListener('click', () => step(-1));
-  next && next.addEventListener('click', () => step(1));
-}
-
-function refreshWindow() {
-  renderDateBar();
-  if (State.live) syncMetaAPI(); else loadData();
-}
-
-function renderDateBar() {
-  const preset = LS.get('meta_date_preset', 'today');
-  document.querySelectorAll('.date-btn[data-preset]').forEach(b =>
-    b.classList.toggle('active', !State.range && b.dataset.preset === preset));
-
-  const note = document.getElementById('date-note');
-  if (!note) return;
-  const tzName = State.accountTz ? State.accountTz.split('/').pop().replace(/_/g, ' ') : null;
-
-  if (State.range) {
-    note.innerHTML = `Showing <strong>${esc(windowLabel())}</strong>` +
-      (tzName ? ` in ${esc(tzName)} time.` : '.') +
-      ` Verdicts still follow the ${esc(activeWindow())} read.`;
-  } else if (preset === 'today') {
-    note.innerHTML = `Showing <strong>today so far</strong>` + (tzName ? ` (${esc(tzName)} time)` : '') +
-      `. This is a part-day — the day-1 thresholds read it against how much of the day has passed.`;
-  } else {
-    note.innerHTML = `Showing <strong>${esc(windowLabel())}</strong>. ` +
-      `Meta's multi-day windows <strong>end yesterday</strong> — today is not included.`;
-  }
-}
-
-/* ==========================================================================
- *  ACCOUNT P&L
- *  The single line a media buyer needs before anything else: across every
- *  live campaign, am I up or down right now, and by how much?
- *  Profit is summed per campaign because each has its own margin — a
- *  blended margin across different products would be meaningless.
- * ========================================================================== */
-function renderPnl() {
-  const el = document.getElementById('pnl-bar');
-  if (!el) return;
-  const live = (State.campaigns || []).filter(c => (c.status || '').toUpperCase() === 'ACTIVE' || c.spend > 0);
-  if (!live.length) { el.innerHTML = ''; el.style.display = 'none'; return; }
-  el.style.display = '';
-
-  const refundRate = (State.econ && State.econ.refundRate) || 0;
-  let spend = 0, revenue = 0, purchases = 0, profit = 0, haveMargin = false;
-  live.forEach(c => {
-    const { ber } = berFor(c);
-    const net = (c.revenue || 0) * (1 - refundRate);      // money you keep
-    spend += c.spend || 0; revenue += net; purchases += c.purchases || 0;
-    if (ber > 0) { haveMargin = true; profit += net / ber - (c.spend || 0); }
-  });
-
-  const roas = spend > 0 ? revenue / spend : 0;
-  const cpa = purchases > 0 ? spend / purchases : null;
-  const tone = profit > 0 ? 'good' : profit < 0 ? 'bad' : 'warn';
-  const cell = (label, value, sub, cls) =>
-    `<div class="pnl-cell ${cls || ''}"><span class="pnl-label">${esc(label)}</span>` +
-    `<span class="pnl-value ${cls === 'good' || cls === 'bad' ? cls : ''}">${value}</span>` +
-    `<span class="pnl-sub">${sub || ''}</span></div>`;
-
-  el.innerHTML =
-    cell('Spend', fmtMoney(spend), `${live.length} campaign${live.length > 1 ? 's' : ''} · ${esc(windowLabel())}`, 'lead') +
-    cell('Revenue', fmtMoney(revenue), refundRate
-        ? `${purchases} orders \u00b7 net of ${Math.round(refundRate * 100)}% refunds`
-        : `${purchases} order${purchases === 1 ? '' : 's'}`) +
-    cell('Blended ROAS', roas ? roas.toFixed(2) : '—', roas ? 'revenue ÷ spend' : 'no sales yet') +
-    (haveMargin
-      ? cell('Profit', (profit >= 0 ? '+' : '') + fmtMoney(profit),
-             profit >= 0 ? 'after product cost and fees' : 'you are losing money right now', tone)
-      : cell('Profit', '—', 'set BER in campaign names', 'warn')) +
-    cell('CPA', cpa === null ? '—' : fmtMoney(cpa), cpa === null ? 'no orders yet' : 'cost per order');
-}
-
-
 function renderAll() {
-  renderDateBar();
-  renderPnl();
   computeVerdicts();
   renderCommandBar();
+  renderTruthPanel();
   renderVerdicts();
+  renderCreativeDesk();
   renderGuardrails();
-  renderBenchmarks();
   renderKpis();
   renderFunnel();
   renderTable();
@@ -2297,55 +2269,55 @@ function buildDemoData() {
   });
 
   const campaigns = [
-    { id: 'c1', name: 'Product A | 1.50 | 67', status: 'ACTIVE', budget: 100, daysLive: 4, learning: true,
+    { id: 'c1', name: 'AtemFrei | 1.50 | 67', status: 'ACTIVE', budget: 100, daysLive: 4, learning: true,
       spend: 104.20, revenue: 302.18, purchases: 11, clicks: 640, lpv: 552, atc: 41, ic: 19,
       impressions: 41000, frequency: 1.32, history: hist([1.9, 2.4, 2.7]) },
 
-    { id: 'c2', name: 'Product B | 1.60 | 62', status: 'ACTIVE', budget: 50, daysLive: 1,
+    { id: 'c2', name: 'Celsior | 1.60 | 62', status: 'ACTIVE', budget: 50, daysLive: 1,
       spend: 43.90, revenue: 0, purchases: 0, clicks: 310, lpv: 268, atc: 5, ic: 1,
       impressions: 22000, frequency: 1.08, history: [] },
 
-    { id: 'c3', name: 'Product C | 1.80 | 56', status: 'ACTIVE', budget: 150, daysLive: 5,
+    { id: 'c3', name: 'ErdKraft | 1.80 | 56', status: 'ACTIVE', budget: 150, daysLive: 5,
       spend: 152.40, revenue: 185.90, purchases: 4, clicks: 720, lpv: 401, atc: 44, ic: 12,
       impressions: 68000, frequency: 2.71, history: hist([2.1, 1.4, 1.2, 1.5]) },
 
-    { id: 'c4', name: 'Product D | 1.50 | 67', status: 'ACTIVE', budget: 200, daysLive: 7,
+    { id: 'c4', name: 'HautGlenz | 1.50 | 67', status: 'ACTIVE', budget: 200, daysLive: 7,
       spend: 198.75, revenue: 407.44, purchases: 14, clicks: 890, lpv: 762, atc: 62, ic: 26,
       impressions: 74000, frequency: 1.91, history: hist([2.2, 2.05, 2.1, 2.0, 2.15, 2.05]) }
-  ].map(c => withSeries({ ...c, roas: c.spend > 0 ? c.revenue / c.spend : 0 }));
+  ].map(c => withSeries({ ...c, roas: c.spend > 0 ? c.revenue / c.spend : 0, metaRevenue: c.revenue, metaRoas: c.spend > 0 ? c.revenue / c.spend : 0, metaPurchases: c.purchases }));
 
   const ads = [
-    { 'Ad Name': 'Product A | UGC hook', 'Campaign': 'Product A', 'Creative Type': 'Video', 'Hook Rate (%)': '31.40',
-      'Link CTR (%)': '2.35', 'Spend ($)': '58.20', 'Reach': '19000', 'Headline': 'Sleep through the night again',
-      'Primary Text Snippet': 'I coughed every night for three weeks. Since using this I sleep through again.',
+    { 'Ad Name': 'AtemFrei | UGC Husten Hook', 'Campaign': 'AtemFrei', 'Creative Type': 'Video', 'Hook Rate (%)': '31.40',
+      'Link CTR (%)': '2.35', 'Spend ($)': '58.20', 'Reach': '19000', 'Headline': 'Endlich wieder durchschlafen',
+      'Primary Text Snippet': 'Ich habe drei Wochen lang jede Nacht gehustet. Seit ich das benutze, schlafe ich wieder durch.',
       'CPM ($)': '2.55', 'CPC ($)': '0.16', 'Impressions': '22800', 'Link Clicks': '360', 'Landing Page Views': '312',
       'Adds to Cart': '24', 'Checkouts Initiated': '11', 'Purchases': '7', 'Purchase ROAS': '3.02', 'Cost per Purchase': '8.31',
       'Frequency': '1.28', 'Video 3s Views': '7160', 'Thruplay Views': '2410', 'Ad ID': 'a1', 'Creative ID': 'cr1' },
 
-    { 'Ad Name': 'Product A | Static before-after', 'Campaign': 'Product A', 'Creative Type': 'Image', 'Hook Rate (%)': '0',
-      'Link CTR (%)': '1.62', 'Spend ($)': '46.00', 'Reach': '15500', 'Headline': 'Breathe freely from today',
-      'Primary Text Snippet': 'My wife noticed the difference first. After two weeks the night cough was gone.',
+    { 'Ad Name': 'AtemFrei | Statisch Vorher-Nachher', 'Campaign': 'AtemFrei', 'Creative Type': 'Image', 'Hook Rate (%)': '0',
+      'Link CTR (%)': '1.62', 'Spend ($)': '46.00', 'Reach': '15500', 'Headline': 'Frei atmen ab heute',
+      'Primary Text Snippet': 'Meine Frau hat den Unterschied zuerst gemerkt. Nach zwei Wochen war das nächtliche Husten weg.',
       'CPM ($)': '2.52', 'CPC ($)': '0.16', 'Impressions': '18200', 'Link Clicks': '280', 'Landing Page Views': '240',
       'Adds to Cart': '17', 'Checkouts Initiated': '8', 'Purchases': '4', 'Purchase ROAS': '2.44', 'Cost per Purchase': '11.50',
       'Frequency': '1.36', 'Video 3s Views': '0', 'Thruplay Views': '0', 'Ad ID': 'a2', 'Creative ID': 'cr2' },
 
-    { 'Ad Name': 'Product B | Split test', 'Campaign': 'Product B', 'Creative Type': 'Video', 'Hook Rate (%)': '12.10',
-      'Link CTR (%)': '1.41', 'Spend ($)': '43.90', 'Reach': '20400', 'Headline': 'Look slimmer instantly',
-      'Primary Text Snippet': 'The leggings that smooth everything. 50% off now.',
+    { 'Ad Name': 'Celsior | Leggings Split', 'Campaign': 'Celsior', 'Creative Type': 'Video', 'Hook Rate (%)': '12.10',
+      'Link CTR (%)': '1.41', 'Spend ($)': '43.90', 'Reach': '20400', 'Headline': 'Sofort schlanker aussehen',
+      'Primary Text Snippet': 'Die Leggings die alles glättet. Jetzt 50% Rabatt.',
       'CPM ($)': '2.00', 'CPC ($)': '0.14', 'Impressions': '22000', 'Link Clicks': '310', 'Landing Page Views': '268',
       'Adds to Cart': '5', 'Checkouts Initiated': '1', 'Purchases': '0', 'Purchase ROAS': '0', 'Cost per Purchase': '',
       'Frequency': '1.08', 'Video 3s Views': '2662', 'Thruplay Views': '640', 'Ad ID': 'a3', 'Creative ID': 'cr3' },
 
-    { 'Ad Name': 'Product C | Demo video', 'Campaign': 'Product C', 'Creative Type': 'Video', 'Hook Rate (%)': '22.80',
-      'Link CTR (%)': '1.06', 'Spend ($)': '152.40', 'Reach': '25100', 'Headline': 'Sleep like you did at 25',
-      'Primary Text Snippet': 'Since sleeping on the mat I no longer wake at three. I did not expect it to work.',
+    { 'Ad Name': 'ErdKraft | Grounding Matte Demo', 'Campaign': 'ErdKraft', 'Creative Type': 'Video', 'Hook Rate (%)': '22.80',
+      'Link CTR (%)': '1.06', 'Spend ($)': '152.40', 'Reach': '25100', 'Headline': 'Schlaf wie mit 25',
+      'Primary Text Snippet': 'Seit ich auf der Matte schlafe, wache ich nicht mehr um drei Uhr auf. Ich hätte nicht gedacht dass es funktioniert.',
       'CPM ($)': '2.24', 'CPC ($)': '0.21', 'Impressions': '68000', 'Link Clicks': '720', 'Landing Page Views': '401',
       'Adds to Cart': '44', 'Checkouts Initiated': '12', 'Purchases': '4', 'Purchase ROAS': '1.22', 'Cost per Purchase': '38.10',
       'Frequency': '2.71', 'Video 3s Views': '15504', 'Thruplay Views': '3900', 'Ad ID': 'a4', 'Creative ID': 'cr4' },
 
-    { 'Ad Name': 'Product D | Routine video', 'Campaign': 'Product D', 'Creative Type': 'Video', 'Hook Rate (%)': '28.60',
-      'Link CTR (%)': '2.11', 'Spend ($)': '198.75', 'Reach': '38700', 'Headline': 'My skin after 14 days',
-      'Primary Text Snippet': 'I tried expensive creams for years. This was the first one my friends noticed.',
+    { 'Ad Name': 'HautGlenz | Glow Oil Ritual', 'Campaign': 'HautGlenz', 'Creative Type': 'Video', 'Hook Rate (%)': '28.60',
+      'Link CTR (%)': '2.11', 'Spend ($)': '198.75', 'Reach': '38700', 'Headline': 'Meine Haut nach 14 Tagen',
+      'Primary Text Snippet': 'Ich habe jahrelang teure Cremes probiert. Das hier war das erste das meine Freundinnen bemerkt haben.',
       'CPM ($)': '2.69', 'CPC ($)': '0.22', 'Impressions': '74000', 'Link Clicks': '890', 'Landing Page Views': '762',
       'Adds to Cart': '62', 'Checkouts Initiated': '26', 'Purchases': '14', 'Purchase ROAS': '2.05', 'Cost per Purchase': '14.20',
       'Frequency': '1.91', 'Video 3s Views': '21164', 'Thruplay Views': '6800', 'Ad ID': 'a5', 'Creative ID': 'cr5' }

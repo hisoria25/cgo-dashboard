@@ -3,6 +3,22 @@
    --------------------------------------------------------------------------
    Pure functions only. No DOM, no fetch. This file is unit-tested in Node
    (see tests/rules.test.js) and loaded as a plain <script> in the browser.
+
+   REVENUE PROVENANCE (added 8 Nov 2026)
+   Every verdict below is only as good as the revenue fed into it. On this
+   account Meta's PER-CAMPAIGN revenue was proved wrong against Shopify and
+   Funnelish: over 28 Oct – 3 Nov the account total agreed within 1.9% but the
+   per-campaign split was out by up to EUR 869, because every pixel is
+   installed store-wide and 1d-view credit lets any campaign claim any sale.
+
+   So the engine now asks where the revenue came from, via ctx.revenueSource:
+     'shopify'  — reconciled against the order book. Every verdict available.
+     'meta'     — Meta's attributed figure. KILL, DESCALE, HOLD and the
+                  diagnostics stay available; SCALE and SURF are locked,
+                  because scaling on a number that has already been wrong
+                  twice is how GLATTR got +35% while below break-even.
+     anything else ('demo', 'csv', undefined) — treated as un-flagged. Nothing
+                  is locked, because these are not live money decisions.
    ========================================================================== */
 
 (function (root, factory) {
@@ -38,52 +54,7 @@
       pct: 40,                              // "DESCALE WITH 40%"
       hardDescalePct: 60,                   // "if it's SUPER unprofitable"
       superUnprofitableRatio: 0.5,          // ROAS below 50% of BER
-      killAfterUnprofitableDays: 2,         // "unprofitable 2 days in a row"
-
-      /* THE LOOK-BACK. Added after the EcomLiberty SOP, which says it in one
-         line: "use a 3-7 day look-back (not a single bad day) to avoid
-         reacting to noise."
-
-         Until now one unprofitable day cut the budget 40%. That is the same
-         mistake that had me recommending a pause on an ad that went on to
-         return 4x three days later — judging a campaign on a window too
-         narrow to hold its variance. A single day on €90 of spend is five
-         or six purchases. Five purchases is not a trend.
-
-         So the day no longer cuts on its own. The trailing window decides,
-         and when the window still clears break-even the verdict is HOLD. */
-      lookbackDays: 3,
-      lookbackMinDays: 2,                   // fewer closed days than this ⇒ no window, fall through
-
-      /* How loud one day is allowed to be inside the window, as a multiple
-         of the median day's spend. At 2, a day can carry twice the weight of
-         a normal day and no more — enough that a genuinely busy day still
-         counts for more, not enough that one runaway budget decides the
-         verdict on its own. Set this to Infinity to pool with no cap. */
-      dayWeightCap: 2,
-
-      /* THE DEAD ZONE, in % below break-even.
-
-         Celsior came up for a 40% cut on a window of 1.54 against a
-         break-even of 1.55 — six tenths of one percent under. One extra
-         order would have flipped it the other way. A 40% budget cut is a
-         large, destabilising move; "almost exactly break-even" is not
-         evidence for it, it is evidence that the campaign is sitting on the
-         line and the next few days will say which side it falls.
-
-         So inside this band the answer is HOLD and watch. Below it, the
-         decline is bigger than the noise and the cut stands. */
-      holdBandPct: 10
-    },
-    /* Budget floor. Descaling a loaded campaign by 40% does not just lower
-       the number — it starves every ad set under it at once, and ad sets that
-       drop below roughly €25/day stop gathering enough conversions to stay
-       optimised. The SOP's instruction is to trim or consolidate ad sets
-       BEFORE cutting spend. The engine cannot do that for him, so it warns,
-       and it refuses to draw a budget that breaks the floor. */
-    budgetFloor: {
-      loadedBudget: 150,   // €/day — above this, a hard cut destabilises delivery
-      perAdset: 25         // €/day each live ad set needs to keep learning
+      killAfterUnprofitableDays: 2          // "unprofitable 2 days in a row"
     },
     weekend: {
       // "ROAS = 3+, Budget x5 | ROAS = 5+, Budget x10"
@@ -91,13 +62,6 @@
         { minRoas: 5, multiplier: 10 },
         { minRoas: 3, multiplier: 5 }
       ],
-      /* What counts as "this was surfed", read from the spend. A surf is a
-         ×5 or ×10 move, so 1.5× is a generous floor that still excludes an
-         ordinary busy weekend. */
-      scaleUpRatio: 1.5,
-      scaleUpRecentDays: 2,   // Sat + Sun
-      scaleUpBaseDays: 5,     // the working week before them
-      scaleUpMinDays: 5,      // below this there is no baseline to compare to
       // Sunday night pull-back
       sundayNight: [
         { minRoas: 5, descalePct: 30 },
@@ -106,54 +70,6 @@
       ]
     },
     frequency: { fatigue: 2.5 },
-    /* Creative fatigue.
-
-       FREQUENCY IS THE GATE. Everything here was rebuilt after the engine
-       called six campaigns "worn" on the same Saturday — a day every one of
-       them had been surf-scaled. Frequency sat between 1.08 and 1.39 the
-       whole time. Nobody was sick of anything; the budget had moved.
-
-       A falling CTR on its own is almost never fatigue. It is the budget mix
-       shifting between ads, a hard scale reaching colder audience, or one odd
-       day. So CTR can no longer convict alone: either frequency corroborates,
-       or CPM has to be climbing at the same time — two independent signals. */
-    creative: {
-      minDays: 6,          // closed days needed before any trend is claimed
-      window: 14,          // 7 was too short: one odd day swung the verdict
-      recentDays: 3,       // "now" = median of the last 3 closed days
-      ctrDropWorn: 25,     // % below baseline, WITH frequency >= freqFading
-      ctrDropFade: 20,     // % below baseline, WITH cpm also climbing
-      cpmRise: 20,         // % above baseline — the corroborating signal
-      freqFading: 2.0,     // frequency.fatigue (2.5) is the worn-out line
-
-      /* THE SUSTAINED SLIDE — a second route to "worn" that does not ask
-         frequency's permission.
-
-         Making frequency the gate was an over-correction. On 17 Oct the
-         engine called every campaign fresh while AtemFrei's CTR had gone
-         4.10 -> 2.61 over fourteen clean days and its CPM 21 -> 29. Four
-         campaigns were down 31-36% and all read "fresh", because none of
-         them reaches frequency 2.0.
-
-         They never will. Frequency counts how often the SAME person sees an
-         ad; on a rising budget Meta keeps finding NEW people, so frequency
-         stays near 1.1 while the creative burns out across the whole market.
-         DermaGleit sat at frequency 1.03 — almost nobody had seen it twice —
-         with CTR down 34%.
-
-         So the shape of the line gets its own vote. The window is split in
-         half and the halves' medians compared, which is slower to react than
-         three days but cannot be swung by one odd day. On top of that, most
-         of the recent half has to sit below the old median: a real decline
-         is persistent, while a spike-and-recover is not. */
-      sustainedMinDays: 10,  // closed days needed before a trend is claimed
-      ctrSlideWorn: 22,      // % the recent half is below the older half
-      ctrSlideFade: 12,
-      sustainedShare: 0.7,   // this much of the recent half must be below baseline
-
-      adCtrSpread: 0.4,    // ads this far apart ⇒ campaign CTR is a blend
-      adMinSpendShare: 0.05 // ignore ads under 5% of spend — they prove nothing
-    },
     // Learning phase. Meta resets learning on a "significant edit", and a
     // budget change above roughly 20% counts as one. That does NOT mean never
     // scale — it means know the cost. Blocking scaling outright would stop a
@@ -174,13 +90,46 @@
       maxActiveCampaignsPerAccount: 3,      // ban prevention
       creativeRefreshAfterProfitableDays: 3
     },
-    /* Refunds and chargebacks. Meta books revenue at the moment of purchase
-       and never takes it back; your bank does. Everything the engine judges is
-       computed on revenue AFTER this haircut, so ROAS, margin, profit and CPA
-       headroom all describe money you keep rather than money that arrived. */
-    refunds: { rate: 0, max: 0.9 },
     // Consistency floor: never act on noise
-    minSpendForVerdict: 5
+    minSpendForVerdict: 5,
+
+    /* ----------------------------------------------------------------
+       CONFIDENCE — added 8 Nov 2026
+       ----------------------------------------------------------------
+       The ladder's thresholds are narrow and this account's daily order
+       counts are small. At ~7 orders per campaign per day the random
+       spread on ROAS is roughly ±38%, which is wider than the gap
+       between "cut 40%" and "scale 35%". Noise alone will flip a
+       campaign between them night after night — and did: GLATTR read
+       3.89 one day and 1.15 another with nothing changed.
+
+       Fixing Meta's attribution removed a BIAS. This removes the
+       VARIANCE. Both were needed.
+
+       z is 1.282 (80%), a business threshold rather than a laboratory
+       one. The asymmetry below is deliberate: adding money to a
+       campaign that has not proved itself compounds a loss, while
+       cutting one that was actually fine is recoverable by scaling it
+       back up. So scaling demands proof and cutting demands only a
+       reasonable sample.
+       ---------------------------------------------------------------- */
+    confidence: {
+      z: 1.282,                 // 80% interval
+      minOrdersForVerdict: 4,   // under this, no call of any kind
+      minOrdersToCut: 8         // enough to stop the bleeding, not enough to prove it
+    },
+
+    /* Weekend surfing is a claim about DEMAND, not about one day's ROAS.
+       Multiplying a budget by 10 because a campaign printed a 3.0 on a
+       sample of seven orders is a coin flip, and it resets learning on
+       every campaign at once. So the lift has to be measured on this
+       account's own history before any of it is allowed. */
+    weekend_evidence: {
+      minWeekendDays: 4,        // at least two weekends of data
+      minWeekdayDays: 10,
+      liftToBudgetFactor: 3,    // a 25% measured lift earns up to +75%
+      maxSurfPct: 100           // never more than double in one step
+    }
   };
 
   /* ------------------------------------------------------------------
@@ -188,18 +137,20 @@
      ------------------------------------------------------------------
      grossMargin = (price - cogs - shipping - fees) / price
      BER         = 1 / grossMargin           (break-even ROAS)
-     netMargin   = grossMargin - 1 / ROAS    (live campaign profit margin)
+     netMargin   = grossMargin - 1 / ROAS    (live contribution margin)
 
      The last identity is what makes the sheet self-consistent:
      ROAS > BER  <=>  netMargin > 0.
+
+     Note on the name: this is CONTRIBUTION margin, not profit. It deducts
+     COGS, shipping and payment fees, and nothing else. Refunds are only
+     deducted when revenue itself arrives net of them, which is the case when
+     revenue comes from Shopify (ctx.revenueSource === 'shopify') and not when
+     it comes from Meta. Fixed costs are never in it.
      ------------------------------------------------------------------ */
-  function economics({ price = 0, cogs = 0, shipping = 0, feePct = 0, refundRate = 0 }) {
+  function economics({ price = 0, cogs = 0, shipping = 0, feePct = 0 }) {
     const p = num(price);
-    // The refund rate is independent of whether a price is set — it must
-    // survive this early exit, or it is silently dropped for anyone whose
-    // break-even comes from campaign names rather than this panel.
-    if (p <= 0) return { price: 0, grossMargin: 0, ber: 0,
-      refundRate: clampRate(refundRate), berAfterRefunds: 0, valid: false };
+    if (p <= 0) return { price: 0, grossMargin: 0, ber: 0, valid: false };
     const fees = p * (num(feePct) / 100);
     const contribution = p - num(cogs) - num(shipping) - fees;
     const grossMargin = contribution / p;
@@ -212,55 +163,11 @@
       grossMargin: grossMargin,
       grossMarginPct: round1(grossMargin * 100),
       ber: grossMargin > 0 ? round2(1 / grossMargin) : 0,
-      refundRate: clampRate(refundRate),
-      berAfterRefunds: grossMargin > 0 ? berAfterRefunds(1 / grossMargin, refundRate) : 0,
       valid: grossMargin > 0
     };
   }
 
-  /* Break-even ROAS once refunds are taken out.
-
-       break-even means   revenue x (1 - r) x grossMargin = spend
-       so                 revenue / spend = 1 / ((1 - r) x grossMargin) = BER / (1 - r)
-
-     A 12% refund rate on a 1.58 break-even means you actually need 1.80 to
-     stand still. This is the number the sheet's rules should be read against.
-
-     It is deliberately the CONSERVATIVE form: a partial refund gives money
-     back without returning the goods, so the product and shipping you already
-     paid for are gone too. The true damage is a little worse than this. */
-  function berAfterRefunds(ber, rate) {
-    const b = num(ber), r = clampRate(rate);
-    if (b <= 0 || r <= 0) return b;
-    return round2(b / (1 - r));
-  }
-
-  function clampRate(r) {
-    const v = num(r);
-    if (!isFinite(v) || v <= 0) return 0;
-    return Math.min(v > 1 ? v / 100 : v, RULES.refunds.max);   // accept 12 or 0.12
-  }
-
-  /* Revenue you actually keep, and the ROAS that follows from it. */
-  function netOfRefunds(campaign, rate) {
-    const r = clampRate(rate);
-    if (!r) return campaign;
-    const revenue = round2(num(campaign.revenue) * (1 - r));
-    const spend = num(campaign.spend);
-    return {
-      ...campaign,
-      revenue,
-      roas: spend > 0 ? revenue / spend : 0,
-      grossRevenue: num(campaign.revenue),
-      refundRate: r,
-      history: (campaign.history || []).map(d => {
-        const rev = num(d.revenue) * (1 - r);
-        return { ...d, revenue: round2(rev), roas: num(d.spend) > 0 ? rev / num(d.spend) : 0 };
-      })
-    };
-  }
-
-  /** Live profit margin of a campaign, as a percentage. */
+  /** Live contribution margin of a campaign, as a percentage. */
   function netMarginPct(roas, grossMargin) {
     if (!roas || roas <= 0 || !grossMargin) return -100;
     return round1((grossMargin - 1 / roas) * 100);
@@ -273,15 +180,135 @@
   }
 
   /* ------------------------------------------------------------------
+     2b. REVENUE PROVENANCE
+     ------------------------------------------------------------------ */
+  /** True when the revenue behind this verdict came from the order book. */
+  function revenueVerified(ctx) {
+    return (ctx && ctx.revenueSource) === 'shopify';
+  }
+
+  /** True when the revenue is Meta's own attribution, which may not scale on. */
+  function scalingLocked(ctx) {
+    return (ctx && ctx.revenueSource) === 'meta';
+  }
+
+  /** What the margin figure actually means, given where revenue came from. */
+  function marginLabel(ctx) {
+    return revenueVerified(ctx)
+      ? 'Contribution margin (after refunds)'
+      : 'Contribution margin (before refunds)';
+  }
+
+  /* ------------------------------------------------------------------
+     2c. CONFIDENCE
+     ------------------------------------------------------------------
+     Orders arrive roughly as a Poisson process, so the relative standard
+     error on a count of n is 1/√n. Revenue inherits that, and ROAS is
+     revenue over a spend figure that is known exactly — so the spread on
+     ROAS is driven by how many orders it rests on, and nothing else.
+
+     n=4  → ±64%      n=10 → ±41%      n=25 → ±26%      n=100 → ±13%
+
+     That is the whole argument for not acting on a single thin day.
+     ------------------------------------------------------------------ */
+  function roasInterval(roas, orders, z) {
+    const n = num(orders), r = num(roas);
+    if (!(n > 0) || !(r > 0)) return null;
+    const zz = num(z) || RULES.confidence.z;
+    const half = zz / Math.sqrt(n);
+    return {
+      roas: round2(r),
+      orders: n,
+      lo: round2(Math.max(0, r * (1 - half))),
+      hi: round2(r * (1 + half)),
+      rsePct: round1((1 / Math.sqrt(n)) * 100)
+    };
+  }
+
+  /** How many orders it would take to separate this ROAS from this BER.
+      Answers "how much longer do I wait" instead of leaving a card silent. */
+  function ordersNeeded(roas, ber, z) {
+    const r = num(roas), b = num(ber);
+    if (!(r > 0) || !(b > 0)) return null;
+    const gap = Math.abs(r - b) / r;
+    if (!(gap > 0)) return null;
+    const zz = num(z) || RULES.confidence.z;
+    return Math.ceil(Math.pow(zz / gap, 2));
+  }
+
+  /** True when the whole interval sits above break-even — the only state
+      in which more money is justified. */
+  function provenAbove(interval, ber) {
+    return !!interval && num(ber) > 0 && interval.lo > num(ber);
+  }
+
+  /* ------------------------------------------------------------------
+     2d. WEEKEND LIFT, MEASURED
+     ------------------------------------------------------------------
+     Pools every Saturday and Sunday in the history against every weekday
+     and reports the real difference. One weekend proves nothing, so the
+     result carries `reliable` and the caller must respect it.
+     ------------------------------------------------------------------ */
+  function weekendLift(history) {
+    const rows = (history || []).filter(d => num(d.spend) > 0 && d.date);
+    const bucket = { we: { spend: 0, revenue: 0, days: 0 }, wd: { spend: 0, revenue: 0, days: 0 } };
+
+    rows.forEach(d => {
+      const t = new Date(String(d.date) + 'T12:00:00Z');
+      if (isNaN(t.getTime())) return;
+      const dow = t.getUTCDay();
+      const b = (dow === 0 || dow === 6) ? bucket.we : bucket.wd;
+      b.spend += num(d.spend);
+      b.revenue += num(d.revenue);
+      b.days += 1;
+    });
+
+    const weRoas = bucket.we.spend > 0 ? bucket.we.revenue / bucket.we.spend : 0;
+    const wdRoas = bucket.wd.spend > 0 ? bucket.wd.revenue / bucket.wd.spend : 0;
+    const reliable = bucket.we.days >= RULES.weekend_evidence.minWeekendDays &&
+                     bucket.wd.days >= RULES.weekend_evidence.minWeekdayDays &&
+                     wdRoas > 0;
+
+    return {
+      weekendRoas: round2(weRoas),
+      weekdayRoas: round2(wdRoas),
+      weekendDays: bucket.we.days,
+      weekdayDays: bucket.wd.days,
+      lift: reliable ? round2((weRoas / wdRoas) - 1) : null,
+      reliable
+    };
+  }
+
+  /** Budget increase a measured lift earns, capped. Returns 0 when the
+      evidence does not support moving anything. */
+  function surfPctFromLift(lift) {
+    const l = num(lift);
+    if (!(l > 0)) return 0;
+    return Math.min(
+      RULES.weekend_evidence.maxSurfPct,
+      Math.round(l * 100 * RULES.weekend_evidence.liftToBudgetFactor)
+    );
+  }
+
+  /* The weekend surf may never scale something the ordinary ladder would
+     refuse, so it borrows the ladder's own lowest scaling tier. */
+  const SURF_MARGIN_FLOOR = RULES.scale.tiers[RULES.scale.tiers.length - 2].minMargin;
+
+  const UNVERIFIED_WHY =
+    'Meta per-campaign revenue is not trustworthy on this account: the account total is right ' +
+    'within about 2%, but the per-campaign split has been out by up to EUR 869 because every ' +
+    'pixel is installed store-wide and view-through credit lets any campaign claim any sale.';
+
+  /* ------------------------------------------------------------------
      3. CAMPAIGN NAME PARSER
      ------------------------------------------------------------------
      The BER is found by shape, not by position, because real campaign
      names are not tidy. All of these must work:
 
-       Product | 1.50 | 67
-       Brand | CM074 | Product Name | 1.58
-       Brand | CM066 | Other Product | 1.36 - V2- Q4
-       Brand|  CM002 | Third Product | 1.55
+       AtemFrei | 1.50 | 67
+       Dr Whilinis | CM074 | AtemFrei™Königskerze-Tropfen | 1.58
+       Hautglenz | CM066 | LidLux™ | 1.36 - V2- Q4
+       Celsior|  CM002 | CelsiorLeggings | 1.55
 
      A BER always has a decimal point. That single fact separates it from
      product codes (CM074), version tags (V2), quarters (Q4) and margins
@@ -335,6 +362,15 @@
     return meaningful[meaningful.length - 1] || parts[0] || name;
   }
 
+  /** The CM code in a campaign name, if there is one. This is the join key
+      between Meta campaigns, ClickUp tasks and Shopify products. CM063 is
+      written both "CM063" and "CM0063" in ClickUp, so leading zeros after
+      the prefix are normalised away. */
+  function cmCode(name) {
+    const m = String(name || '').match(/\bCM0*(\d{1,5})\b/i);
+    return m ? 'CM' + m[1].padStart(3, '0') : null;
+  }
+
   /* ------------------------------------------------------------------
      4. CHECK WINDOW — which of the 3 daily reads are we in?
      ------------------------------------------------------------------ */
@@ -342,7 +378,7 @@
      Meta rolls the advertising day over in the account timezone, so that is
      the only clock the daily rules mean anything against. Reading the browser
      clock instead silently shifts every window by your UTC offset — sitting
-     in the browser (UTC+3) against a Berlin account (UTC+2) tips you into the
+     in Cairo (UTC+3) against a Berlin account (UTC+2) tips you into the
      evening read an hour early, every single day, which suppresses the
      day-1 kill and price-drop calls. */
   function clockIn(date, tz) {
@@ -429,360 +465,6 @@
   }
 
   /* ------------------------------------------------------------------
-     5b. BREAK-EVEN CPA
-     ------------------------------------------------------------------
-     ROAS tells you whether you are winning. Break-even CPA tells you by
-     how much, in the unit you actually bid in. maxCPA is the most you can
-     pay for a customer and still not lose money:
-
-       maxCPA = AOV x grossMargin        (and BER = 1 / grossMargin)
-
-     headroom is how much room is left before the campaign turns. A
-     campaign at 30% headroom can absorb a CPM rise; one at 1% cannot.
-     ------------------------------------------------------------------ */
-  function cpaPicture(c, grossMargin) {
-    const spend = num(c.spend), purchases = num(c.purchases), revenue = num(c.revenue);
-    const aov = purchases > 0 ? revenue / purchases : 0;
-    const cpa = purchases > 0 ? spend / purchases : null;
-    const maxCPA = aov > 0 && grossMargin > 0 ? aov * grossMargin : null;
-    return {
-      cpa: cpa === null ? null : round2(cpa),
-      aov: round2(aov),
-      maxCPA: maxCPA === null ? null : round2(maxCPA),
-      // Positive = room to spend more per customer. Negative = losing money.
-      headroomPct: (cpa !== null && maxCPA) ? round1(((maxCPA - cpa) / maxCPA) * 100) : null,
-      profit: maxCPA !== null ? round2((maxCPA - cpa) * purchases) : null
-    };
-  }
-
-  /* ------------------------------------------------------------------
-     5c. DAY PACING
-     ------------------------------------------------------------------
-     You cannot judge a running day by its spend alone. At 11:00 a €40
-     spend means something very different than at 23:00. This projects
-     where the day lands so the day-1 thresholds are read in context.
-     Meta's delivery is not linear, but it is close enough to linear
-     after the first couple of hours to be a useful guide — and being
-     roughly right beats being precisely blind.
-     ------------------------------------------------------------------ */
-  function dayPacing(c, ctx) {
-    if (!ctx || typeof ctx.accountHour !== 'number') return null;
-    const elapsed = ctx.accountHour + (ctx.accountMinute || 0) / 60;
-    if (elapsed < 1) return null;                 // too early to extrapolate
-    const fraction = elapsed / 24;
-    const spend = num(c.spend), budget = num(c.budget);
-    const projectedSpend = round2(spend / fraction);
-    return {
-      elapsedHours: round1(elapsed),
-      dayFractionPct: round1(fraction * 100),
-      projectedSpend,
-      // Under-delivery: budget it is not managing to spend.
-      budgetUsedPct: budget > 0 ? round1((spend / budget) * 100) : null,
-      willUnderDeliver: budget > 0 && projectedSpend < budget * RULES.pacing.underDelivering,
-      projectedPurchases: spend > 0 ? round1(num(c.purchases) / fraction) : 0
-    };
-  }
-
-  /* ------------------------------------------------------------------
-     5d. BROKEN FUNNEL STAGE
-     ------------------------------------------------------------------
-     Different from biggestLeak, which grades a stage as weak. This finds
-     a stage that is flatly DEAD — zero events where the stage above it
-     produced plenty. That is a bug on the page, not a bad offer, and no
-     budget or price change will touch it. Learned the hard way: 11 carts
-     and 0 checkouts is a broken button, not a pricing objection.
-     ------------------------------------------------------------------ */
-  const STAGE_MIN = 8;       // mid-funnel: this many above, zero below = broken
-  const PURCHASE_MIN = 12;   // the purchase step needs more evidence, see below
-
-  /* opts.includePurchaseStep — the checkout→purchase step is the one
-     ambiguous link. Zero purchases from a handful of checkouts can be a
-     dead payment provider OR simply a price objection, which the sheet
-     already handles with a price drop. So day-1 triage looks only at the
-     unambiguous mid-funnel steps; the account-wide alarm looks at all of
-     them and says what it sees. */
-  function brokenStage(c, opts) {
-    const includePurchase = !opts || opts.includePurchaseStep !== false;
-    const clicks = num(c.clicks), lpv = num(c.lpv), atc = num(c.atc),
-          ic = num(c.ic), purchases = num(c.purchases);
-    const chain = [
-      { from: 'clicks',    to: 'landing page views', up: clicks, down: lpv,
-        msg: 'Clicks are not turning into page views. The page is not loading — check the domain, the redirect and load speed.' },
-      { from: 'page views', to: 'add-to-carts', up: lpv, down: atc,
-        msg: 'Page views produce no add-to-carts. Either the button is broken or the add-to-cart event is not firing.' },
-      { from: 'add-to-carts', to: 'checkouts', up: atc, down: ic,
-        msg: 'Carts never reach checkout. The checkout button or its event is broken — a discount cannot fix this.' },
-      { from: 'checkouts', to: 'purchases', up: ic, down: purchases, purchaseStep: true,
-        msg: 'Checkouts never complete. Check the payment providers — Klarna, PayPal and Stripe — and the purchase event.' }
-    ];
-    for (let i = 0; i < chain.length; i++) {
-      const st = chain[i];
-      if (st.purchaseStep && !includePurchase) continue;
-      const floor = st.purchaseStep ? PURCHASE_MIN : STAGE_MIN;
-      if (st.up < floor || st.down !== 0) continue;
-      // A zero stage with live traffic BELOW it is a skipped step, not a
-      // broken one. Funnelish one-page funnels go straight to checkout, so
-      // they never fire add-to-cart — that is architecture, not a bug.
-      const downstreamAlive = chain.slice(i + 1).some(later => later.down > 0);
-      if (downstreamAlive) continue;
-      return { from: st.from, to: st.to, upCount: st.up, message: st.msg, purchaseStep: !!st.purchaseStep };
-    }
-    return null;
-  }
-
-  /* ------------------------------------------------------------------
-     5c. CREATIVE HEALTH
-     ------------------------------------------------------------------
-     Whether the creative still has life left in it.
-
-     THE RULE THAT GOVERNS EVERYTHING HERE: frequency is the gate. If the
-     same people are not seeing the ad repeatedly, the creative is not worn
-     out — whatever the click-through is doing. A CTR slide at low frequency
-     is the budget mix moving between ads, or a hard scale reaching colder
-     audience. Neither is fixed by shooting new creatives.
-
-     Three earlier mistakes this version corrects:
-       1. A 7-day window let one odd day swing the verdict. Now 14.
-       2. It compared today to the BEST day ever. A high-water mark is
-          usually a fluke, so every ordinary day looked like decay. Now it
-          compares the median of the last 3 closed days to the median of
-          the days before them.
-       3. It read the campaign's blended CTR as if it were one creative's
-          health. A campaign CTR is a weighted average of its ads: move
-          budget from a 5% ad to a 3% ad and the line falls with nothing
-          having aged. Now the ads are read individually.
-
-     States:
-       new     — under minDays of CLOSED days. Say so; never guess a trend.
-       fresh   — frequency low. Leave it alone.
-       fading  — frequency building, or CTR down AND CPM up together.
-       worn    — frequency past the fatigue line. Shoot today.
-     ------------------------------------------------------------------ */
-  function median(values) {
-    const a = (values || []).filter(v => isFinite(v)).slice().sort((x, y) => x - y);
-    if (!a.length) return 0;
-    const m = Math.floor(a.length / 2);
-    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
-  }
-
-  /* Per-ad read. This is the piece that stops a budget shift masquerading as
-     fatigue: it names the ad whose own frequency is past the line, and warns
-     when the ads are far enough apart that the campaign average means little. */
-  function adFatigue(adStats) {
-    const all = (adStats || []).filter(a => num(a.spend) > 0);
-    if (all.length < 2) return { worstAd: null, mixWarning: null };
-    const FAT = RULES.frequency.fatigue;
-    const R = RULES.creative;
-
-    /* Only ads carrying real budget count. An ad on €4 with a 0% CTR is not
-       evidence of anything — including it made the spread warning fire on
-       every campaign in the account, which is the same as not firing at all. */
-    const totalSpend = all.reduce((t, a) => t + num(a.spend), 0);
-    const ads = all.filter(a => totalSpend > 0 && num(a.spend) / totalSpend >= R.adMinSpendShare);
-
-    /* The ad heading for trouble, not just the one already there: flag from
-       freqFading up, and say which side of the fatigue line it sits on. */
-    let worst = null;
-    ads.forEach(a => {
-      if (num(a.frequency) >= R.freqFading && (!worst || num(a.frequency) > num(worst.frequency))) worst = a;
-    });
-
-    let mixWarning = null;
-    const ctrs = ads.map(a => num(a.ctr)).filter(v => v > 0);
-    if (ctrs.length >= 2) {
-      const hi = Math.max.apply(null, ctrs), lo = Math.min.apply(null, ctrs);
-      if (hi > 0 && (hi - lo) / hi >= R.adCtrSpread) {
-        mixWarning = `Ads carrying real budget here run from ${round2(lo)}% to ${round2(hi)}% CTR. The campaign average moves whenever budget moves between them — judge the ads, not the blend.`;
-      }
-    }
-
-    let worstAd = null;
-    if (worst) {
-      const f = round2(num(worst.frequency));
-      const nm = worst.name || 'One ad';
-      worstAd = {
-        name: worst.name || 'one ad',
-        frequency: f,
-        past: f >= FAT,
-        note: f >= FAT
-          ? `${nm} is at frequency ${f}, past the ${FAT} line — replace that ad, not the whole set.`
-          : `${nm} is at frequency ${f} and climbing toward ${FAT} — it will need replacing before the rest of the set does.`
-      };
-    }
-    return { worstAd, mixWarning };
-  }
-
-  function creativeHealth(campaign, opts) {
-    const R = RULES.creative;
-    const FAT = RULES.frequency.fatigue;
-    const c = campaign || {};
-
-    /* CLOSED days only. The day still running is deliberately excluded — a
-       partial day is not a data point, and counting one is what made a
-       surf-scaled Saturday look like a dying creative. */
-    const rows = (c.history || [])
-      .filter(d => num(d.spend) > 0 && num(d.ctr) > 0)
-      .slice(-R.window);
-
-    const freq = num(c.frequency) || (rows.length ? num(rows[rows.length - 1].frequency) : 0);
-    const adRead = adFatigue(c.adStats);
-
-    const base = {
-      days: rows.length, frequency: round2(freq),
-      ctrRecent: null, ctrBaseline: null, ctrDropPct: null,
-      cpmRecent: null, cpmBaseline: null, cpmRisePct: null,
-      worstAd: adRead.worstAd, mixWarning: adRead.mixWarning
-    };
-
-    if (rows.length < R.minDays) {
-      const sig = [];
-      if (freq >= FAT) sig.push(`Frequency ${round2(freq)} already — worth watching on a campaign this young.`);
-      if (adRead.mixWarning) sig.push(adRead.mixWarning);
-      return Object.assign(base, {
-        state: 'new',
-        headline: 'Too early to read fatigue',
-        detail: `Needs ${R.minDays} closed days of delivery before a trend means anything. ${rows.length} so far.`,
-        signals: sig
-      });
-    }
-
-    const n = R.recentDays;
-    const ctrs = rows.map(d => num(d.ctr));
-    const cpms = rows.map(d => num(d.cpm));
-
-    const ctrRecent = median(ctrs.slice(-n));
-    const ctrBaseline = median(ctrs.slice(0, -n));
-    const ctrDropPct = ctrBaseline > 0 ? round1(((ctrBaseline - ctrRecent) / ctrBaseline) * 100) : 0;
-
-    const cpmRecent = median(cpms.slice(-n).filter(v => v > 0));
-    const cpmBaseline = median(cpms.slice(0, -n).filter(v => v > 0));
-    const cpmRisePct = cpmBaseline > 0 ? round1(((cpmRecent - cpmBaseline) / cpmBaseline) * 100) : 0;
-
-    const ctrFalling = ctrDropPct >= R.ctrDropFade;
-    const cpmClimbing = cpmRisePct >= R.cpmRise;
-
-    /* ---- the sustained slide, judged on halves of the window -----------
-       Medians, so one spike cannot manufacture a decline; and a share test,
-       so a decline that already recovered does not count as one. */
-    const half = Math.floor(rows.length / 2);
-    const earlyCtrs = ctrs.slice(0, half);
-    const lateCtrs = ctrs.slice(-half);
-    const earlyMed = median(earlyCtrs);
-    const lateMed = median(lateCtrs);
-    const slidePct = earlyMed > 0 ? round1(((earlyMed - lateMed) / earlyMed) * 100) : 0;
-    const belowShare = earlyMed > 0 && lateCtrs.length
-      ? lateCtrs.filter(v => v < earlyMed).length / lateCtrs.length : 0;
-    const longEnough = rows.length >= R.sustainedMinDays;
-    const persistent = longEnough && belowShare >= R.sustainedShare;
-    const slideWorn = persistent && slidePct >= R.ctrSlideWorn;
-    const slideFading = persistent && slidePct >= R.ctrSlideFade;
-
-    let state, headline, detail;
-    if (freq >= FAT) {
-      state = 'worn';
-      headline = 'Worn out — upload fresh creatives today';
-      detail = 'Frequency is past the fatigue line: the same people keep seeing this. No budget change fixes that.';
-    } else if (freq >= R.freqFading && ctrDropPct >= R.ctrDropWorn) {
-      state = 'worn';
-      headline = 'Worn out — upload fresh creatives today';
-      detail = 'Frequency is climbing and click-through has fallen hard. Two signals agreeing is real fatigue.';
-    } else if (slideWorn) {
-      /* Frequency is not consulted here on purpose — see ctrSlideWorn. */
-      state = 'worn';
-      headline = 'Worn out — upload fresh creatives today';
-      detail = `Click-through has slid ${slidePct}% across ${rows.length} closed days and stayed down. Frequency is only ${round2(freq)}, which means the market is tiring of this creative rather than the same people seeing it twice — and a bigger budget makes that worse, not better.`;
-    } else if (freq >= R.freqFading) {
-      state = 'fading';
-      headline = 'Fading — start shooting now';
-      detail = 'Frequency is building toward the fatigue line. Get new creatives ready while this still pays.';
-    } else if (ctrFalling && cpmClimbing) {
-      state = 'fading';
-      headline = 'Fading — start shooting now';
-      detail = 'Click-through is down and the auction is getting more expensive at the same time. Two independent signals, so this is decay rather than noise.';
-    } else if (slideFading) {
-      state = 'fading';
-      headline = 'Fading — start shooting now';
-      detail = `Click-through is ${slidePct}% below where it was earlier in the window and has not come back. Not steep enough to stop anything today, but it is going one way.`;
-    } else {
-      state = 'fresh';
-      headline = 'Fresh — leave it alone';
-      detail = longEnough
-        ? `Click-through is holding across ${rows.length} closed days and frequency is ${round2(freq)}. Nothing here says the creative is tiring.`
-        : `Frequency ${round2(freq)} is below ${R.freqFading} and there is not yet a long enough run of days to read a trend.`;
-    }
-
-    const signals = [`Frequency ${round2(freq)} — the fatigue line is ${FAT}.`];
-    if (ctrDropPct >= R.ctrDropFade) {
-      signals.push(`Link CTR ${round2(ctrRecent)}% over the last ${n} closed days against ${round2(ctrBaseline)}% before — down ${ctrDropPct}%.`);
-    } else if (ctrDropPct <= -5) {
-      signals.push(`Link CTR ${round2(ctrRecent)}% — up on its own baseline of ${round2(ctrBaseline)}%.`);
-    }
-    if (cpmClimbing) {
-      signals.push(`CPM ${round2(cpmRecent)} — up ${cpmRisePct}% on its baseline. Meta is charging more to keep placing this.`);
-    }
-    if (longEnough && slidePct >= R.ctrSlideFade) {
-      signals.push(`Over the window: CTR ${round2(earlyMed)}% in the first half against ${round2(lateMed)}% in the second — a ${slidePct}% slide, with ${Math.round(belowShare * 100)}% of recent days below the old level.`);
-    }
-    if (state === 'fresh' && ctrFalling && !persistent) {
-      signals.push(`Watch only: the last ${n} days are off ${ctrDropPct}%, but the slide has not held across the window — more likely the mix than the creative.`);
-    }
-    if (adRead.mixWarning) signals.push(adRead.mixWarning);
-    if (adRead.worstAd) signals.push(adRead.worstAd.note);
-
-    return Object.assign(base, {
-      state, headline, detail, signals,
-      ctrRecent: round2(ctrRecent), ctrBaseline: round2(ctrBaseline), ctrDropPct,
-      cpmRecent: round2(cpmRecent), cpmBaseline: round2(cpmBaseline), cpmRisePct
-    });
-  }
-
-  /* The angle library — his own standing creative prompt systems. Classified
-     from ad copy, which sees the WORDS, not the footage: treat a match as
-     "he has probably run this angle", not as proof. Naming an untested angle
-     is the useful half; a dashboard cannot pick the next winner for him. */
-  const ANGLES = [
-    { key: 'before-after', label: 'Before / after split',
-      hints: ['ohne', 'vorher', 'nachher', 'unterschied', 'vergleich', 'before', 'after'] },
-    { key: 'lifestyle', label: 'Lifestyle aspiration',
-      hints: ['endlich', 'gefühl', 'jeden morgen', 'ritual', 'alltag', 'selbstbewusst', 'genießen', 'wohl'] },
-    { key: 'problem-relief', label: 'Problem / relief',
-      hints: ['schluss', 'nie wieder', 'schmerz', 'schmerzen', 'problem', 'stört', 'nervt', 'endlich frei'] },
-    { key: 'testimonial', label: 'Personal story',
-      hints: ['ich', 'mein', 'meine', 'seitdem', 'bei mir', 'monaten', 'wochen'] },
-    { key: 'offer', label: 'Offer / discount',
-      hints: ['rabatt', 'gratis', 'kostenlos', 'sale', 'nur heute', 'spare', 'versandkostenfrei', 'prozent'] }
-  ];
-
-  /* German is full of short words that live inside longer ones — "ich" sits
-     inside "endlich", "mit" inside "damit". Substring matching therefore reads
-     a personal-story angle into copy that has none, so every hint is matched on
-     word boundaries. Percent signs are matched separately, having none. */
-  function hintHit(text, hint) {
-    const esc = hint.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp('(^|[^\\p{L}\\p{N}])' + esc + '($|[^\\p{L}\\p{N}])', 'u').test(text);
-  }
-
-  /** Which angles this campaign's ads cover, and which are untested. */
-  function angleCoverage(ads) {
-    const list = Array.isArray(ads) ? ads : [];
-    const seen = {};
-    list.forEach(a => {
-      const text = ((a.headline || '') + ' ' + (a.body || '')).toLowerCase();
-      if (!text.trim()) return;
-      // A number next to a percent sign is an offer, wherever it sits.
-      if (/\d\s*%|\d+\s*(€|eur)\b/.test(text)) seen.offer = (seen.offer || 0) + 1;
-      ANGLES.forEach(ang => {
-        if (ang.hints.some(h => hintHit(text, h))) seen[ang.key] = (seen[ang.key] || 0) + 1;
-      });
-    });
-    return {
-      tested: ANGLES.filter(a => seen[a.key]).map(a => ({ ...a, count: seen[a.key] })),
-      untested: ANGLES.filter(a => !seen[a.key]).map(a => ({ key: a.key, label: a.label })),
-      adsRead: list.length
-    };
-  }
-
-  /* ------------------------------------------------------------------
      6. THE VERDICT
      ------------------------------------------------------------------
      campaign = {
@@ -793,14 +475,12 @@
        history: [{date, spend, roas}],   // oldest → newest, today last
        descaleCount              // times descaled since last profitable day
      }
-     ctx = { ber, grossMargin, window, isSaturday, isSunday, currency }
+     ctx = { ber, grossMargin, window, isSaturday, isSunday, currency,
+             revenueSource,      // 'shopify' | 'meta' | other — see header
+             atcTrackingBroken } // true when the ATC event does not fire
      ------------------------------------------------------------------ */
-  let _ctx = null;   // set by verdict(), read by build() for pacing/economics
-
   function verdict(campaign, ctx) {
-    _ctx = ctx || {};
-    // Judge what you keep, not what Meta reported.
-    const c = normalizeCampaign(netOfRefunds(campaign, (ctx || {}).refundRate));
+    const c = normalizeCampaign(campaign);
     const ber = num(ctx.ber);
     const gm = ctx.grossMargin || grossMarginFromBer(ber);
     const win = ctx.window || 'midnight';
@@ -809,6 +489,14 @@
     const profitable = ber > 0 && c.roas > ber;
     const unprofitableStreak = countUnprofitableStreak(c.history, ber);
     const notes = [];
+    const locked = scalingLocked(ctx);
+
+    /* How much this verdict actually knows. Everything below that adds
+       money has to clear it. */
+    const zUsed = (ctx.confidence && ctx.confidence.z) || RULES.confidence.z;
+    const interval = roasInterval(c.roas, c.purchases, zUsed);
+    const proven = provenAbove(interval, ber);
+    const needed = ordersNeeded(c.roas, ber, zUsed);
 
     // ---- guard: not enough data to judge -------------------------------
     if (!ber || ber <= 0) {
@@ -816,81 +504,76 @@
         headline: 'Set the BER first',
         reasons: ['No break-even ROAS for this campaign. Name it "Product | BER | Margin" or set the unit economics.'],
         rule: 'Campaign name: Productname | BER | Profit margin'
-      }, f, margin, ber);
+      }, f, margin, ber, notes, ctx);
     }
-    /* A paused campaign is not a candidate for any budget move. It still
-       shows up while it has spend in the window being viewed, because you
-       need to see how the day it was stopped actually ended — but telling
-       someone to scale a campaign they just switched off is nonsense, and
-       acting on it would mean turning it back on by accident. Report the
-       outcome; leave the decision to restart to the person. */
-    if (/PAUSED|ARCHIVED|DELETED/i.test(c.status || '')) {
-      const outcome = c.purchases > 0
-        ? `It ended on ROAS ${c.roas.toFixed(2)} against break-even ${ber.toFixed(2)} — ${profitable ? 'profitable' : 'under water'}.`
-        : `It ended with ${money(c.spend, ctx.currency)} spent and no sales.`;
-      const broken = brokenStage(c, { includePurchaseStep: false });
-      return build('PAUSED', c, {
-        headline: profitable ? 'Paused — it was working when you stopped it' : 'Paused',
-        reasons: [
-          outcome,
-          broken
-            ? `${broken.upCount} ${broken.from} produced 0 ${broken.to}. Fix that before switching it back on.`
-            : profitable
-              ? 'Switching it back on is a decision for you — the sheet does not scale a campaign that is off.'
-              : 'Leave it off until the creative or the funnel behind it has changed.'
-        ],
-        rule: 'Paused campaigns are never scaled, descaled or killed — these numbers are final for this window.'
-      }, f, margin, ber, notes);
-    }
-
     if (c.spend < RULES.minSpendForVerdict) {
       return build('MONITOR', c, {
         headline: 'Too early to call',
         reasons: [`Only ${money(c.spend, ctx.currency)} spent. Let it gather data.`],
         rule: 'Do not act on noise.'
-      }, f, margin, ber);
+      }, f, margin, ber, notes, ctx);
     }
+
+    /* A kill or a descale driven by comparing revenue against break-even is
+       still allowed on Meta's numbers — but it is worth saying out loud that
+       the comparison rests on a figure that has been wrong before. This is
+       not hypothetical: SchnarchFrei was killed on a Meta ROAS of 0.24 when
+       its true ROAS was 1.58 against a BER of 1.47, i.e. profitable. */
+    const unverifiedCutNote = locked
+      ? ['This cut is computed from Meta revenue, which is unverified. A campaign has already been killed here on a Meta figure that turned out to be profitable — confirm against Shopify if the amount matters.']
+      : [];
 
     // ---- WEEKEND SURFSCALING ------------------------------------------
     // Applies Sat + Sun, at both the 11AM and midnight reads.
     if (ctx.isSaturday || (ctx.isSunday && win !== 'midnight')) {
-      for (const tier of RULES.weekend.surf) {
-        if (c.roas >= tier.minRoas) {
-          return build('SURF', c, {
-            headline: `Surf ×${tier.multiplier}`,
-            newBudget: c.budget * tier.multiplier,
-            reasons: [
-              `ROAS ${c.roas.toFixed(2)} is at or above ${tier.minRoas} on a weekend.`,
-              `Weekend surf multiplies budget ×${tier.multiplier}. You can do this twice today.`,
-              'Remember to pull back Sunday night — Monday always dips.',
-              ctx.learning ? 'This ad set is still in learning and a ×' + tier.multiplier + ' change will reset it. That is the accepted price of surfing a weekend winner.' : ''
-            ].filter(Boolean),
-            rule: `Weekend Surfscaling: ROAS ${tier.minRoas}+ → Budget ×${tier.multiplier}`
-          }, f, margin, ber);
-        }
+      /* The original rule read one day's ROAS and multiplied the budget by
+         5 or 10. At this account's order counts a 3.0 on a Saturday is
+         frequently just a good Saturday, and a ×10 resets learning on every
+         campaign at once — which is most of why Monday hurts.
+
+         Surfing is a claim about weekend DEMAND. So measure the demand on
+         this account's own history, and only then spend against it. */
+      const ev = ctx.weekendLift || weekendLift(c.history);
+      const pct = ev.reliable ? surfPctFromLift(ev.lift) : 0;
+      const liftPct = ev.lift === null ? null : Math.round(ev.lift * 100);
+
+      if (!ev.reliable) {
+        notes.push(`Weekend, but there is no measured lift yet — ${ev.weekendDays} weekend day(s) and ${ev.weekdayDays} weekday(s) on file, and the rule needs ${RULES.weekend_evidence.minWeekendDays} and ${RULES.weekend_evidence.minWeekdayDays}. Surfing stays off until this account's own history shows weekends really are better. Normal rules apply.`);
+      } else if (pct <= 0) {
+        notes.push(`Measured weekend lift is ${liftPct}% (weekend ROAS ${ev.weekendRoas} against weekday ${ev.weekdayRoas} over ${ev.weekendDays + ev.weekdayDays} days). Weekends are not better on this account, so there is nothing to surf. Normal rules apply.`);
+      } else if (locked) {
+        return lockedScale(c, `a measured weekend surf of +${pct}%`, c.budget * (1 + pct / 100),
+          `Weekend ROAS runs ${liftPct}% above weekday on this account (${ev.weekendRoas} against ${ev.weekdayRoas}).`,
+          f, margin, ber, ctx, notes);
+      } else if (!proven) {
+        notes.push(`The weekend lift is real (+${liftPct}%) but this campaign has not earned the extra budget: ROAS ${c.roas.toFixed(2)} on ${c.purchases} order(s) spans ${interval ? interval.lo + '–' + interval.hi : '—'}, which still crosses break-even ${ber.toFixed(2)}. Surf the campaigns that have proved themselves, not this one.`);
+      } else if (margin < SURF_MARGIN_FLOOR) {
+        /* The surf amplifies the ladder; it does not bypass it. On a 6%
+           margin a doubled budget buys a little more volume at a worse CPA
+           and lands in the red, lift or no lift. The normal ladder already
+           refuses to scale under 15% and the weekend does not change that. */
+        notes.push(`Weekend lift is real (+${liftPct}%), and this campaign is genuinely profitable, but ${marginLabel(ctx).toLowerCase()} is only ${margin}% — under the ${SURF_MARGIN_FLOOR}% the ladder requires before adding budget. CPA climbs as you scale, so surfing a margin this thin ends the weekend in the red. Left alone.`);
+      } else {
+        return build('SURF', c, {
+          headline: `Surf +${pct}%`,
+          newBudget: c.budget * (1 + pct / 100),
+          reasons: [
+            `Weekend ROAS on this account runs ${liftPct}% above weekday — ${ev.weekendRoas} against ${ev.weekdayRoas}, measured over ${ev.weekendDays} weekend days and ${ev.weekdayDays} weekdays.`,
+            `This campaign has earned it: ROAS ${c.roas.toFixed(2)} on ${c.purchases} orders, and even the low end of that range (${interval.lo}) clears break-even ${ber.toFixed(2)}.`,
+            `A ${liftPct}% lift supports roughly +${pct}% budget, capped at +${RULES.weekend_evidence.maxSurfPct}%. Bigger multiples are not supported by anything measurable.`,
+            'Pull back Sunday night — Monday still dips.',
+            ctx.learning ? `This ad set is in learning and a +${pct}% change will reset it. On a measured lift that is a reasonable trade; on a guess it was not.` : ''
+          ].filter(Boolean),
+          rule: `Weekend surf, sized to a measured lift of ${liftPct}% (was: ROAS 3+ → ×5, which rested on one day)`
+        }, f, margin, ber, notes, ctx);
       }
-      notes.push('Weekend, but ROAS is under 3 — no surf. Normal rules apply.');
     }
 
-    /* ---- SUNDAY NIGHT PULL-BACK ---------------------------------------
-       The pull-back exists to UNDO a weekend surf. It is not a rule about
-       Sundays; it is the second half of a scale-up.
-
-       It used to fire on any profitable campaign on a Sunday, on the
-       assumption that a winner on Sunday night must have been surfed. That
-       assumption is false, and on 18 Oct it told Velmira and LidLux — both
-       profitable, neither touched all weekend — to give up 40% of their
-       budget for nothing. A note at the bottom of the card said "no weekend
-       scale-up recorded", but the headline still said −40% and the card
-       still drew the new budget, so the note was worth nothing.
-
-       Now it needs evidence that a surf actually happened: either the
-       action log says so, or the spend itself shows it. The spend test is
-       there because a surf applied by hand in Ads Manager never reaches the
-       log, and a rule that only works when he remembers to click Applied is
-       not a rule. */
-    const surfed = c.surfedRecently || weekendScaleUp(c.history);
-    if (ctx.isSunday && win === 'midnight' && profitable && surfed) {
+    // ---- SUNDAY NIGHT PULL-BACK ---------------------------------------
+    // Only winners get pulled back — they are the ones that were scaled up
+    // over the weekend. A loser on Sunday night is still a loser, and falls
+    // through to the normal kill / descale rules below.
+    if (ctx.isSunday && win === 'midnight' && profitable) {
       const tier = RULES.weekend.sundayNight.find(t => c.roas >= t.minRoas);
       return build('DESCALE', c, {
         headline: `Sunday pull-back −${tier.descalePct}%`,
@@ -900,10 +583,7 @@
           'Always scale back Sunday night — Monday brings a hard dip.'
         ],
         rule: `Sunday night ROAS ${tier.minRoas === 0 ? '<3' : tier.minRoas + '+'} → descale ${tier.descalePct}%`
-      }, f, margin, ber, c.surfedRecently ? [] : ['The weekend scale-up was spotted in the spend rather than the action log — check the budget really did go up before you take it down.']);
-    }
-    if (ctx.isSunday && win === 'midnight' && profitable && !surfed) {
-      notes.push('Sunday, but this was never scaled up over the weekend — spend is in line with its normal days. There is nothing to pull back, so the ordinary rules decide below.');
+      }, f, margin, ber, c.surfedRecently ? [] : ['No weekend scale-up recorded for this one — if you never raised its budget this weekend, leave it alone.'], ctx);
     }
 
     /* ================= MORNING READ (≈11:00) =========================
@@ -922,6 +602,28 @@
       // decision threshold reached, no sales
       if (c.spend >= RULES.day1.decisionSpend && c.purchases === 0) {
         const atcRate = f.offer.value;
+
+        /* The ATC event does not fire at all on the Funnelish funnels. When
+           that is true, ATC rate is structurally 0 for every campaign, the
+           "nobody wants the offer" branch fires every time, and the price-drop
+           branch becomes unreachable — so every new product gets killed with a
+           reason that is simply false. Confirmed on CM063 and CM073, where
+           CM073 recorded a real purchase while reporting ATC 0.
+           With ATC untracked, fall back to landing-page views: traffic that
+           arrives and never buys is still a kill, but say why honestly. */
+        if (ctx.atcTrackingBroken) {
+          return build('KILL', c, {
+            headline: 'Kill it',
+            newBudget: 0,
+            reasons: [
+              `${money(c.spend, ctx.currency)} spent, 0 sales.`,
+              `${c.lpv} landing page views produced nothing.`,
+              'Add-to-cart is not being tracked on this funnel, so the price-drop test cannot be run. Judged on traffic that arrived and did not buy.'
+            ],
+            rule: 'Adspend ≤ 40 and 0 sales → KILL CAMPAIGN (ATC untracked, so LPV→purchase was used instead)'
+          }, f, margin, ber, ['Fix the AddToCart event on this funnel — until it fires, no new campaign can ever earn the price-drop branch.'], ctx);
+        }
+
         if (atcRate < RULES.day1.atcRateLow) {
           return build('KILL', c, {
             headline: 'Kill it',
@@ -931,22 +633,22 @@
               `Add-to-cart rate is ${atcRate}% — under ${RULES.day1.atcRateLow}%. Nobody wants the offer.`
             ],
             rule: 'Adspend ≤ 40 and 0 sales with low ATC rate → KILL CAMPAIGN'
-          }, f, margin, ber);
+          }, f, margin, ber, notes, ctx);
         }
         // High ATC but nobody reaches checkout is a broken funnel, not a
         // price objection — dropping the price on it just burns €30 more.
-        const broken = brokenStage(c, { includePurchaseStep: false });
-        if (broken) {
+        const stalled = c.atc >= 5 && c.ic === 0;
+        if (stalled) {
           return build('KILL', c, {
-            headline: `Stop it — ${broken.to} are not happening at all`,
+            headline: 'Stop it — the checkout is not receiving anyone',
             newBudget: 0,
             reasons: [
-              `${money(c.spend, ctx.currency)} spent, 0 sales, and ${broken.upCount} ${broken.from} produced 0 ${broken.to}.`,
-              broken.message,
-              'Pause it, fix that step, then retest at full price.'
+              `${money(c.spend, ctx.currency)} spent, 0 sales, and ${c.atc} add-to-carts produced 0 checkouts.`,
+              'Cart-to-checkout is 0%. That is a broken step, not a price objection — a discount cannot fix it.',
+              'Pause it, fix the checkout, then retest at full price.'
             ],
             rule: 'Adspend ≤ 40 and 0 sales → kill; price drop only applies when the funnel still works'
-          }, f, margin, ber);
+          }, f, margin, ber, notes, ctx);
         }
         return build('PRICE_DROP', c, {
           headline: 'Cut the price 20–30%, give it €30 more',
@@ -957,7 +659,7 @@
             'Still no sale after that extra €30 → kill it.'
           ],
           rule: 'Adspend ≤ 40 and 0 sales with high ATC rate → lower price 20-30%, spend another 30'
-        }, f, margin, ber);
+        }, f, margin, ber, notes, ctx);
       }
       // sales are coming in — let it prove itself
       if (c.purchases >= 1 && c.spend < RULES.day1.proveWindow[0]) {
@@ -969,7 +671,7 @@
             `By ${money(RULES.day1.proveWindow[1], ctx.currency)} it must be at or above break-even (ROAS ${ber.toFixed(2)}) or it dies tonight.`
           ],
           rule: 'Adspend ≤ 40 and 1+ sales → let it spend until 80-90'
-        }, f, margin, ber);
+        }, f, margin, ber, notes, ctx);
       }
       // past the prove window
       if (c.spend >= RULES.day1.proveWindow[0] && !profitable) {
@@ -981,7 +683,7 @@
             'It had its chance in the 80–90 window.'
           ],
           rule: 'By 80-90 it should be profitable or break-even. If not → KILL CAMPAIGN'
-        }, f, margin, ber);
+        }, f, margin, ber, unverifiedCutNote, ctx);
       }
       return null;
     };
@@ -999,7 +701,7 @@
           'Budget changes belong to the midnight read, not the midday one.'
         ],
         rule: 'Day 1 analysis around 11AM; scaling decisions after 12AM'
-      }, f, margin, ber, notes);
+      }, f, margin, ber, notes, ctx);
     }
 
     /* ================= EVENING READ ==================================
@@ -1018,7 +720,7 @@
           : ['Every stage of the funnel is inside benchmark. Nothing to fix on the page tonight.',
              `Page speed ${f.pageLoad.value}% · Offer ${f.offer.value}% · Intent ${f.intent.value}% · Completion ${f.completion.value}%`],
         rule: 'Evening check = funnel quality. No budget changes.'
-      }, f, margin, ber, notes);
+      }, f, margin, ber, notes, ctx);
     }
 
     /* ================= MIDNIGHT READ (after 00:00) ===================
@@ -1026,19 +728,6 @@
        ================================================================= */
     if (profitable) {
       const tier = RULES.scale.tiers.find(t => margin > t.minMargin) || RULES.scale.tiers[RULES.scale.tiers.length - 1];
-
-      /* The look-back cuts both ways. A good day on top of a bad week is the
-         mirror image of a bad day on a good week, and it is the more
-         expensive one to miss: the day says "fine", the budget stays, and the
-         campaign keeps bleeding behind a reassuring number.
-
-         This does NOT move the budget — a profitable day is not grounds for a
-         cut. It warns, loudly, and leaves the decision where it belongs. */
-      const back = trailingRoas(c.history, RULES.descale.lookbackDays);
-      if (back && back.days >= RULES.descale.lookbackMinDays && back.roas < ber) {
-        notes.push(`Careful — the day is green but the week is not. The last ${back.days} closed days pooled are ROAS ${back.roas.toFixed(2)} against break-even ${ber.toFixed(2)}, on ${money(back.spend, ctx.currency)} of spend. Yesterday alone looks profitable. Do not read that as recovery off one day: if the window is still under break-even tomorrow, this is a relaunch candidate, not a scale.`);
-      }
-
       if (ctx.learning && tier.pct > RULES.learning.safeBudgetChangePct) {
         notes.push(`Still in learning. A +${tier.pct}% change counts as a significant edit and restarts it — +${RULES.learning.safeBudgetChangePct}% (${money(c.budget * 1.2, ctx.currency)}) stays under the threshold if you would rather protect the learning it has already done.`);
       } else if (ctx.learning && tier.pct > 0) {
@@ -1050,21 +739,30 @@
           newBudget: c.budget,
           reasons: [
             `ROAS ${c.roas.toFixed(2)} beats break-even ${ber.toFixed(2)}, so it makes money.`,
-            `But profit margin is only ${margin}% — under 15%. Scaling now would eat the margin.`,
+            `But ${marginLabel(ctx).toLowerCase()} is only ${margin}% — under 15%. Scaling now would eat the margin.`,
             'Leave the budget exactly where it is and let it optimise.'
           ],
           rule: 'ROAS > BER and profit margin < 15% → DON\'T CHANGE BUDGET, LET IT RUN'
-        }, f, margin, ber, notes.concat(creativeNote(c)));
+        }, f, margin, ber, notes.concat(creativeNote(c)), ctx);
+      }
+      if (locked) {
+        return lockedScale(c, `+${tier.pct}%`, c.budget * (1 + tier.pct / 100),
+          `ROAS ${c.roas.toFixed(2)} is above break-even ${ber.toFixed(2)} and ${marginLabel(ctx).toLowerCase()} is ${margin}%.`,
+          f, margin, ber, ctx, notes.concat(creativeNote(c)));
+      }
+      if (!proven) {
+        return notYetProven(c, `+${tier.pct}%`, c.budget * (1 + tier.pct / 100),
+          interval, needed, f, margin, ber, ctx, notes.concat(creativeNote(c)));
       }
       return build('SCALE', c, {
         headline: `Scale +${tier.pct}%`,
         newBudget: c.budget * (1 + tier.pct / 100),
         reasons: [
           `ROAS ${c.roas.toFixed(2)} is above break-even ${ber.toFixed(2)}.`,
-          `Profit margin is ${margin}% ${tier.minMargin === 20 ? '(over 20%)' : '(15–20%)'} → increase budget ${tier.pct}%.`
+          `${marginLabel(ctx)} is ${margin}% ${tier.minMargin === 20 ? '(over 20%)' : '(15–20%)'} → increase budget ${tier.pct}%.`
         ],
         rule: `ROAS > BER and profit margin ${tier.minMargin === 20 ? '> 20%' : '= 15-20%'} → +${tier.pct}% BUDGET INCREASE`
-      }, f, margin, ber, notes.concat(creativeNote(c)));
+      }, f, margin, ber, notes.concat(creativeNote(c)), ctx);
     }
 
     // Unprofitable
@@ -1077,7 +775,7 @@
           'Day-1 losers get killed, not descaled.'
         ],
         rule: 'Day 1 at night: ROAS < BER (unprofitable) → KILL CAMPAIGN'
-      }, f, margin, ber, notes);
+      }, f, margin, ber, notes.concat(unverifiedCutNote), ctx);
     }
 
     if (unprofitableStreak >= RULES.descale.killAfterUnprofitableDays && c.descaleCount >= 2) {
@@ -1089,85 +787,83 @@
           'Test new creatives or move to the next product.'
         ],
         rule: 'Unprofitable 2 days in a row after descaling twice → KILL CAMPAIGN and test new creatives'
-      }, f, margin, ber, notes);
+      }, f, margin, ber, notes.concat(unverifiedCutNote), ctx);
     }
 
-    /* ---- THE LOOK-BACK GATE ------------------------------------------
-       The day was unprofitable. Before any money moves, ask the wider
-       window whether that day was the campaign or just the weather. */
-    const window = trailingRoas(c.history, RULES.descale.lookbackDays);
-    /* One closed day is not a window — it is the same day the verdict is
-       already judging, wearing a different hat. Below the minimum, there is
-       no second opinion to appeal to and the engine must say so rather than
-       dress a single day up as a trend. */
-    const trail = window && window.days >= RULES.descale.lookbackMinDays ? window : null;
-
-    /* Sitting on the line. Not profitable, but not far enough under for a
-       40% cut to be the proportionate answer. */
-    const band = ber * (1 - RULES.descale.holdBandPct / 100);
-    if (trail && trail.roas < ber && trail.roas >= band) {
-      const shortBy = round1((1 - trail.roas / ber) * 100);
+    /* Cutting needs a reasonable sample, not proof. Below break-even means
+       money is leaving now, so waiting for statistical certainty is itself
+       expensive — but three orders is not a sample. Zero orders never
+       blocks a cut: zero is conclusive on its own. */
+    if (c.purchases > 0 && c.purchases < RULES.confidence.minOrdersToCut) {
       return build('HOLD', c, {
-        headline: 'On the line — hold and watch',
+        headline: 'Too few orders to cut on',
         newBudget: c.budget,
         reasons: [
-          `The last ${trail.days} closed days pooled are ROAS ${trail.roas.toFixed(2)} against break-even ${ber.toFixed(2)} — short by ${shortBy}%.`,
-          `That is inside the ${RULES.descale.holdBandPct}% band where a day's noise is bigger than the gap. A 40% cut is a large move to make on a difference this small.`,
-          'Leave it. If it is still under tomorrow, the gap will have widened and the cut becomes the right call.'
-        ],
-        rule: `Window within ${RULES.descale.holdBandPct}% of break-even → HOLD, not descale.`
-      }, f, margin, ber, notes.concat(creativeNote(c)));
-    }
-
-    if (trail && trail.roas >= ber) {
-      return build('HOLD', c, {
-        headline: 'Bad day, good week — hold the budget',
-        newBudget: c.budget,
-        reasons: [
-          `Yesterday closed at ROAS ${c.roas.toFixed(2)}, under break-even ${ber.toFixed(2)}.`,
-          `But the last ${trail.days} closed days pooled together are ROAS ${trail.roas.toFixed(2)} on ${money(trail.spend, ctx.currency)} — still above break-even.`,
-          'One day is five or six purchases. That is noise, not a trend. Leave the budget alone and read it again tomorrow.'
-        ],
-        rule: 'Use a 3-day look-back, not a single bad day. Day under BER but window above BER → HOLD, do not descale.'
-      }, f, margin, ber, notes.concat(creativeNote(c)));
+          `ROAS ${c.roas.toFixed(2)} is under break-even ${ber.toFixed(2)}, but it rests on ${c.purchases} order${c.purchases === 1 ? '' : 's'}.`,
+          interval ? `That puts the real figure somewhere between ${interval.lo} and ${interval.hi} — a range wide enough to contain a perfectly healthy campaign.` : '',
+          `Cutting needs ${RULES.confidence.minOrdersToCut} orders in the window. Leave it, or widen the window to three days and look again.`
+        ].filter(Boolean),
+        rule: `A descale needs at least ${RULES.confidence.minOrdersToCut} orders behind it`
+      }, f, margin, ber, notes, ctx);
     }
 
     const superBad = c.roas < ber * RULES.descale.superUnprofitableRatio && unprofitableStreak >= 2;
     const pct = superBad ? RULES.descale.hardDescalePct : RULES.descale.pct;
-
-    /* ---- THE BUDGET FLOOR --------------------------------------------
-       How far the cut is allowed to go. Below roughly €25 per live ad set
-       the ad sets stop collecting enough conversions to stay optimised, so
-       a 40% cut on a loaded campaign can do more damage than the bad day
-       it is answering. */
-    const liveAdsets = Math.max(1, c.adsetCount || 1);
-    const floor = liveAdsets * RULES.budgetFloor.perAdset;
-    const wanted = c.budget * (1 - pct / 100);
-    const clamped = wanted < floor && c.budget > floor;
-    const newBudget = clamped ? floor : wanted;
-
-    if (c.budget >= RULES.budgetFloor.loadedBudget && liveAdsets > 1) {
-      notes.push(`This campaign is carrying ${money(c.budget, ctx.currency)}/day across ${liveAdsets} ad sets. Cutting ${pct}% starves all of them at once. Trim or consolidate the weakest ad set FIRST, then take the budget down — otherwise delivery destabilises and tomorrow's number tells you nothing.`);
-    }
-    if (clamped) {
-      notes.push(`A straight −${pct}% would land on ${money(wanted, ctx.currency)}, under the ${money(floor, ctx.currency)} floor for ${liveAdsets} live ad set${liveAdsets > 1 ? 's' : ''} (${money(RULES.budgetFloor.perAdset, ctx.currency)} each). Held at the floor instead. If it needs to go lower than this, cut ad sets, not the budget.`);
-    }
-
     return build('DESCALE', c, {
-      headline: clamped ? `Descale to the floor — ${money(newBudget, ctx.currency)}` : `Descale −${pct}%`,
-      newBudget,
+      headline: `Descale −${pct}%`,
+      newBudget: c.budget * (1 - pct / 100),
       reasons: [
         `ROAS ${c.roas.toFixed(2)} is below break-even ${ber.toFixed(2)} (margin ${margin}%).`,
-        trail
-          ? `The last ${trail.days} closed days pooled are ROAS ${trail.roas.toFixed(2)} on ${money(trail.spend, ctx.currency)} — also under break-even, so this is the campaign, not one bad day.`
-          : 'Not enough closed history for a look-back window yet, so the day stands on its own.',
         superBad
           ? 'Deeply unprofitable and never consistent — cut harder than the standard 40%.'
-          : `Cut ${pct}% and let it re-optimise tomorrow.`,
+          : 'Cut 40% and let it re-optimise tomorrow.',
         unprofitableStreak >= 1 ? `Unprofitable ${unprofitableStreak} day(s) running. One more and it dies.` : ''
       ].filter(Boolean),
-      rule: 'Day AND 3-day window both under BER → descale. The window is what makes the cut, not the day.'
-    }, f, margin, ber, notes);
+      rule: 'ROAS < BER (unprofitable) → DESCALE WITH 40%, let it optimize the next day'
+    }, f, margin, ber, notes.concat(unverifiedCutNote), ctx);
+  }
+
+  /* A scale the ladder earned but the revenue cannot justify. Shown as a HOLD
+     so no money moves, but the card still says what it would have been — the
+     number is the whole point, because it is what you get back by fixing
+     tracking. */
+  function lockedScale(c, intended, wouldBe, because, f, margin, ber, ctx, notes) {
+    return build('HOLD', c, {
+      headline: 'Scaling locked — revenue unverified',
+      newBudget: c.budget,
+      reasons: [
+        because,
+        `On these numbers the ladder says ${intended} (${money(c.budget, ctx.currency)} → ${money(wouldBe, ctx.currency)}).`,
+        UNVERIFIED_WHY,
+        'Confirm this campaign against the Shopify order book, then the scale unlocks. Killing and descaling stay available — those do not need exact revenue.'
+      ],
+      rule: 'Scaling requires Shopify-verified revenue. Meta alone can kill or descale, never scale.'
+    }, f, margin, ber, (notes || []).concat([
+      `Held at ${money(c.budget, ctx.currency)}. The locked move was ${intended}.`
+    ]), ctx);
+  }
+
+  /* The ladder earned a scale, the revenue is verified, and the sample
+     still cannot tell this campaign apart from break-even. Holding is the
+     answer, but a silent hold teaches nothing — so the card says what the
+     move would have been and how much more data would settle it. */
+  function notYetProven(c, intended, wouldBe, interval, needed, f, margin, ber, ctx, notes) {
+    const short = needed && interval ? Math.max(0, needed - interval.orders) : null;
+    return build('HOLD', c, {
+      headline: 'Not proven yet — hold',
+      newBudget: c.budget,
+      reasons: [
+        `ROAS ${c.roas.toFixed(2)} beats break-even ${ber.toFixed(2)} on the face of it, and the ladder would say ${intended} (${money(c.budget, ctx.currency)} → ${money(wouldBe, ctx.currency)}).`,
+        interval
+          ? `But it rests on ${interval.orders} order${interval.orders === 1 ? '' : 's'}, so the real figure is somewhere between ${interval.lo} and ${interval.hi} — and that range still crosses break-even.`
+          : 'There are no orders behind this figure yet.',
+        short !== null && short > 0
+          ? `About ${needed} orders in the window would settle it; this has ${interval.orders}, so roughly ${short} more at the current rate.`
+          : 'Give it more volume in the window before adding budget.',
+        'Adding budget now is a bet on noise. The campaign is not losing money — leave it to accumulate evidence.'
+      ].filter(Boolean),
+      rule: 'A scale requires the low end of the ROAS range to clear break-even'
+    }, f, margin, ber, notes, ctx);
   }
 
   function creativeNote(c) {
@@ -1320,6 +1016,30 @@
   }
 
   /* ------------------------------------------------------------------
+     7b. WINDOW AGREEMENT
+     ------------------------------------------------------------------
+     A single closed day is a noisy sample, and a multi-day pool hides a
+     campaign that just turned. Neither is wrong, but quietly picking
+     whichever one supports the answer you already wanted is. This returns
+     the two verdicts side by side so the card can say when they disagree.
+
+     `pooled` is the same campaign shape, aggregated over several days.
+     ------------------------------------------------------------------ */
+  function windowAgreement(campaign, pooled, ctx) {
+    if (!pooled || !(num(pooled.spend) > 0)) return null;
+    const a = verdict(campaign, ctx);
+    const b = verdict({ ...campaign, ...pooled, daysLive: Math.max(2, num(pooled.days) || 2) }, ctx);
+    const direction = v => (['SCALE', 'SURF'].includes(v.code) ? 'up'
+      : ['KILL', 'DESCALE'].includes(v.code) ? 'down' : 'flat');
+    return {
+      day: { code: a.code, headline: a.headline, roas: round2(num(campaign.roas)) },
+      pooled: { code: b.code, headline: b.headline, roas: round2(num(pooled.roas) || (num(pooled.revenue) / num(pooled.spend))), days: num(pooled.days) || null },
+      agree: direction(a) === direction(b),
+      conflict: direction(a) !== direction(b) ? { day: direction(a), pooled: direction(b) } : null
+    };
+  }
+
+  /* ------------------------------------------------------------------
      8. HELPERS
      ------------------------------------------------------------------ */
   function countUnprofitableStreak(history, ber) {
@@ -1332,97 +1052,6 @@
       else break;
     }
     return streak;
-  }
-
-  /* Trailing ROAS over the last `days` CLOSED days with spend.
-
-     Pooled, never an average of daily ratios. A €12 day and a €300 day are
-     not two equal opinions: averaging their ROAS lets the small day shout.
-     Sum the money, then divide — that is the ROAS he actually got.
-
-     Zero-spend days are skipped rather than counted as zeros; a day the
-     campaign was off is not evidence about the creative or the offer.
-     Returns null when there is not enough history to say anything. */
-  function trailingRoas(history, days) {
-    if (!Array.isArray(history) || !(days > 0)) return null;
-
-    const picked = [];
-    for (let i = history.length - 1; i >= 0 && picked.length < days; i--) {
-      if (num(history[i].spend) > 0) picked.push(history[i]);
-    }
-    if (!picked.length) return null;
-
-    /* ---- THE OUTLIER CAP ------------------------------------------------
-       Pooling is right: sum the money, then divide, so a €12 day cannot
-       shout as loudly as a €300 one. But it has a mirror failure nobody
-       hit until a €3,000 budget went in by mistake.
-
-       On 11 Oct the account spent €4,184 against a normal €1,100. That one
-       day was 65% of the three-day window, so the "3-day look-back" was
-       really one day wearing a trenchcoat, and it marked four profitable
-       campaigns for a 40% cut.
-
-       A day far outside the normal range is not a bigger version of the
-       same experiment — it is a different one. Four times the budget buys
-       much colder audience, so its ROAS describes that day's reach, not the
-       offer. It still gets a vote; it does not get to outvote the week.
-
-       So each day's weight is capped at a multiple of the MEDIAN day. The
-       median is used rather than the mean because the outlier would drag a
-       mean upwards and quietly raise its own ceiling. Revenue and orders
-       scale by the same factor, so the day keeps its ROAS and its basket
-       size — only its loudness is reduced. */
-    const med = median(picked.map(d => num(d.spend)));
-    const cap = med > 0 ? med * RULES.descale.dayWeightCap : 0;
-
-    let spend = 0, revenue = 0, purchases = 0, rawSpend = 0, rawRevenue = 0, capped = 0;
-    for (const d of picked) {
-      const s = num(d.spend);
-      const w = (cap > 0 && s > cap) ? cap / s : 1;
-      if (w < 1) capped++;
-      spend += s * w;
-      revenue += num(d.revenue) * w;
-      // Orders ride along so a caller can work out a basket size over the
-      // same window. Older history rows may not carry them; those sum to 0,
-      // and a caller that needs orders checks for 0 rather than assuming.
-      purchases += num(d.purchases) * w;
-      rawSpend += s;
-      rawRevenue += num(d.revenue);
-    }
-    if (spend <= 0) return null;
-
-    return {
-      roas: revenue / spend,
-      spend, revenue, purchases, days: picked.length,
-      // What it would have said without the cap, and how many days were
-      // turned down. A verdict that hinges on this should be able to say so.
-      cappedDays: capped,
-      rawRoas: rawSpend > 0 ? rawRevenue / rawSpend : 0,
-      rawSpend
-    };
-  }
-
-  /* Did this campaign actually get scaled up over the weekend?
-
-     Read from the spend, because a surf applied by hand in Ads Manager
-     never reaches the action log. The most recent closed days are compared
-     against the quieter run before them, both as medians so one heavy day
-     on either side cannot decide it.
-
-     A surf is a multiplication — ×5 or ×10 in the sheet — so the bar is set
-     well above ordinary daily drift: nothing under half as much again
-     counts, and a campaign simply having a busy Saturday does not. */
-  function weekendScaleUp(history) {
-    if (!Array.isArray(history)) return false;
-    const spends = history.map(d => num(d.spend)).filter(s => s > 0);
-    if (spends.length < RULES.weekend.scaleUpMinDays) return false;
-    const recent = spends.slice(-RULES.weekend.scaleUpRecentDays);
-    const before = spends.slice(-(RULES.weekend.scaleUpRecentDays + RULES.weekend.scaleUpBaseDays),
-                                -RULES.weekend.scaleUpRecentDays);
-    if (!recent.length || !before.length) return false;
-    const base = median(before);
-    if (base <= 0) return false;
-    return median(recent) / base >= RULES.weekend.scaleUpRatio;
   }
 
   function countProfitableStreak(history, ber) {
@@ -1451,19 +1080,11 @@
       roas: num(c.roas) || (spend > 0 ? revenue / spend : 0),
       purchases: num(c.purchases),
       frequency: num(c.frequency),
-      // Fatigue reads these; they must survive normalization.
-      ctr: num(c.ctr),
-      cpm: num(c.cpm),
-      // Per-ad rows, so fatigue is judged on the ads and not on their blend.
-      adStats: c.adStats || [],
       clicks: num(c.clicks),
       lpv: num(c.lpv),
       atc: num(c.atc),
       ic: num(c.ic),
       history: c.history || [],
-      // How many ad sets the budget has to feed — the budget floor is per ad
-      // set, so one number cannot answer it.
-      adsetCount: num(c.adsetCount),
       descaleCount: num(c.descaleCount),
       profitableStreak: num(c.profitableStreak),
       surfedRecently: !!c.surfedRecently,
@@ -1477,12 +1098,12 @@
     SCALE: 'success', SURF: 'success', PROVE: 'success',
     HOLD: 'neutral', MONITOR: 'neutral', DIAGNOSE: 'neutral', NEEDS_SETUP: 'neutral',
     DESCALE: 'warning', PRICE_DROP: 'warning',
-    KILL: 'danger',
-    PAUSED: 'neutral'
+    KILL: 'danger'
   };
 
-  function build(code, c, spec, f, margin, ber, notes) {
+  function build(code, c, spec, f, margin, ber, notes, ctx) {
     const newBudget = spec.newBudget === undefined ? null : round2(spec.newBudget);
+    const source = (ctx && ctx.revenueSource) || null;
     return {
       code,
       tone: TONE[code] || 'neutral',
@@ -1493,6 +1114,22 @@
       budgetFrom: c.budget || null,
       budgetTo: newBudget,
       budgetDelta: newBudget !== null && c.budget ? round2(newBudget - c.budget) : null,
+      revenue: {
+        source,
+        verified: source === 'shopify',
+        scalingLocked: source === 'meta',
+        marginMeans: marginLabel(ctx || {})
+      },
+      /* What this verdict actually knows, so the card can show it. */
+      confidence: (() => {
+        const iv = roasInterval(c.roas, c.purchases, (ctx && ctx.confidence && ctx.confidence.z) || RULES.confidence.z);
+        return {
+          orders: c.purchases,
+          interval: iv,
+          proven: provenAbove(iv, ber),
+          ordersNeeded: ordersNeeded(c.roas, ber, (ctx && ctx.confidence && ctx.confidence.z) || RULES.confidence.z)
+        };
+      })(),
       metrics: {
         spend: round2(c.spend),
         revenue: round2(c.revenue),
@@ -1508,15 +1145,7 @@
           ? round2((c.revenue / c.purchases) * (ber > 0 ? 1 / ber : 0))
           : null,
         pacingPct: c.budget > 0 ? Math.round((c.spend / c.budget) * 100) : null,
-        learning: c.learning,
-        // Profit and headroom in euros — what ROAS actually means in the bank.
-        aov: cpaPicture(c, ber > 0 ? 1 / ber : 0).aov,
-        headroomPct: cpaPicture(c, ber > 0 ? 1 / ber : 0).headroomPct,
-        profit: cpaPicture(c, ber > 0 ? 1 / ber : 0).profit,
-        pacing: dayPacing(c, _ctx),
-        broken: brokenStage(c),
-        // Whether the creative still has life in it — read before ROAS moves.
-        creative: creativeHealth(c)
+        learning: c.learning
       },
       funnel: f
     };
@@ -1532,16 +1161,14 @@
   }
 
   function num(v) { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; }
-  function numLoose(v) { return num(String(v).replace(',', '.').replace(/[^\d.\-]/g, '')); }
   function round1(v) { return Math.round(v * 10) / 10; }
   function round2(v) { return Math.round(v * 100) / 100; }
 
   return {
-    RULES, economics, netMarginPct, grossMarginFromBer, parseCampaignName,
-    clockIn, detectWindow, dayContext, funnel, biggestLeak,
-    berAfterRefunds, netOfRefunds, clampRate,
-    cpaPicture, dayPacing, brokenStage, creativeHealth, adFatigue, median, angleCoverage, ANGLES,
-    verdict, guardrails, deliveryAlarms, productLabel,
-    countUnprofitableStreak, countProfitableStreak, trailingRoas, weekendScaleUp, money
+    RULES, economics, netMarginPct, grossMarginFromBer, parseCampaignName, cmCode,
+    clockIn, detectWindow, dayContext, funnel, biggestLeak, verdict, guardrails, deliveryAlarms, productLabel,
+    countUnprofitableStreak, countProfitableStreak, money,
+    revenueVerified, scalingLocked, marginLabel, windowAgreement,
+    roasInterval, ordersNeeded, provenAbove, weekendLift, surfPctFromLift
   };
 });
