@@ -511,15 +511,34 @@ function acctKey(base, id) { return `${base}::${id || activeAccount().id}`; }
    so a downgrade still finds its data where it left it. */
 function migrateAccountState() {
   const first = accountRegistry()[0];
-  if (!first || LS.get('cgo_scoped_v1', '')) return;
+  if (!first) return;
+  /* Re-run whenever the first account still has nothing but a global value is
+     sitting there — a half-finished earlier migration must not be permanent. */
+  const done = LS.get('cgo_scoped_v1', '');
+  const needsRepair = ACCOUNT_SCOPED.some(base =>
+    !isEmptyish(LS.get(base, '')) && isEmptyish(LS.get(acctKey(base, first.id), '')));
+  if (done && !needsRepair) return;
   ACCOUNT_SCOPED.forEach(base => {
     const legacy = LS.get(base, '');
-    if (legacy && !LS.get(acctKey(base, first.id), '')) LS.set(acctKey(base, first.id), legacy);
+    if (!isEmptyish(legacy) && isEmptyish(LS.get(acctKey(base, first.id), '')))
+      LS.set(acctKey(base, first.id), legacy);
   });
   LS.set('cgo_scoped_v1', '1');
 }
 
-const acctJson = (base, dflt) => LS.json(acctKey(base), dflt);
+/* An empty object is not data. Older builds wrote "{}" into some of these
+   keys, and treating that as content is how a configured account came back
+   reading "set your unit economics". */
+const isEmptyish = (raw) => {
+  if (!raw) return true;
+  try { const v = JSON.parse(raw); return !v || (typeof v === 'object' && !Object.keys(v).length); }
+  catch (e) { return false; }
+};
+
+const acctJson = (base, dflt) => {
+  const raw = LS.get(acctKey(base), '');
+  return isEmptyish(raw) ? dflt : LS.json(acctKey(base), dflt);
+};
 const acctSet = (base, value) => LS.set(acctKey(base), value);
 
 /* Delegated, because the tabs are re-rendered whenever the registry or the
@@ -2488,6 +2507,22 @@ function injectStyles() {
   .funnel-status-badge.impossible { background: rgba(245,158,11,.15);
       color: var(--color-warning, #f59e0b); border: 1px solid rgba(245,158,11,.35); }
   .note-impossible { color: var(--color-warning, #f59e0b); }
+
+  /* style.css lays the KPI tiles out with auto-fit at 180px, which wraps the
+     eighth onto a row of its own. The bar is read at a glance, so on a wide
+     screen it is one row; narrower screens still wrap sensibly. */
+  @media (min-width: 1180px) {
+    .kpi-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; }
+    .kpi-card { padding: 14px 12px; }
+    .kpi-label { font-size: 10.5px; letter-spacing: .03em; }
+    .kpi-value { font-size: 22px; }
+    .kpi-trend { font-size: 11px; }
+  }
+  @media (min-width: 1500px) {
+    .kpi-grid { gap: 16px; }
+    .kpi-card { padding: 18px 16px; }
+    .kpi-value { font-size: 26px; }
+  }
 
   /* Account tabs — style.css predates them, so they are defined here. */
   .account-tab-bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .9rem;
