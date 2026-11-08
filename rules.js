@@ -442,6 +442,13 @@
   }
 
   function grade(value, band) {
+    /* A stage cannot convert more than everyone who reached the stage above
+       it. Over 100% the two event counts are not the same people or the same
+       moment — a view firing twice, organic traffic landing mid-funnel, an
+       order placed on a second device. Grading it 'healthy' is how a broken
+       pixel reads as a working funnel, and grading it 'alert' invents a leak
+       that is not there. Neither: the ratio carries no information. */
+    if (value > 100) return { status: 'impossible', target: band.good };
     if (value >= band.good) return { status: 'healthy', target: band.good };
     if (value >= band.poor) return { status: 'warning', target: band.good };
     return { status: 'alert', target: band.good };
@@ -712,13 +719,27 @@
       const d1 = dayOne();
       if (d1) return d1;
       const leak = biggestLeak(f);
+      const line = `Page speed ${f.pageLoad.value}% · Offer ${f.offer.value}% · Intent ${f.intent.value}% · Completion ${f.completion.value}%`;
+      /* A stage reading over 100% is not a clean funnel — it is a funnel you
+         cannot read. Saying "clean" there sends him away satisfied from a
+         broken pixel. */
+      const broken = ['pageLoad', 'offer', 'intent', 'completion']
+        .filter(k => f[k] && f[k].status === 'impossible');
+      if (!leak && broken.length) {
+        return build('DIAGNOSE', c, {
+          headline: 'Funnel cannot be read',
+          reasons: [
+            `${broken.map(stageLabel).join(' and ')} reads over 100%, which is impossible — those events are not counting the same people. Fix the tracking before judging the page.`,
+            line
+          ],
+          rule: 'Evening check = funnel quality. No budget changes.'
+        }, f, margin, ber, notes, ctx);
+      }
       return build('DIAGNOSE', c, {
         headline: leak ? `Fix: ${stageLabel(leak.stage)}` : 'Funnel is clean',
         reasons: leak
-          ? [leak.message,
-             `Page speed ${f.pageLoad.value}% · Offer ${f.offer.value}% · Intent ${f.intent.value}% · Completion ${f.completion.value}%`]
-          : ['Every stage of the funnel is inside benchmark. Nothing to fix on the page tonight.',
-             `Page speed ${f.pageLoad.value}% · Offer ${f.offer.value}% · Intent ${f.intent.value}% · Completion ${f.completion.value}%`],
+          ? [leak.message, line]
+          : ['Every stage of the funnel is inside benchmark. Nothing to fix on the page tonight.', line],
         rule: 'Evening check = funnel quality. No budget changes.'
       }, f, margin, ber, notes, ctx);
     }

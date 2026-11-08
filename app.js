@@ -31,6 +31,7 @@ const State = {
   truth: null,          // Worker payload for the judged window
   truthStatus: null,    // { state: 'off'|'ok'|'error', message }
   truthMatch: null,     // output of Truth.match
+  truthSyncedAt: 0,     // when the Shopify pull last succeeded
   atcBroken: false      // the ATC event does not fire on these funnels
 };
 
@@ -609,6 +610,7 @@ async function syncTruth(preset) {
   State.truthRange = { since: res.since, until: res.until };
   State.truthMatch = TR.match(State.campaigns, res.data.byProduct || {}, LS.json('cgo_product_map', {}));
   State.truthStatus = { state: 'ok', message: null };
+  State.truthSyncedAt = Date.now();
 }
 
 /* --------------------------------------------------- API → app model ----- */
@@ -1276,6 +1278,78 @@ function truthPanelHost() {
   return el;
 }
 
+/* ========================================================================== *
+ *  DATA STRIP — what window am I looking at, and how old is it
+ * ========================================================================== *
+ * Every number below this line is only meaningful against a date and a clock.
+ * "Today" in a Berlin ad account is not today in Cairo, and a Today figure is
+ * a part-day that will keep growing — scaling off it as though the day were
+ * finished is the single easiest way to act on noise. The strip says the
+ * dates out loud, marks a running day as running, and shows how stale each
+ * source is so a silently failed sync cannot pass for fresh data.
+ * ========================================================================== */
+function dataStripHost() {
+  let el = document.getElementById('data-strip');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'data-strip';
+    const kpis = document.querySelector('.kpi-grid');
+    if (kpis && kpis.parentNode) kpis.parentNode.insertBefore(el, kpis);
+    else document.body.insertBefore(el, document.body.firstChild);
+  }
+  return el;
+}
+
+function ageText(ts) {
+  if (!ts) return null;
+  const mins = Math.floor((Date.now() - ts) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + ' min ago';
+  const h = Math.floor(mins / 60);
+  return h + (h === 1 ? ' hour ago' : ' hours ago');
+}
+
+/* The Berlin dates the chosen preset actually covers. Derived from the same
+   helper the Shopify pull uses, so the two can never describe different days. */
+function windowDates() {
+  const tz = State.accountTz || 'Europe/Berlin';
+  const preset = LS.get('meta_date_preset', 'today');
+  try {
+    const r = TR.rangeForPreset(preset, tz);
+    if (!r) return null;
+    const first = r.since.toISOString().slice(0, 10);
+    const last = new Date(r.until.getTime() - 1).toISOString().slice(0, 10);
+    return { preset, tz, first, last, single: first === last };
+  } catch (e) { return null; }
+}
+
+function renderDataStrip() {
+  const host = dataStripHost();
+  const w = windowDates();
+  if (!w) { host.innerHTML = ''; return; }
+
+  const running = w.preset === 'today' && !dayIsOver();
+  const metaAge = ageText(State.lastSync);
+  const shopAge = ageText(State.truthSyncedAt);
+  const stale = State.lastSync && Date.now() - State.lastSync > 30 * 60 * 1000;
+
+  const label = w.single ? w.first : `${w.first} → ${w.last}`;
+  const srcName = State.source === 'api' ? 'Meta API' : State.source === 'csv' ? 'CSV' : 'demo data';
+
+  host.innerHTML = `
+    <div class="dstrip${running ? ' running' : ''}">
+      <span class="dstrip-dates">📅 <strong>${esc(label)}</strong>
+        <span class="dstrip-tz">${esc(w.tz)}</span></span>
+      ${running
+        ? `<span class="dstrip-flag">⏳ Day still running — this is a part-day. Budget moves wait for the midnight read.</span>`
+        : `<span class="dstrip-flag done">✓ Complete day</span>`}
+      <span class="dstrip-src">
+        ${srcName}${metaAge ? ' · synced ' + metaAge : ' · not synced'}${stale ? ' <em>(stale)</em>' : ''}
+        · Shopify ${shopAge ? 'synced ' + shopAge : 'not connected'}
+      </span>
+    </div>`;
+}
+
 function renderTruthPanel() {
   const host = truthPanelHost();
   const st = State.truthStatus;
@@ -1578,14 +1652,41 @@ function renderKpis() {
   document.getElementById('kpi-total-spend').innerText = fmtMoney(t.spend, 0);
   document.getElementById('kpi-spend-sub').innerText = `${State.campaigns.length} campaign${State.campaigns.length === 1 ? '' : 's'}`;
   document.getElementById('kpi-revenue').innerText = fmtMoney(revenue, 0);
-  const profitEl = document.getElementById('kpi-profit-sub');
-  profitEl.innerText = contribution === null ? 'Contribution —'
-    : `Contribution ${fmtMoney(contribution, 0)}${verified ? '' : ' (Meta, unverified)'}`;
-  profitEl.className = 'kpi-trend ' + (contribution === null ? 'neutral' : contribution >= 0 ? 'positive' : 'negative');
+  const revSub = document.getElementById('kpi-revenue-sub');
+  revSub.innerText = verified ? 'Shopify, net of refunds' : 'Meta-attributed, unverified';
+  revSub.className = 'kpi-trend ' + (verified ? 'positive' : 'neutral');
+
+  /* Profit is the number he actually takes home, so it gets its own tile
+     rather than hiding as a sub-line under revenue. It is null whenever the
+     unit economics are unset — showing €0 there would read as break-even. */
+  const profitEl = document.getElementById('kpi-profit');
+  const profitSub = document.getElementById('kpi-profit-sub');
+  profitEl.innerText = contribution === null ? '—' : fmtMoney(contribution, 0);
+  profitEl.className = 'kpi-value' +
+    (contribution === null ? '' : contribution >= 0 ? ' pos' : ' neg');
+  profitSub.innerText = contribution === null ? 'Set your unit economics'
+    : verified ? `At ${(gm * 100).toFixed(0)}% margin, Shopify revenue`
+               : `At ${(gm * 100).toFixed(0)}% margin, Meta revenue`;
+  profitSub.className = 'kpi-trend ' + (contribution === null ? 'neutral'
+    : contribution >= 0 ? 'positive' : 'negative');
 
   const orders = verified ? State.truth.orders : t.purchases;
   document.getElementById('kpi-total-purchases').innerText = fmtInt(orders);
-  document.getElementById('kpi-cpa-sub').innerText = orders ? `CPA ${fmtMoney(t.spend / orders)}` : 'CPA —';
+  document.getElementById('kpi-orders-sub').innerText = verified ? 'Shopify orders' : 'Meta-reported';
+
+  const cpaEl = document.getElementById('kpi-cpa');
+  const cpaSub = document.getElementById('kpi-cpa-sub');
+  cpaEl.innerText = orders ? fmtMoney(t.spend / orders) : '—';
+  /* A CPA is only good or bad against what an order is worth, so say it. */
+  if (orders && revenue) {
+    const aov = revenue / orders;
+    cpaSub.innerText = `AOV ${fmtMoney(aov)}`;
+    const cpa = t.spend / orders;
+    cpaSub.className = 'kpi-trend ' + (gm && cpa < aov * gm ? 'positive' : gm ? 'negative' : 'neutral');
+  } else {
+    cpaSub.innerText = 'Spend ÷ orders';
+    cpaSub.className = 'kpi-trend neutral';
+  }
 
   const imps = t.impressions || State.ads.reduce((s, a) => s + (parseInt(a['Impressions']) || 0), 0);
   const clicks = t.clicks || State.ads.reduce((s, a) => s + (parseInt(a['Link Clicks']) || 0), 0);
@@ -1598,24 +1699,28 @@ function renderKpis() {
 }
 
 const FUNNEL_NOTES = {
+    impossible: 'More page views than clicks. The two counts are not the same people — usually direct or organic traffic landing on the page, or a view that fires twice. Nothing can be concluded from the ratio until that is settled.',
   pageLoad: {
     healthy: 'Clicks are reaching the page. Nothing to fix here.',
     warning: 'Some clicks never load the page. Compress hero images and cut third-party scripts.',
     alert: 'Most clicks never see the page. This is a speed problem, and no budget change fixes it.',
     untracked: 'Not measured. Meta is returning no landing-page-view events, so this ratio cannot be computed. Fire the LandingPageView event in Funnelish.'
   },
+    impossible: 'More carts than page views. The counts are measuring different people or different moments, so this says nothing about the offer. Check the events in Funnelish before changing price or creative.',
   offer: {
     healthy: 'People land and add to cart. The offer is working.',
     warning: 'Add-to-cart is soft. Test the price, the hero image and the first screen.',
     alert: 'They look and leave. Price or first screen is wrong — creative is not the problem.',
     untracked: 'Not measured. The add-to-cart event does not fire on these funnels, so a 0% here means nothing about the offer.'
   },
+    impossible: 'More checkouts than carts. Checkout is being reached without an add-to-cart event, so this ratio has no denominator you can trust.',
   intent: {
     healthy: 'Carts move into checkout cleanly.',
     warning: 'Some carts stall. Show shipping cost earlier so it is not a surprise.',
     alert: 'Carts are not becoming checkouts. Almost always an unexpected shipping cost.',
     untracked: 'Not measured. Without add-to-cart there is no denominator for this ratio.'
   },
+    impossible: 'More purchases than checkouts. Orders are arriving through a path that never fires initiate-checkout — a saved cart, a second device, or a direct link. The percentage is an artefact, not a conversion rate.',
   completion: {
     healthy: 'Checkouts finish. Payment is not blocking anyone.',
     warning: 'Some checkouts drop. Check the mobile layout and trust badges.',
@@ -1651,6 +1756,22 @@ function renderFunnel() {
       badge.innerText = 'Not tracked';
       note.className = 'funnel-diagnostic-note note-untracked';
       note.innerText = FUNNEL_NOTES[key].untracked;
+      return;
+    }
+
+    /* A stage cannot convert more than 100% of the stage above it. When it
+       reads over 100 the two event counts are not covering the same people or
+       the same moment, and every diagnosis drawn from the ratio is worthless.
+       Velmira showed 166.7% checkout completion and the dashboard still called
+       it a weak offer. Say "can't tell" rather than invent a cause. */
+    if (d.value > 100) {
+      bar.style.width = '100%';
+      bar.className = 'funnel-bar impossible';
+      text.innerText = d.value + '%';
+      badge.className = 'funnel-status-badge impossible';
+      badge.innerText = "Can't tell";
+      note.className = 'funnel-diagnostic-note note-impossible';
+      note.innerText = FUNNEL_NOTES[key].impossible;
       return;
     }
 
@@ -2120,6 +2241,37 @@ function injectStyles() {
   const s = document.createElement('style');
   s.id = 'truth-styles';
   s.textContent = `
+  /* Profit and cost-per-purchase are their own tiles now, so they need the
+     accent and the sign colouring that style.css only defines for the two
+     tiles that existed before. */
+  .kpi-card.accent-green { border-left: 4px solid var(--color-success, #10b981); }
+  .kpi-value.pos { color: var(--color-success, #10b981); }
+  .kpi-value.neg { color: var(--color-danger, #ef4444); }
+
+  /* A funnel stage reading over 100% is neither good nor bad — it is
+     unreadable. Amber-striped so it cannot be mistaken for either. */
+  .funnel-bar.impossible { background: repeating-linear-gradient(45deg,
+      var(--color-warning, #f59e0b), var(--color-warning, #f59e0b) 6px,
+      transparent 6px, transparent 12px); opacity: .75; }
+  .funnel-status-badge.impossible { background: rgba(245,158,11,.15);
+      color: var(--color-warning, #f59e0b); border: 1px solid rgba(245,158,11,.35); }
+  .note-impossible { color: var(--color-warning, #f59e0b); }
+
+  /* Data strip */
+  #data-strip { margin: 0 0 .85rem; }
+  .dstrip { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1rem;
+    padding: .6rem .9rem; border-radius: 10px; font-size: 13px;
+    border: 1px solid var(--color-border, rgba(255,255,255,.1));
+    background: var(--color-surface, rgba(255,255,255,.03)); }
+  .dstrip.running { border-left: 4px solid var(--color-warning, #f59e0b); }
+  .dstrip-dates strong { font-variant-numeric: tabular-nums; }
+  .dstrip-tz { opacity: .6; margin-left: .35rem; font-size: 12px; }
+  .dstrip-flag { color: var(--color-warning, #f59e0b); }
+  .dstrip-flag.done { color: var(--color-success, #10b981); }
+  .dstrip-src { margin-left: auto; opacity: .7; font-size: 12px; }
+  .dstrip-src em { color: var(--color-danger, #ef4444); font-style: normal; }
+  @media (max-width: 760px) { .dstrip-src { margin-left: 0; } }
+
   #truth-panel { margin: 0 0 1rem; }
   .truth-card { border-radius: 12px; padding: 1rem 1.15rem; border: 1px solid var(--color-border, rgba(255,255,255,.1));
     background: var(--color-surface, rgba(255,255,255,.03)); }
@@ -2241,6 +2393,7 @@ function injectStyles() {
 function renderAll() {
   computeVerdicts();
   renderCommandBar();
+  renderDataStrip();
   renderTruthPanel();
   renderVerdicts();
   renderCreativeDesk();

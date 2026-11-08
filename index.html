@@ -178,6 +178,50 @@
     </div>
   </div>
 
+  <!-- ======================= ACCOUNT KPIs ======================= -->
+  <div class="kpi-grid">
+    <div class="card kpi-card accent-purple">
+      <span class="kpi-label">Account ROAS</span>
+      <span class="kpi-value" id="kpi-roas">0.00</span>
+      <span class="kpi-trend neutral" id="kpi-roas-sub">vs BER —</span>
+    </div>
+    <div class="card kpi-card">
+      <span class="kpi-label">Spend</span>
+      <span class="kpi-value" id="kpi-total-spend">—</span>
+      <span class="kpi-trend neutral" id="kpi-spend-sub">All campaigns</span>
+    </div>
+    <div class="card kpi-card">
+      <span class="kpi-label">Revenue</span>
+      <span class="kpi-value" id="kpi-revenue">—</span>
+      <span class="kpi-trend neutral" id="kpi-revenue-sub">Source —</span>
+    </div>
+    <div class="card kpi-card accent-green">
+      <span class="kpi-label">Profit</span>
+      <span class="kpi-value" id="kpi-profit">—</span>
+      <span class="kpi-trend neutral" id="kpi-profit-sub">Contribution after spend</span>
+    </div>
+    <div class="card kpi-card">
+      <span class="kpi-label">Cost per purchase</span>
+      <span class="kpi-value" id="kpi-cpa">—</span>
+      <span class="kpi-trend neutral" id="kpi-cpa-sub">Spend ÷ orders</span>
+    </div>
+    <div class="card kpi-card">
+      <span class="kpi-label">Orders</span>
+      <span class="kpi-value" id="kpi-total-purchases">0</span>
+      <span class="kpi-trend neutral" id="kpi-orders-sub">—</span>
+    </div>
+    <div class="card kpi-card">
+      <span class="kpi-label">Link CTR</span>
+      <span class="kpi-value" id="kpi-ctr">0.00%</span>
+      <span class="kpi-trend neutral">Benchmark &gt; 2%</span>
+    </div>
+    <div class="card kpi-card accent-indigo">
+      <span class="kpi-label">Video Hook Rate</span>
+      <span class="kpi-value" id="kpi-hook-rate">0.0%</span>
+      <span class="kpi-trend neutral">Benchmark &gt; 25%</span>
+    </div>
+  </div>
+
   <!-- ======================= VERDICTS ======================= -->
   <section class="section-block">
     <h2 class="section-title">⚡ Campaign Verdicts</h2>
@@ -200,40 +244,6 @@
       the per-campaign level is where Meta's attribution goes wrong, so judge money on the cards above.
     </p>
     <div class="chart-container h240"><canvas id="trendChart"></canvas></div>
-  </div>
-
-  <!-- ======================= ACCOUNT KPIs ======================= -->
-  <div class="kpi-grid">
-    <div class="card kpi-card accent-purple">
-      <span class="kpi-label">Account ROAS</span>
-      <span class="kpi-value" id="kpi-roas">0.00</span>
-      <span class="kpi-trend neutral" id="kpi-roas-sub">vs BER —</span>
-    </div>
-    <div class="card kpi-card">
-      <span class="kpi-label">Spend</span>
-      <span class="kpi-value" id="kpi-total-spend">—</span>
-      <span class="kpi-trend neutral" id="kpi-spend-sub">All campaigns</span>
-    </div>
-    <div class="card kpi-card">
-      <span class="kpi-label">Revenue</span>
-      <span class="kpi-value" id="kpi-revenue">—</span>
-      <span class="kpi-trend neutral" id="kpi-profit-sub">Contribution —</span>
-    </div>
-    <div class="card kpi-card">
-      <span class="kpi-label">Orders</span>
-      <span class="kpi-value" id="kpi-total-purchases">0</span>
-      <span class="kpi-trend neutral" id="kpi-cpa-sub">CPA —</span>
-    </div>
-    <div class="card kpi-card">
-      <span class="kpi-label">Link CTR</span>
-      <span class="kpi-value" id="kpi-ctr">0.00%</span>
-      <span class="kpi-trend neutral">Benchmark &gt; 2%</span>
-    </div>
-    <div class="card kpi-card accent-indigo">
-      <span class="kpi-label">Video Hook Rate</span>
-      <span class="kpi-value" id="kpi-hook-rate">0.0%</span>
-      <span class="kpi-trend neutral">Benchmark &gt; 25%</span>
-    </div>
   </div>
 
   <!-- ======================= FUNNEL + PLAYBOOK ======================= -->

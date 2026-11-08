@@ -159,6 +159,51 @@
     return key(first);
   }
 
+  /* ------------------------------------------------------------------
+     THE FUNNEL REGISTER
+     ------------------------------------------------------------------
+     Confirmed against the live funnel list 8 Nov 2026. Matching on product
+     names alone fails whenever the two systems disagree about the name —
+     Shopify sells "ZahnPro™ Sonic360", the campaign is called "CM028 |
+     Zahnpro™" — and a near-miss there silently drops real revenue out of a
+     campaign's ROAS. The CM code is the one identifier both sides carry, so
+     it is tried first and the name is only the fallback.
+
+     Keys are head tokens of the Shopify product title. Add a line when a new
+     funnel goes live; the UI's manual override still wins over this. */
+  var FUNNELS = {
+    zahnpro:      'CM028',
+    schnarchfrei: 'CM077',
+    glattr:       'CM064',
+    hautschild:   'CM032',
+    celsior:      'CM002',
+    lavouria:     'CM078',
+    lidlux:       'CM066',
+    velmira:      'CM081',
+    atemfrei:     'CM074'
+  };
+
+  function cmOf(name) {
+    var VE = (typeof globalThis !== 'undefined' && globalThis.VerdictEngine) || root.VerdictEngine;
+    if (VE && VE.cmCode) return VE.cmCode(name);
+    var m = String(name || '').match(/\bCM0*(\d{1,5})\b/i);
+    return m ? 'CM' + m[1].padStart(3, '0') : null;
+  }
+
+  /* The CM code a Shopify product belongs to, by its head token. */
+  function cmForProduct(title, register) {
+    var reg = register || FUNNELS;
+    var h = headKey(title);
+    if (reg[h]) return reg[h];
+    /* "ZahnPro™ Sonic360" heads to "zahnpro"; but a title whose first word is
+       a qualifier ("Dr.Willhelmshaus Velmira") still needs to find its funnel,
+       so fall back to a contains scan over the whole normalised title. */
+    var t = key(title);
+    var hit = Object.keys(reg).filter(function (k) { return t.indexOf(k) !== -1; })
+      .sort(function (a, b) { return b.length - a.length; })[0];
+    return hit ? reg[hit] : null;
+  }
+
   /**
    * Join the Worker's per-product revenue onto the live campaigns.
    *
@@ -178,9 +223,20 @@
     // "LidLux" is more specific than a short shared prefix.
     const index = campaigns.map(c => {
       const label = productLabelOf(c.name) || c.name;
-      return { id: c.id, name: c.name, label, head: headKey(label), full: key(label) };
+      return { id: c.id, name: c.name, label, head: headKey(label), full: key(label), cm: cmOf(c.name) };
     }).filter(x => x.head.length >= 3)
       .sort((a, b) => b.head.length - a.head.length);
+
+    /* One campaign per CM code. Where two live campaigns carry the same code
+       (a retest beside the original), the product's revenue cannot be split
+       between them on this evidence, so neither gets it and the pair is
+       reported instead of guessed at. */
+    const byCm = {};
+    index.forEach(x => {
+      if (!x.cm) return;
+      if (byCm[x.cm] === undefined) byCm[x.cm] = x;
+      else byCm[x.cm] = null;               // ambiguous
+    });
 
     const add = (campaignId, title, row) => {
       const p = perCampaign[campaignId] ||
@@ -209,13 +265,34 @@
         return;
       }
 
+      /* CM code first — it is the identifier both systems actually share. */
+      const cm = cmForProduct(title, over.__register);
+      if (cm && byCm[cm]) {
+        const hit = byCm[cm];
+        add(hit.id, title, row);
+        matches.push({ title, campaignId: hit.id, campaign: hit.label, how: 'cm:' + cm, net: row.net });
+        return;
+      }
+      if (cm && byCm[cm] === null) {
+        unmatchedProducts.push({
+          title, net: row.net || 0, orders: row.orders || 0,
+          why: 'two live campaigns both carry ' + cm + ' — rename one, or map this product by hand'
+        });
+        return;
+      }
+
       const t = key(title);
       const hit = index.find(x => t.startsWith(x.head) || t.includes(x.head) || x.full.includes(t));
       if (hit) {
         add(hit.id, title, row);
         matches.push({ title, campaignId: hit.id, campaign: hit.label, how: 'name', net: row.net });
       } else {
-        unmatchedProducts.push({ title, net: row.net || 0, orders: row.orders || 0, why: 'no live campaign with a matching product name' });
+        unmatchedProducts.push({
+          title, net: row.net || 0, orders: row.orders || 0,
+          why: cm
+            ? 'belongs to ' + cm + ', but no live campaign carries that code'
+            : 'no live campaign with a matching product name, and no CM code on file'
+        });
       }
     });
 
@@ -251,5 +328,6 @@
 
   function round2(v) { const n = parseFloat(v); return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; }
 
-  return { fetchTruth, match, rangeForPreset, tzDayRange, tzOffsetMinutes, key, headKey, PRESET_RANGE };
+  return { fetchTruth, match, rangeForPreset, tzDayRange, tzOffsetMinutes,
+           key, headKey, cmForProduct, FUNNELS, PRESET_RANGE };
 });
