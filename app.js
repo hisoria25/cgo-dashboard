@@ -934,9 +934,13 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
     const impressions = parseInt(r.impressions) || 0;
     const clicks = parseInt(r.inline_link_clicks) || 0;
     let lpv = conv.lpvRaw; if (!lpv && clicks) { lpv = Math.round(clicks * 0.82); lpvEstimated = true; }
-    // Meta removed the 3-second view metric. Video plays is the closest live
-    // equivalent and is what "hook rate" means in practice now.
-    const v3 = actionVal(r.video_play_actions, 'video_view');
+    /* Meta retired the standalone 3-second field, but the count itself still
+       arrives inside `actions` as `video_view` — the same number Ads Manager
+       shows as "3-second video plays". Video PLAYS are not a substitute: an
+       autoplay start is counted on nearly every impression, which is how the
+       hook rate came to read 94% on every ad. Plays are kept only as a last
+       resort for rows where Meta sends no 3-second count at all. */
+    const v3 = actionVal(r.actions, 'video_view') || actionVal(r.video_play_actions, 'video_view');
     const thru = actionVal(r.video_thruplay_watched_actions, 'video_view');
     const hookRate = impressions > 0 ? (v3 / impressions) * 100 : 0;
     // Link CTR and link CPC — not the all-clicks versions, which count every
@@ -1508,19 +1512,25 @@ function renderDataStrip() {
   const label = w.single ? w.first : `${w.first} → ${w.last}`;
   const srcName = State.source === 'api' ? 'Meta API' : State.source === 'csv' ? 'CSV' : 'demo data';
 
+  /* Demo data produces real-looking KILL and SCALE cards. The header badge
+     alone is too quiet for that: anyone glancing at a verdict has to be told
+     it is an example, not their account. */
+  const demo = State.source === 'demo';
+
   host.innerHTML = `
-    <div class="dstrip${running ? ' running' : ''}">
+    <div class="dstrip${demo ? ' demo' : running ? ' running' : ''}">
       <span class="dstrip-dates">📅 <strong>${esc(label)}</strong>
         <span class="dstrip-tz">${esc(w.tz)}</span></span>
-      ${running
-        ? `<span class="dstrip-flag">⏳ Day still running — this is a part-day. Budget moves wait for the midnight read.</span>`
-        : `<span class="dstrip-flag done">✓ Complete day</span>`}
+      ${demo
+        ? `<span class="dstrip-flag demo">⚠️ DEMO DATA — these numbers and verdicts are examples, not your account. Connect Meta in Data sources.</span>`
+        : running
+          ? `<span class="dstrip-flag">⏳ Day still running — this is a part-day. Budget moves wait for the midnight read.</span>`
+          : `<span class="dstrip-flag done">✓ Complete day</span>`}
       <span class="dstrip-src">
         ${srcName}${metaAge ? ' · synced ' + metaAge : ' · not synced'}${stale ? ' <em>(stale)</em>' : ''}
         · Shopify ${shopAge ? 'synced ' + shopAge : 'not connected'}
       </span>
     </div>`;
-
 }
 
 /* ========================================================================== *
@@ -1544,8 +1554,14 @@ function renderDateBar() {
       (tzName ? ` in ${esc(tzName)} time.` : '.') +
       ` Verdicts still follow the ${esc(activeWindow())} read.`;
   } else if (preset === 'today') {
-    note.innerHTML = `Showing <strong>today so far</strong>` + (tzName ? ` (${esc(tzName)} time)` : '') +
-      `. This is a part-day — budget moves wait for the midnight read.`;
+    /* dayIsOver() is the single source of truth about whether the day is
+       finished. Hard-coding "part-day" here put the note and the strip in
+       plain contradiction once the midnight read opened. */
+    note.innerHTML = dayIsOver()
+      ? `Showing <strong>today</strong>` + (tzName ? ` (${esc(tzName)} time)` : '') +
+        `. The advertising day is over — this is the read budget moves are made on.`
+      : `Showing <strong>today so far</strong>` + (tzName ? ` (${esc(tzName)} time)` : '') +
+        `. This is a part-day — budget moves wait for the midnight read.`;
   } else {
     note.innerHTML = `Showing <strong>${esc(windowLabel())}</strong>. ` +
       `Meta's multi-day windows <strong>end yesterday</strong> — today is not included.`;
@@ -2563,6 +2579,9 @@ function injectStyles() {
     border: 1px solid var(--color-border, rgba(255,255,255,.1));
     background: var(--color-surface, rgba(255,255,255,.03)); }
   .dstrip.running { border-left: 4px solid var(--color-warning, #f59e0b); }
+  .dstrip.demo { border-left: 4px solid var(--color-danger, #ef4444);
+    background: rgba(239,68,68,.07); border-color: rgba(239,68,68,.3); }
+  .dstrip-flag.demo { color: var(--color-danger, #ef4444); font-weight: 600; }
   .dstrip-dates strong { font-variant-numeric: tabular-nums; }
   .dstrip-tz { opacity: .6; margin-left: .35rem; font-size: 12px; }
   .dstrip-flag { color: var(--color-warning, #f59e0b); }
