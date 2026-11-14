@@ -419,8 +419,18 @@
     ageWarnDays: 21, ageAlertDays: 35,
     pipelineDays: 10,
     minImpressions: 2500,                    // per comparison window
-    needScoreSoon: 1, needScoreAdd: 3, needScoreUrgent: 5
+    needScoreSoon: 1, needScoreAdd: 3, needScoreUrgent: 5,
+    /* Weekly rhythm: the bigger the daily budget, the faster the audience
+       burns through creatives. Tiers are [min €/day, new ads per week]. */
+    cadence: [[300, 3], [150, 2], [100, 1]]
   };
+
+  /** How many new ads a week a campaign spending `spendPerDay` should be getting. */
+  function cadenceTarget(spendPerDay) {
+    const s = n(spendPerDay);
+    for (const [min, per] of FRESH.cadence) if (s >= min) return per;
+    return 0;
+  }
 
   const DAY_MS = 86400000;
   const sum = (arr, f) => arr.reduce((t, x) => t + n(f(x)), 0);
@@ -515,13 +525,20 @@
       add('pipeline', 1, `Nothing new has gone into this campaign for ${Math.round(newest)} days.`);
     }
 
+    const young = campaign.learning || n(campaign.daysLive) < 3;
+    const target = cadenceTarget(campaign.spendPerDay);
+    const cadence = { target, actual: newLast7, met: newLast7 >= target };
+    if (!young && target > 0 && newLast7 < target) {
+      add('cadence', 1,
+        `Spending about €${Math.round(n(campaign.spendPerDay))} a day, this campaign should get ${target} new ad${target === 1 ? '' : 's'} a week. Only ${newLast7} went in during the last 7 days.`);
+    }
+
     const score = sum(signals, s => s.weight);
     const opportunities = [];
     if (streak >= 3 && ber > 0) {
       opportunities.push(`Profitable ${streak} days in a row. Your SOP says this is the moment to test new creatives: a failed test costs nothing and a winner scales sideways.`);
     }
 
-    const young = campaign.learning || n(campaign.daysLive) < 3;
     let state, headline, addCount = 0;
     if (young) {
       state = 'learning';
@@ -547,7 +564,7 @@
     return {
       state, headline, addCount, score, signals, opportunities,
       liveAds: liveN, topAd: top ? top.name : null, topShare: r2(topShare),
-      newestAdDays: newest === null ? null : Math.round(newest), newLast7,
+      newestAdDays: newest === null ? null : Math.round(newest), newLast7, cadence,
       trend: tr, roasTrend: rt
     };
   }
@@ -697,6 +714,6 @@
   return {
     STAGES, SOP_MAX_ADS, SOP_MIN_ADS, FAIR_TEST_MULTIPLE, AD_RULES, FRESH,
     retention, diagnose, fairTestThreshold, poissonCdf, judgeAd, adVerdicts,
-    freshness, trendOf, roasTrend, campaignNeeds, brief, desk
+    freshness, cadenceTarget, trendOf, roasTrend, campaignNeeds, brief, desk
   };
 });

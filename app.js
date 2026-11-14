@@ -2010,7 +2010,12 @@ function renderPlan() {
       <ul>${plan.quiet.map(q => `<li><strong>${esc(q.campaign)}</strong> — ${esc(q.text)}</li>`).join('')}</ul>
     </details>` : '';
 
-  const rhythm = `<p class="plan-rhythm">New ads launched in the last 7 days across active campaigns: <b>${sm.newLast7}</b>. ${sm.newLast7 === 0 ? 'Nothing fresh has gone in all week — this is what makes scaling stall.' : ''}</p>`;
+  const cb = sm.cadenceBehind || [];
+  const rhythm = `<div class="plan-rhythm">
+    <p>New ads launched in the last 7 days across active campaigns: <b>${sm.newLast7}</b>. ${sm.newLast7 === 0 ? 'Nothing fresh has gone in all week — this is what makes scaling stall.' : ''}</p>
+    ${sm.cadenceTarget > 0 ? `<p><b>Weekly target:</b> ${sm.cadenceActual} of ${sm.cadenceTarget} new ads launched (campaigns above €100 a day should get 1–3 a week: 1 from €100, 2 from €150, 3 from €300 a day).</p>
+    <ul class="plan-cadence">${cb.map(x => `<li>${x.met ? '✅' : '⬜'} <strong>${esc(x.campaign)}</strong> — ${x.actual} of ${x.target} this week</li>`).join('')}</ul>` : ''}
+  </div>`;
 
   host.innerHTML = `
     <h2 class="section-title">📝 What to do tonight</h2>
@@ -3106,7 +3111,9 @@ function injectStyles() {
   .plan-quiet { margin-top: 12px; font-size: 13px; }
   .plan-quiet summary { cursor: pointer; opacity: .8; }
   .plan-quiet ul { margin: 8px 0 0 18px; padding: 0; line-height: 1.6; }
-  .plan-rhythm { margin: 12px 0 0; font-size: 12.5px; opacity: .8; }
+  .plan-rhythm { margin: 12px 0 0; font-size: 12.5px; opacity: .85; }
+  .plan-rhythm p { margin: 0 0 6px; }
+  .plan-cadence { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 3px; }
   .curve-ceiling { border-left: 4px solid var(--color-warning, #f59e0b); }
   .curve-room { border-left: 4px solid var(--color-success, #10b981); }
   .curve-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .3rem .6rem; margin-bottom: .35rem; }

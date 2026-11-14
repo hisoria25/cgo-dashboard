@@ -1363,7 +1363,8 @@
     const dayOver = !!(opts && opts.dayIsOver);
     const items = [];
     const quiet = [];
-    const sum = { pauseAds: 0, bleedPerWeek: 0, budgetMoves: 0, creativeJobs: 0, newLast7: 0, newAds: 0 };
+    const sum = { pauseAds: 0, bleedPerWeek: 0, budgetMoves: 0, creativeJobs: 0, newLast7: 0, newAds: 0,
+      cadenceTarget: 0, cadenceActual: 0, cadenceBehind: [] };
     const MONEY_NOW = { KILL: 2, DESCALE: 3, PRICE_DROP: 3, SCALE: 5, SURF: 5 };
     const FIX = { DIAGNOSE: 'Fix what is leaking', NEEDS_SETUP: 'Finish the setup' };
     const when = dayOver ? 'Now — the day is closed' : 'After midnight — the day is still running';
@@ -1419,7 +1420,8 @@
           lines: [], money: 0,
           why: (v.reasons && v.reasons[0]) || ''
         });
-      } else if (FIX[v.code] && (v.code === 'NEEDS_SETUP' || num(c.lpv) >= 100)) {
+      } else if (FIX[v.code] && (v.code === 'NEEDS_SETUP' ||
+                 (num(c.lpv) >= 100 && !c.learning && num(c.daysLive) >= 3))) {
         items.push({
           priority: 3, kind: 'fix', when: 'Today', campaign: label, campaignId: c.id,
           title: `${label}: ${FIX[v.code]}`, lines: [], money: 0,
@@ -1428,6 +1430,11 @@
       }
 
       if (f) sum.newLast7 += f.newLast7 || 0;
+      if (f && f.cadence && f.cadence.target > 0 && f.state !== 'learning') {
+        sum.cadenceTarget += f.cadence.target;
+        sum.cadenceActual += Math.min(f.cadence.actual, f.cadence.target);
+        sum.cadenceBehind.push({ campaign: label, target: f.cadence.target, actual: f.cadence.actual, met: f.cadence.met });
+      }
       if (f && f.addCount > 0) {
         sum.creativeJobs++; sum.newAds += f.addCount;
         const pr = f.state === 'urgent' ? 4 : f.state === 'add' ? 6 : 7;
@@ -1443,7 +1450,8 @@
 
       if (items.length === before) {
         quiet.push({ campaign: label, campaignId: c.id,
-          text: FIX[v.code] && num(c.lpv) < 100 ? `Only ${Math.round(num(c.lpv))} landing-page views so far — too few to say where the funnel leaks. Leave it running.`
+          text: FIX[v.code] && v.code !== 'NEEDS_SETUP' && (c.learning || num(c.daysLive) < 3) ? 'Still in its first days — too early to say where the funnel leaks. Leave it running.'
+              : FIX[v.code] && num(c.lpv) < 100 ? `Only ${Math.round(num(c.lpv))} landing-page views so far — too few to say where the funnel leaks. Leave it running.`
               : f && f.state === 'learning' ? 'Still in its first days. Leave it alone and do not judge it yet.'
               : v.headline ? `${v.headline}. No ad to pause, no creative needed yet.` : 'Nothing to do.' });
       }
