@@ -129,6 +129,19 @@
       minWeekdayDays: 10,
       liftToBudgetFactor: 3,    // a 25% measured lift earns up to +75%
       maxSurfPct: 100           // never more than double in one step
+    },
+
+    /* The budget sweet spot. Scaling is only worth it while the EXTRA spend
+       still earns money; past some level a campaign makes less in total,
+       not more. That level is read from the campaign's own days. */
+    curve: {
+      minDays: 9,               // three days per band at the very least
+      minDaysPerBand: 3,
+      minOrdersPerBand: 15,     // a band on a dozen orders is a coin toss
+      minSpread: 1.5,           // the budget has to have actually moved
+      dropPct: 15,              // the top band must earn this much less...
+      dropAbs: 10,              // ...and at least this many euros a day less
+      overshoot: 1.05           // tolerance before a budget counts as past the ceiling
     }
   };
 
@@ -983,6 +996,327 @@
   /* ------------------------------------------------------------------
      7. ACCOUNT-LEVEL GUARDRAILS (ban prevention + fatigue)
      ------------------------------------------------------------------ */
+  /* ------------------------------------------------------------------
+     DELIVERY, PER CAMPAIGN
+     ------------------------------------------------------------------
+     The account-wide alarm says "2 ads rejected". That is not enough to act
+     on: you need to know WHICH campaign, WHY Meta refused, and whether
+     anything in that campaign is still running. A campaign whose only two
+     ads are rejected is not a weak campaign — it is a switched-off one, and
+     judging its ROAS is judging nothing.
+
+     ads    = [{ name, campaignId, effectiveStatus, issues, reviewFeedback }]
+     adsets = [{ name, campaignId, effectiveStatus, issues }]            */
+  const OFF_ON_PURPOSE = /^(PAUSED|ADSET_PAUSED|CAMPAIGN_PAUSED|ARCHIVED|DELETED)$/;
+
+  /* Meta explains a refusal in one of two places. ad_review_feedback is a map
+     of policy name -> explanation; issues_info is a list of error objects.
+     Whichever is present, return one readable line. */
+  function reviewReason(item) {
+    const fb = item && item.reviewFeedback;
+    const g = fb && (fb.global || fb.placement_specific || fb);
+    if (g && typeof g === 'object') {
+      const parts = Object.keys(g).map(k => {
+        const v = g[k];
+        if (v && typeof v === 'object') return Object.keys(v).join(', ');
+        const name = String(k).replace(/_/g, ' ').trim();
+        /* Meta's explanation runs to a paragraph of boilerplate. The policy
+           name is the signal; one sentence of the text is enough context. */
+        const why = (String(v || '').trim().match(/^[^.!?]*[.!?]?/) || [''])[0].trim();
+        return why && why.toLowerCase() !== name.toLowerCase() ? `${name}: ${why}` : name;
+      }).filter(Boolean);
+      if (parts.length) return parts.join(' · ');
+    }
+    const issues = (item && item.issues) || [];
+    const lines = issues.map(i => (i && (i.error_summary || i.error_message)) || '').filter(Boolean);
+    return lines.length ? [...new Set(lines)].join(' · ') : '';
+  }
+
+  function campaignDelivery(campaign, ads, adsets) {
+    const id = campaign && campaign.id;
+    const mine = (ads || []).filter(a => a.campaignId === id);
+    const considered = mine.filter(a => !OFF_ON_PURPOSE.test((a.effectiveStatus || '').toUpperCase()));
+    const pick = re => considered
+      .filter(a => re.test((a.effectiveStatus || '').toUpperCase()))
+      .map(a => ({ name: a.name, reason: reviewReason(a) }));
+
+    const rejected   = pick(/^DISAPPROVED$/);
+    const inReview   = pick(/^(PENDING_REVIEW|IN_PROCESS)$/);
+    const withIssues = pick(/^WITH_ISSUES$/);
+    const billing    = pick(/^PENDING_BILLING_INFO$/);
+    const delivering = considered.filter(a => (a.effectiveStatus || '').toUpperCase() === 'ACTIVE').length;
+
+    const adsetIssues = (adsets || [])
+      .filter(s => s.campaignId === id)
+      .filter(s => /^WITH_ISSUES$/.test((s.effectiveStatus || '').toUpperCase()) || ((s.issues || []).length > 0))
+      .filter(s => !OFF_ON_PURPOSE.test((s.effectiveStatus || '').toUpperCase()))
+      .map(s => ({ name: s.name, reason: reviewReason(s) }));
+
+    /* A campaign Meta marks WITH_ISSUES is one that is meant to be running. */
+    const cStatus = ((campaign && campaign.status) || '').toUpperCase();
+    const live = /^(ACTIVE|WITH_ISSUES|IN_PROCESS)$/.test(cStatus);
+    const campaignIssues = reviewReason({ issues: campaign && campaign.issues }) ||
+      (cStatus === 'WITH_ISSUES' ? 'Meta reports a problem with this campaign' : '');
+    const blocked = rejected.length + inReview.length + withIssues.length + billing.length;
+
+    /* Nothing running in a campaign that is meant to be live. */
+    const allBlocked = live && considered.length > 0 && delivering === 0;
+
+    let severity = null, headline = '';
+    const n = (k, one, many) => `${k} ${k === 1 ? one : many}`;
+    if (allBlocked) {
+      severity = 'alert';
+      headline = 'No ad is delivering';
+    } else if (rejected.length || billing.length) {
+      severity = 'alert';
+      headline = rejected.length ? n(rejected.length, 'ad rejected', 'ads rejected') : 'Billing is blocking delivery';
+    } else if (withIssues.length || adsetIssues.length || campaignIssues) {
+      severity = 'warning';
+      headline = withIssues.length ? n(withIssues.length, 'ad has a delivery issue', 'ads have delivery issues')
+        : adsetIssues.length ? 'Ad set has a delivery issue' : 'Campaign has a delivery issue';
+    } else if (inReview.length) {
+      severity = 'info';
+      headline = n(inReview.length, 'ad still in review', 'ads still in review');
+    }
+
+    return {
+      severity, headline, allBlocked,
+      rejected, inReview, withIssues, billing, adsetIssues, campaignIssues,
+      delivering, considered: considered.length, blocked,
+      /* The numbers on the card describe only the ads that ran. */
+      note: !severity ? ''
+        : allBlocked ? 'Every ad in this campaign is stopped, so the figures on this card are not a verdict on the product. Fix delivery first.'
+        : rejected.length ? `${delivering} of ${considered.length} ads are running. The card is judging the survivors, not the creative set you launched.`
+        : ''
+    };
+  }
+
+  /* ------------------------------------------------------------------
+     ACCOUNT HEALTH — the problems that stop everything at once
+     ------------------------------------------------------------------ */
+  const ACCOUNT_STATUS = {
+    2: ['alert', 'Ad account is DISABLED', 'Meta has disabled this ad account. Nothing will deliver until it is reinstated — check Account Quality.'],
+    3: ['alert', 'Ad account has an unpaid balance', 'A payment failed and the account is unsettled. Delivery is stopped or about to stop — settle the balance in Billing.'],
+    7: ['alert', 'Ad account is in risk review', 'Meta is reviewing this account. Delivery can be limited or stopped until the review ends.'],
+    8: ['warning', 'Ad account is waiting on a payment', 'A payment is pending settlement. Delivery continues but will stop if it fails.'],
+    9: ['warning', 'Ad account is in a payment grace period', 'A payment failed and Meta is giving a grace period. Fix the payment method before it runs out.'],
+    100: ['alert', 'Ad account is pending closure', 'This account is scheduled to close.'],
+    101: ['alert', 'Ad account is CLOSED', 'This account is closed and cannot deliver.']
+  };
+  const DISABLE_REASON = {
+    1: 'ads integrity policy', 2: 'intellectual property review', 3: 'payment risk',
+    4: 'account shut down', 5: 'advertising review', 6: 'business integrity review',
+    7: 'permanent closure', 11: 'Business Manager policy', 12: 'misrepresentation',
+    15: 'compromised account'
+  };
+
+  function accountHealth(account) {
+    const out = [];
+    if (!account) return out;
+    const label = account.name ? `${account.name}: ` : '';
+
+    const st = ACCOUNT_STATUS[parseInt(account.account_status, 10)];
+    if (st) {
+      const why = DISABLE_REASON[parseInt(account.disable_reason, 10)];
+      out.push({ severity: st[0], title: label + st[1], body: st[2] + (why ? ` Reason Meta gives: ${why}.` : '') });
+    }
+
+    /* The spending limit stops ALL delivery the moment it is reached, with no
+       notice on any campaign. Both figures are in the same unit, so the ratio
+       is safe whatever that unit is. */
+    const cap = num(account.spend_cap), spent = num(account.amount_spent);
+    if (cap > 0) {
+      const used = spent / cap;
+      if (used >= 1) {
+        out.push({ severity: 'alert', title: label + 'Account spending limit reached',
+          body: 'The account has hit its spending limit, so every campaign has stopped. Raise or reset the limit in Billing & payments.' });
+      } else if (used >= 0.9) {
+        out.push({ severity: 'warning', title: `${label}${Math.round(used * 100)}% of the account spending limit is used`,
+          body: 'When the limit is reached every campaign stops at once. Raise or reset it in Billing & payments before it does.' });
+      }
+    }
+    return out;
+  }
+
+  /* ------------------------------------------------------------------
+     BREAKDOWNS — country, placement
+     ------------------------------------------------------------------
+     rows = [{ key, label, spend, impressions, clicks, purchases, revenue }]
+     Purchases here are Meta-attributed: Shopify cannot say which placement
+     an order came from. So the flags are prompts to look, sized against the
+     account's own cost per order, and they stay silent on thin evidence. */
+  function breakdown(rows, opts) {
+    const o = opts || {};
+    const by = {};
+    (rows || []).forEach(r => {
+      const k = r.key || '—';
+      const t = by[k] || (by[k] = { key: k, label: r.label || k, spend: 0, impressions: 0, clicks: 0, purchases: 0, revenue: 0 });
+      t.spend += num(r.spend); t.impressions += num(r.impressions); t.clicks += num(r.clicks);
+      t.purchases += num(r.purchases); t.revenue += num(r.revenue);
+    });
+    const list = Object.values(by).filter(r => r.spend > 0 || r.purchases > 0);
+    const totalSpend = list.reduce((s, r) => s + r.spend, 0);
+    const totalPurchases = list.reduce((s, r) => s + r.purchases, 0);
+    const totalRevenue = list.reduce((s, r) => s + r.revenue, 0);
+
+    /* Meta sometimes withholds conversions on a breakdown. If the parent has
+       orders and the rows have none, the zeros are missing data, not facts. */
+    const expected = num(o.expectedPurchases);
+    const conversionsReported = totalPurchases > 0 || expected === 0;
+    const cpaAll = totalPurchases > 0 ? totalSpend / totalPurchases : 0;
+
+    const out = list.map(r => {
+      const cpa = r.purchases > 0 ? r.spend / r.purchases : null;
+      const row = {
+        key: r.key, label: r.label,
+        spend: round2(r.spend),
+        sharePct: totalSpend > 0 ? round1((r.spend / totalSpend) * 100) : 0,
+        impressions: r.impressions, clicks: r.clicks,
+        purchases: r.purchases, revenue: round2(r.revenue),
+        cpa: cpa === null ? null : round2(cpa),
+        roas: r.spend > 0 && r.revenue > 0 ? round2(r.revenue / r.spend) : null,
+        flag: null, flagText: ''
+      };
+      if (conversionsReported && cpaAll > 0) {
+        if (r.purchases === 0 && r.spend >= cpaAll * 2) {
+          row.flag = 'bleed';
+          row.flagText = `Spent ${(r.spend / cpaAll).toFixed(1)}× the average cost of an order with no sale`;
+        } else if (r.purchases >= 3 && cpa <= cpaAll * 0.75) {
+          row.flag = 'strong';
+          row.flagText = `Orders cost ${Math.round((1 - cpa / cpaAll) * 100)}% less here than average`;
+        } else if (r.purchases >= 3 && cpa >= cpaAll * 1.5) {
+          row.flag = 'weak';
+          row.flagText = `Orders cost ${Math.round((cpa / cpaAll - 1) * 100)}% more here than average`;
+        }
+      }
+      return row;
+    }).sort((a, b) => b.spend - a.spend);
+
+    return {
+      rows: out,
+      totalSpend: round2(totalSpend), totalPurchases, totalRevenue: round2(totalRevenue),
+      avgCpa: cpaAll ? round2(cpaAll) : null,
+      conversionsReported
+    };
+  }
+
+  /* ------------------------------------------------------------------
+     THE SPEND CURVE — where does this campaign stop paying for more budget?
+     ------------------------------------------------------------------
+     The ladder asks "is today profitable?". It cannot ask "was the LAST
+     increase worth it?", and that is the question that matters when scaling
+     keeps disappointing. A campaign at ROAS 2.2 on €250 a day can out-earn
+     the same campaign at ROAS 1.7 on €450 a day: the bigger budget still
+     looks profitable, and it is quietly making less money.
+
+     So: take the campaign's own closed days, sort them by spend, cut them
+     into a low, middle and high third, and compare PROFIT PER DAY — not
+     ROAS — across the three. Revenue here is what Meta reported per day;
+     Shopify is not split by day, so this reads the shape, not the cents.
+
+     history = [{ date, spend, revenue, purchases? }]                      */
+  const eur0 = v => '€' + Math.round(num(v));
+
+  function spendCurve(history, ber) {
+    const cfg = RULES.curve;
+    const gm = num(ber) > 0 ? 1 / num(ber) : 0;
+    const days = (history || [])
+      .filter(d => d && d.date !== 'today' && num(d.spend) > 0)
+      .map(d => ({ spend: num(d.spend), revenue: num(d.revenue),
+                   purchases: d.purchases === undefined ? null : num(d.purchases) }));
+
+    if (!gm) return { state: 'thin', days: days.length, reason: 'No break-even on file, so profit per day cannot be worked out.' };
+    if (days.length < cfg.minDays) {
+      return { state: 'thin', days: days.length,
+               reason: `Only ${days.length} day${days.length === 1 ? '' : 's'} of history — it takes at least ${cfg.minDays} to see where extra budget stops paying.` };
+    }
+
+    days.sort((a, b) => a.spend - b.spend);
+    const lo = days[0].spend, hi = days[days.length - 1].spend;
+    if (hi / lo < cfg.minSpread) {
+      return { state: 'flat', days: days.length,
+               reason: `The budget has stayed between ${eur0(lo)} and ${eur0(hi)} a day, so there is nothing to compare yet. The ceiling only shows once spend has been at clearly different levels.` };
+    }
+
+    const third = Math.floor(days.length / 3);
+    const cuts = [days.slice(0, third), days.slice(third, days.length - third), days.slice(days.length - third)];
+    const knowsOrders = days.every(d => d.purchases !== null);
+    const bands = cuts.map((list, i) => {
+      const spend = list.reduce((s, d) => s + d.spend, 0);
+      const revenue = list.reduce((s, d) => s + d.revenue, 0);
+      return {
+        level: ['low', 'middle', 'high'][i],
+        days: list.length,
+        from: round2(list[0].spend), to: round2(list[list.length - 1].spend),
+        spendPerDay: round2(spend / list.length),
+        roas: spend > 0 ? round2(revenue / spend) : 0,
+        orders: knowsOrders ? list.reduce((s, d) => s + d.purchases, 0) : null,
+        profitPerDay: round2((revenue * gm - spend) / list.length)
+      };
+    });
+
+    const thinBand = bands.find(b => b.days < cfg.minDaysPerBand ||
+                                     (b.orders !== null && b.orders < cfg.minOrdersPerBand));
+    if (thinBand) {
+      return { state: 'thin', days: days.length, bands,
+               reason: `Too few orders at the ${thinBand.level} spend level to trust the comparison${thinBand.orders !== null ? ` (${thinBand.orders} orders in ${thinBand.days} days)` : ''}. The pattern needs more volume before it means anything.` };
+    }
+
+    const top = bands[2];
+    const best = bands.reduce((a, b) => (b.profitPerDay > a.profitPerDay ? b : a));
+    const base = { days: days.length, bands, best, top };
+
+    if (best.profitPerDay <= 0) {
+      return { ...base, state: 'unprofitable',
+               reason: 'No spend level has been profitable on these days, so there is no sweet spot to find — the offer or the creative has to change first.' };
+    }
+    if (best === top) {
+      return { ...base, state: 'room',
+               reason: `Profit per day has been highest at the highest spend level so far (${eur0(top.from)}–${eur0(top.to)} a day). No ceiling found yet.` };
+    }
+    const gap = best.profitPerDay - top.profitPerDay;
+    if (gap >= Math.max(cfg.dropAbs, Math.abs(best.profitPerDay) * cfg.dropPct / 100) && top.roas < best.roas) {
+      return { ...base, state: 'ceiling',
+               ceiling: { from: best.from, to: best.to, typical: best.spendPerDay },
+               reason: `This campaign has earned most at ${eur0(best.from)}–${eur0(best.to)} a day (about ${eur0(best.profitPerDay)} profit a day at ROAS ${best.roas}). At ${eur0(top.from)}–${eur0(top.to)} a day it earned ${eur0(top.profitPerDay)} a day at ROAS ${top.roas} — more spend, not more money.` };
+    }
+    return { ...base, state: 'unclear',
+             reason: 'Profit per day is about the same at every spend level it has run at, so the history does not point to a ceiling either way.' };
+  }
+
+  /* Turn the curve into a decision. A scale that would push the budget past
+     the level where the campaign earned most is not a scale — it is the move
+     that has already been tried and lost money. The cheat sheet's answer is
+     the same one: find the sweet spot, then widen with new creatives. */
+  function applyCeiling(v, curve) {
+    if (!v || !curve || curve.state !== 'ceiling') return v;
+    const top = curve.ceiling.to * RULES.curve.overshoot;
+    const raising = v.budgetTo !== null && v.budgetFrom !== null && v.budgetTo > v.budgetFrom;
+
+    if (raising && v.budgetTo > top) {
+      return {
+        ...v,
+        code: 'HOLD', tone: TONE.HOLD || 'neutral',
+        headline: 'At its ceiling — add creatives, not budget',
+        ceilingBlocked: { wouldHaveBeen: v.code, budgetTo: v.budgetTo },
+        budgetTo: null, budgetDelta: null,
+        reasons: [
+          `Today is profitable, and the ladder would raise the budget to ${eur0(v.budgetTo)}. But ${curve.reason.charAt(0).toLowerCase()}${curve.reason.slice(1)}`,
+          'More budget on the same ads has already been tried here. The way up is new creatives: they reach people the current ads do not.'
+        ],
+        rule: 'If performance drops after scaling, find the budget sweet spot and test new creatives.'
+      };
+    }
+    if (v.budgetFrom !== null && v.budgetFrom > top && v.budgetTo === null) {
+      return {
+        ...v,
+        notes: (v.notes || []).concat(
+          `The budget (${eur0(v.budgetFrom)}) is above the level this campaign has earned most at (${eur0(curve.ceiling.from)}–${eur0(curve.ceiling.to)} a day). If it stays weak, bring it back toward ${eur0(curve.ceiling.to)} rather than cutting it hard.`)
+      };
+    }
+    return v;
+  }
+
   function guardrails(campaigns) {
     const out = [];
 
@@ -1188,6 +1522,7 @@
   return {
     RULES, economics, netMarginPct, grossMarginFromBer, parseCampaignName, cmCode,
     clockIn, detectWindow, dayContext, funnel, biggestLeak, verdict, guardrails, deliveryAlarms, productLabel,
+    campaignDelivery, accountHealth, breakdown, reviewReason, spendCurve, applyCeiling,
     countUnprofitableStreak, countProfitableStreak, money,
     revenueVerified, scalingLocked, marginLabel, windowAgreement,
     roasInterval, ordersNeeded, provenAbove, weekendLift, surfPctFromLift

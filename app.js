@@ -379,6 +379,7 @@ function loadData() {
   State.source = 'demo';
   State.truth = null;
   State.truthStatus = null;
+  State.adStatuses = []; State.adsetStatuses = []; State.accountInfo = []; State.breakdowns = null;
   setApiStatus('offline');
   document.getElementById('brand-sub').innerText = 'Demo data · connect the Meta API for live verdicts';
   renderAll();
@@ -421,7 +422,8 @@ async function graph(path, params) {
         const msg = body.error.message || 'Unknown Graph error';
 
         // A field this API version no longer knows — drop it and retry.
-        const dead = msg.match(/\(#100\)\s*([a-zA-Z0-9_]+)\s+is not valid for fields param/i);
+        const dead = msg.match(/\(#100\)\s*([a-zA-Z0-9_]+)\s+is not valid for fields param/i) ||
+                     msg.match(/nonexisting field \(([a-zA-Z0-9_]+)\)/i);
         if (dead && attemptParams.fields && attemptParams.fields.includes(dead[1])) {
           if (!State.droppedFields.includes(dead[1])) State.droppedFields.push(dead[1]);
           attemptParams.fields = stripField(attemptParams.fields, dead[1]);
@@ -442,6 +444,30 @@ async function graph(path, params) {
   }
   throw new Error(lastErr || 'Graph API unreachable');
 }
+
+/* Meta returns one page at a time. This account has more ads than fit in a
+   page, and reading only the first page is how 19 of its 30 rejected ads
+   went unseen. Follow the cursor, with a ceiling so a huge account cannot
+   burn the hourly request limit. */
+async function graphAll(path, params, maxPages) {
+  const out = [];
+  let after = null;
+  for (let page = 0; page < (maxPages || 3); page++) {
+    const body = await graph(path, after ? { ...params, after } : params);
+    (body.data || []).forEach(d => out.push(d));
+    after = body.paging && body.paging.next && body.paging.cursors && body.paging.cursors.after;
+    if (!after) break;
+  }
+  return { data: out };
+}
+
+/* Ads that are meant to be running, or that Meta is refusing to run. Ads
+   switched off on purpose are left out: there are hundreds of them and they
+   are not a delivery problem. */
+const LIVE_AD_STATUSES = ['ACTIVE', 'DISAPPROVED', 'WITH_ISSUES', 'PENDING_REVIEW',
+                          'IN_PROCESS', 'PENDING_BILLING_INFO', 'PREAPPROVED'];
+const AD_OBJECT_FIELDS = 'id,name,campaign_id,effective_status,issues_info,ad_review_feedback,' +
+                         'creative{id,title,body,object_type,video_id,thumbnail_url}';
 
 /* ==========================================================================
    ACCOUNT REGISTRY — one account at a time
@@ -618,16 +644,30 @@ function windowLabel() {
 async function fetchAccount(acc, preset) {
   const win = windowParams();
   const [account, campaigns, adsets, judged, history, adInsights, adsMeta] = await Promise.all([
-    graph(acc, { fields: 'name,currency,timezone_name' }),
-    graph(`${acc}/campaigns`, { fields: 'id,name,status,effective_status,daily_budget,lifetime_budget,created_time', limit: 200 }),
-    graph(`${acc}/adsets`, { fields: 'id,campaign_id,daily_budget,effective_status,learning_stage_info', limit: 300 }),
+    // account_status / spend_cap are the problems that stop everything at once
+    graph(acc, { fields: 'name,currency,timezone_name,account_status,disable_reason,spend_cap,amount_spent' }),
+    graphAll(`${acc}/campaigns`, { fields: 'id,name,status,effective_status,daily_budget,lifetime_budget,created_time,issues_info', limit: 200 }),
+    graphAll(`${acc}/adsets`, { fields: 'id,name,campaign_id,daily_budget,effective_status,learning_stage_info,issues_info', limit: 300 }),
     // the window being judged, aggregated by Meta — not summed by us
     graph(`${acc}/insights`, Object.assign({ level: 'campaign', fields: CAMPAIGN_FIELDS, limit: 200 }, win)),
     // history for sparklines and streaks (ends yesterday, which is what we want)
     graph(`${acc}/insights`, { level: 'campaign', fields: 'campaign_id,spend,actions,action_values,purchase_roas', date_preset: 'last_30d', time_increment: 1, limit: 800 }),
     graph(`${acc}/insights`, Object.assign({ level: 'ad', fields: AD_FIELDS, limit: 300 }, win)),
-    graph(`${acc}/ads`, { fields: 'id,name,campaign_id,effective_status,creative{id,title,body,object_type,video_id,thumbnail_url}', limit: 300 })
+    // issues_info and ad_review_feedback carry Meta's own reason for a refusal
+    graphAll(`${acc}/ads`, { fields: AD_OBJECT_FIELDS, effective_status: JSON.stringify(LIVE_AD_STATUSES), limit: 300 })
   ]);
+
+  /* An ad that spent in this window and was paused since is not in the list
+     above, but its row still needs a headline, a format and a video. Fetch
+     just those by id — usually none, occasionally a handful. */
+  const known = new Set((adsMeta.data || []).map(a => a.id));
+  const missing = [...new Set((adInsights.data || []).map(r => r.ad_id).filter(id => id && !known.has(id)))].slice(0, 100);
+  for (let i = 0; i < missing.length; i += 50) {
+    try {
+      const res = await graph('', { ids: missing.slice(i, i + 50).join(','), fields: AD_OBJECT_FIELDS });
+      Object.values(res || {}).forEach(a => { if (a && a.id) adsMeta.data.push(a); });
+    } catch (e) { /* the row falls back to the insight's own name and numbers */ }
+  }
 
   /* Video lengths turn the quartiles into timestamps. One batched call for
      every video in the account, and the curve can say "they leave at 7
@@ -688,6 +728,9 @@ async function syncMetaAPI() {
     State.campaigns = ok.flatMap(r => r.campaigns);
     State.ads = ok.flatMap(r => r.ads);
     State.adStatuses = ok.flatMap(r => r.adStatuses || []);
+    State.adsetStatuses = ok.flatMap(r => r.adsetStatuses || []);
+    State.accountInfo = ok.map(r => r.account);
+    State.breakdowns = null;       // belongs to the previous window or account
     State.lpvEstimated = ok.some(r => r.lpvEstimated);
     State.lastSync = Date.now();
     State.source = 'api';
@@ -743,6 +786,7 @@ function loadDemoFallback() {
   State.truth = null;
   State.truthStatus = null;
   State.truthMatch = null;
+  State.adStatuses = []; State.adsetStatuses = []; State.accountInfo = []; State.breakdowns = null;
   renderAll();
 }
 
@@ -842,7 +886,8 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
     const daily = (historyByCampaign[c.id] || []).map(r => {
       const conv = conversions(r);
       const spend = parseFloat(r.spend) || 0;
-      return { date: r.date_start, spend, revenue: conv.revenue, roas: spend > 0 ? conv.revenue / spend : 0 };
+      return { date: r.date_start, spend, revenue: conv.revenue, purchases: conv.purchases,
+               roas: spend > 0 ? conv.revenue / spend : 0 };
     });
 
     const j = judgedByCampaign[c.id] || {};
@@ -876,6 +921,7 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       accountId,
       accountName,
       status: (c.effective_status || c.status || '').toUpperCase(),
+      issues: c.issues_info || [],
       learning: !!learningByCampaign[c.id],
       budget,
       budgetSource,
@@ -902,7 +948,7 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       // Streaks judge closed days only — never the day still in progress.
       history: daily
     };
-  }).filter(c => c.spend > 0 || c.status === 'ACTIVE');
+  }).filter(c => c.spend > 0 || c.status === 'ACTIVE' || c.status === 'WITH_ISSUES');
 
   // ---- ads table ----
   const creativeById = {};
@@ -922,9 +968,19 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
   // Ads Meta is refusing to deliver — these never reach the insights list, so
   // they have to be collected from the ad objects themselves.
   const adStatuses = adsMeta.map(a => ({
+    id: a.id,
     name: a.name || a.id,
     campaignId: a.campaign_id || '',
-    effectiveStatus: (a.effective_status || '').toUpperCase()
+    effectiveStatus: (a.effective_status || '').toUpperCase(),
+    issues: a.issues_info || [],
+    reviewFeedback: a.ad_review_feedback || null
+  }));
+
+  const adsetStatuses = (adsets || []).map(x => ({
+    name: x.name || x.id,
+    campaignId: x.campaign_id || '',
+    effectiveStatus: (x.effective_status || '').toUpperCase(),
+    issues: x.issues_info || []
   }));
 
   const ads = adInsights.map(r => {
@@ -1005,7 +1061,7 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
     });
   });
 
-  return { campaigns: built, ads, adStatuses, lpvEstimated };
+  return { campaigns: built, ads, adStatuses, adsetStatuses, lpvEstimated };
 }
 
 function decodeFormat(t) {
@@ -1156,6 +1212,12 @@ function computeVerdicts() {
 
     c.verdict = VE.verdict(c, ctx);
 
+    /* The ladder asks whether today is profitable. The curve asks whether the
+       last increase was worth it, from this campaign's own days — and a scale
+       past the level where it earned most is turned into a hold. */
+    c.curve = VE.spendCurve(c.history, ber);
+    c.verdict = VE.applyCeiling(c.verdict, c.curve);
+
     // Stability check — shown as a note, never as a second verdict.
     const pool = metaTrendPool(c, 3);
     c.trend = pool ? VE.windowAgreement(
@@ -1297,9 +1359,11 @@ function renderVerdicts() {
           <div class="verdict-badge tone-${v.tone}">${VERDICT_ICON[v.code] || ''} ${esc(v.headline)} ${lockChip}</div>
         </header>
 
+        ${deliveryBlock(c)}
         ${revenueLine(c)}
         <div class="evidence-line">${evidenceChip}</div>
         ${budgetLine}
+        ${curveBlock(c)}
 
         <div class="verdict-stats">
           <div class="vstat tone-${roasTone}" title="${v.confidence && v.confidence.interval ? `Resting on ${v.confidence.orders} orders, so the real figure is between ${v.confidence.interval.lo} and ${v.confidence.interval.hi}` : 'No orders behind this figure'}">
@@ -1336,6 +1400,59 @@ function renderVerdicts() {
         </footer>
       </article>`;
   }).join('');
+}
+
+/* Where this campaign stops paying for more budget, from its own days. */
+function curveBlock(c) {
+  const cv = c.curve;
+  if (!cv) return '';
+  if (!cv.bands || cv.state === 'thin' || cv.state === 'flat') {
+    return `<div class="curve curve-quiet"><span class="curve-title">💶 Budget sweet spot</span> ${esc(cv.reason)}</div>`;
+  }
+  const tag = cv.state === 'ceiling' ? `best at ${fmtMoney(cv.ceiling.from, 0)}–${fmtMoney(cv.ceiling.to, 0)} a day`
+    : cv.state === 'room' ? 'room to scale'
+    : cv.state === 'unprofitable' ? 'no profitable level' : 'no clear ceiling';
+  const peak = Math.max(...cv.bands.map(b => Math.abs(b.profitPerDay)), 1);
+  const rows = cv.bands.map(b => `
+    <tr class="${b === cv.best && cv.state !== 'unprofitable' ? 'curve-best' : ''}">
+      <td>${fmtMoney(b.from, 0)}–${fmtMoney(b.to, 0)}<span class="curve-days">${b.days} days</span></td>
+      <td class="num">${b.roas.toFixed(2)}</td>
+      <td class="num"><span class="curve-bar ${b.profitPerDay < 0 ? 'neg' : ''}"><i style="width:${Math.round(Math.abs(b.profitPerDay) / peak * 100)}%"></i></span>${b.profitPerDay < 0 ? '−' : ''}${fmtMoney(Math.abs(b.profitPerDay), 0)}</td>
+    </tr>`).join('');
+  return `
+    <div class="curve curve-${cv.state}">
+      <div class="curve-head"><span class="curve-title">💶 Budget sweet spot</span><span class="curve-tag">${esc(tag)}</span></div>
+      <table>
+        <thead><tr><th>Spend a day</th><th class="num">ROAS</th><th class="num">Profit a day</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p class="curve-why">${esc(cv.reason)}</p>
+      <p class="curve-foot">From ${cv.days} closed days of Meta-reported revenue at this campaign's break-even. It shows the shape, not the cents.</p>
+    </div>`;
+}
+
+/* What Meta is refusing to run in this campaign, and why, on the card that is
+   being judged — not in an account-wide list three screens away. */
+function deliveryBlock(c) {
+  const d = VE.campaignDelivery(c, State.adStatuses || [], State.adsetStatuses || []);
+  if (!d.severity) return '';
+  const icon = d.severity === 'alert' ? '⛔' : d.severity === 'warning' ? '⚠️' : '🕓';
+  const line = (label, list) => list.map(x =>
+    `<li><b>${esc(label)}</b> ${esc(x.name)}${x.reason ? ` — <span class="dlv-why">${esc(x.reason)}</span>` : ' — <span class="dlv-why none">Meta gave no reason through the API; open the ad in Ads Manager</span>'}</li>`).join('');
+  return `
+    <div class="dlv dlv-${d.severity}">
+      <div class="dlv-head">${icon} <strong>${esc(d.headline)}</strong>
+        <span class="dlv-count">${d.delivering} of ${d.considered} ads running</span></div>
+      <ul class="dlv-list">
+        ${line('Rejected:', d.rejected)}
+        ${line('Billing hold:', d.billing)}
+        ${line('Issue:', d.withIssues)}
+        ${line('Ad set:', d.adsetIssues)}
+        ${d.campaignIssues ? `<li><b>Campaign:</b> <span class="dlv-why">${esc(d.campaignIssues)}</span></li>` : ''}
+        ${line('In review:', d.inReview)}
+      </ul>
+      ${d.note ? `<p class="dlv-note">${esc(d.note)}</p>` : ''}
+    </div>`;
 }
 
 /* A funnel chip must never show a green number it guessed. When landing page
@@ -1839,6 +1956,165 @@ function copyBrief(key) {
 window.copyBrief = copyBrief;
 
 /* ========================================================================== *
+ *  COUNTRY & PLACEMENT
+ * ========================================================================== *
+ * Loaded on request, not on every sync: it costs two extra Meta requests, and
+ * the hourly request limit is the thing that takes the whole dashboard down.
+ * Orders in these tables are Meta-attributed. Shopify knows what was sold but
+ * not which placement sold it, so this section shows where the money went —
+ * it is not a second profit calculation.
+ * ========================================================================== */
+const PLATFORM_LABEL = { facebook: 'Facebook', instagram: 'Instagram', audience_network: 'Audience Network',
+                         messenger: 'Messenger', threads: 'Threads', whatsapp: 'WhatsApp' };
+
+function placementLabel(platform, position) {
+  const plat = PLATFORM_LABEL[platform] || String(platform || 'Unknown');
+  let pos = String(position || '').replace(new RegExp('^' + platform + '_'), '').replace(/_/g, ' ').trim();
+  if (pos === 'an classic') pos = 'native & banner';
+  return pos ? `${plat} · ${pos.charAt(0).toUpperCase()}${pos.slice(1)}` : plat;
+}
+
+function countryLabel(code) {
+  if (!code) return 'Unknown';
+  try { return new Intl.DisplayNames(['en'], { type: 'region' }).of(String(code).toUpperCase()) || code; }
+  catch (e) { return code; }
+}
+
+async function loadBreakdowns() {
+  if (State.source !== 'api') return;
+  const acc = accountIds()[0];
+  const keep = State.breakdowns && State.breakdowns.campaign;
+  State.breakdowns = { loading: true };
+  renderBreakdowns();
+  try {
+    const win = windowParams();
+    const fields = 'campaign_id,spend,impressions,inline_link_clicks,actions,action_values';
+    const [country, placement] = await Promise.all([
+      graph(`${acc}/insights`, Object.assign({ level: 'campaign', fields, breakdowns: 'country', limit: 500 }, win)),
+      graph(`${acc}/insights`, Object.assign({ level: 'campaign', fields, breakdowns: 'publisher_platform,platform_position', limit: 500 }, win))
+    ]);
+    const norm = (r, key, label) => {
+      const c = conversions(r);
+      return { campaignId: r.campaign_id, key, label,
+               spend: parseFloat(r.spend) || 0, impressions: parseInt(r.impressions) || 0,
+               clicks: parseInt(r.inline_link_clicks) || 0, purchases: c.purchases, revenue: c.revenue };
+    };
+    State.breakdowns = {
+      loadedAt: Date.now(), campaign: keep || 'all', window: windowLabel(),
+      country: (country.data || []).map(r => norm(r, r.country, countryLabel(r.country))),
+      placement: (placement.data || []).map(r =>
+        norm(r, `${r.publisher_platform}|${r.platform_position}`, placementLabel(r.publisher_platform, r.platform_position)))
+    };
+  } catch (e) {
+    State.breakdowns = {
+      error: /request limit|rate limit|#17|#4\b/i.test(e.message)
+        ? "Meta's hourly request limit is used up. Nothing is broken — try again in a while."
+        : e.message
+    };
+  }
+  renderBreakdowns();
+}
+
+function breakdownHost() {
+  let el = document.getElementById('breakdowns');
+  if (!el) {
+    el = document.createElement('section');
+    el.id = 'breakdowns';
+    el.className = 'section-block';
+    const guard = document.getElementById('guardrails');
+    if (guard && guard.parentNode) guard.parentNode.insertBefore(el, guard);
+    else document.body.appendChild(el);
+  }
+  return el;
+}
+
+function breakdownTable(title, firstCol, result, maxRows) {
+  const rows = result.rows;
+  if (!rows.length) return `<div class="bd-table card"><h3>${esc(title)}</h3><p class="bd-empty">No spend in this window.</p></div>`;
+  const shown = rows.slice(0, maxRows), rest = rows.slice(maxRows);
+  const restSpend = rest.reduce((s, r) => s + r.spend, 0);
+  const cell = v => (result.conversionsReported ? v : '—');
+  return `
+    <div class="bd-table card">
+      <h3>${esc(title)}</h3>
+      <table>
+        <thead><tr><th>${esc(firstCol)}</th><th class="num">Spend</th><th class="num">Share</th>
+          <th class="num">Orders</th><th class="num">Cost / order</th><th class="num">ROAS</th></tr></thead>
+        <tbody>
+          ${shown.map(r => `
+            <tr class="${r.flag ? 'bd-' + r.flag : ''}">
+              <td>${esc(r.label)}${r.flagText ? `<span class="bd-flag">${r.flag === 'strong' ? '▲' : '▼'} ${esc(r.flagText)}</span>` : ''}</td>
+              <td class="num">${fmtMoney(r.spend, 0)}</td>
+              <td class="num"><span class="bd-bar"><i style="width:${Math.min(100, r.sharePct)}%"></i></span>${r.sharePct}%</td>
+              <td class="num">${cell(r.purchases)}</td>
+              <td class="num">${cell(r.cpa === null ? '—' : fmtMoney(r.cpa))}</td>
+              <td class="num">${cell(r.roas === null ? '—' : r.roas.toFixed(2))}</td>
+            </tr>`).join('')}
+          ${rest.length ? `<tr class="bd-rest"><td>${rest.length} smaller ${rest.length === 1 ? 'row' : 'rows'}</td><td class="num">${fmtMoney(restSpend, 0)}</td><td colspan="4"></td></tr>` : ''}
+        </tbody>
+      </table>
+      ${result.conversionsReported ? '' : `<p class="bd-warn">Meta returned no orders for this split even though the campaign has them. That is missing data, not zero sales — only the spend columns can be read here.</p>`}
+    </div>`;
+}
+
+function renderBreakdowns() {
+  const host = breakdownHost();
+  const b = State.breakdowns;
+  const head = `
+    <h2 class="section-title">🌍 Country &amp; placement</h2>
+    <p class="section-lede">
+      Where each campaign's budget went. Orders and ROAS in these tables are <strong>Meta-attributed</strong> —
+      Shopify knows what was sold, not which placement sold it — so use this to see where money is going,
+      not to work out profit.
+    </p>`;
+
+  if (State.source !== 'api') {
+    host.innerHTML = head + `<p class="bd-empty">Needs a live Meta connection — there is nothing to split in ${State.source === 'csv' ? 'a CSV' : 'demo data'}.</p>`;
+    return;
+  }
+  if (!b) {
+    host.innerHTML = head + `<button class="btn btn-secondary" id="bd-load">Load country &amp; placement</button>
+      <span class="bd-hint">Two extra Meta requests, so it loads only when you ask.</span>`;
+    document.getElementById('bd-load').addEventListener('click', loadBreakdowns);
+    return;
+  }
+  if (b.loading) { host.innerHTML = head + `<p class="bd-empty">Loading…</p>`; return; }
+  if (b.error) {
+    host.innerHTML = head + `<p class="bd-warn">${esc(b.error)}</p><button class="btn btn-secondary" id="bd-load">Try again</button>`;
+    document.getElementById('bd-load').addEventListener('click', loadBreakdowns);
+    return;
+  }
+
+  const sel = b.campaign || 'all';
+  const camp = State.campaigns.find(c => c.id === sel);
+  const pick = rows => (camp ? rows.filter(r => r.campaignId === camp.id) : rows);
+  const expected = camp ? (camp.metaPurchases || 0)
+    : State.campaigns.reduce((s, c) => s + (c.metaPurchases || 0), 0);
+  const country = VE.breakdown(pick(b.country), { expectedPurchases: expected });
+  const placement = VE.breakdown(pick(b.placement), { expectedPurchases: expected });
+
+  host.innerHTML = head + `
+    <div class="bd-controls">
+      <select id="bd-campaign" class="select-input" aria-label="Campaign">
+        <option value="all"${sel === 'all' ? ' selected' : ''}>All campaigns</option>
+        ${State.campaigns.map(c => `<option value="${esc(c.id)}"${c.id === sel ? ' selected' : ''}>${esc(VE.productLabel(c.name))}</option>`).join('')}
+      </select>
+      <button class="btn btn-secondary btn-small" id="bd-load">Refresh</button>
+      <span class="bd-hint">${esc(b.window || '')} · loaded ${esc(ageText(b.loadedAt) || 'just now')}${country.avgCpa ? ` · average cost per order ${fmtMoney(country.avgCpa)}` : ''}</span>
+    </div>
+    <div class="bd-grid">
+      ${breakdownTable('By country', 'Country', country, 8)}
+      ${breakdownTable('By placement', 'Placement', placement, 8)}
+    </div>`;
+
+  document.getElementById('bd-load').addEventListener('click', loadBreakdowns);
+  document.getElementById('bd-campaign').addEventListener('change', e => {
+    State.breakdowns.campaign = e.target.value;
+    renderBreakdowns();
+  });
+}
+
+/* ========================================================================== *
  *  GUARDRAILS
  * ========================================================================== */
 function renderGuardrails() {
@@ -1846,7 +2122,8 @@ function renderGuardrails() {
 
   // Delivery alarms come first — a stopped campaign matters more than a
   // mediocre one.
-  const items = VE.deliveryAlarms(State.campaigns, State.adStatuses || [], { dayIsOver: dayIsOver() })
+  const items = (State.accountInfo || []).flatMap(a => VE.accountHealth(a))
+    .concat(VE.deliveryAlarms(State.campaigns, State.adStatuses || [], { dayIsOver: dayIsOver() }))
     .concat(VE.guardrails(State.campaigns));
 
   if (State.accountErrors && State.accountErrors.length) {
@@ -2553,6 +2830,66 @@ function injectStyles() {
   .acct-hint { font-size: 12px; opacity: .6; }
   .acct-hint.acct-hint-warn { color: var(--color-warning, #f59e0b); opacity: 1; }
 
+  /* Delivery block on a verdict card */
+  .dlv { margin: .1rem 0 .7rem; padding: .6rem .75rem; border-radius: 10px; font-size: 12.5px;
+    border: 1px solid var(--color-border, rgba(255,255,255,.12)); }
+  .dlv-alert { border-left: 4px solid var(--color-danger, #ef4444); background: rgba(239,68,68,.07); }
+  .dlv-warning { border-left: 4px solid var(--color-warning, #f59e0b); background: rgba(245,158,11,.06); }
+  .dlv-info { border-left: 4px solid var(--accent-primary, #6366f1); }
+  .dlv-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .3rem .6rem; }
+  .dlv-count { margin-left: auto; opacity: .7; font-size: 12px; }
+  .dlv-list { margin: .4rem 0 0; padding-left: 1.1rem; }
+  .dlv-list li { margin: .15rem 0; }
+  .dlv-list b { font-weight: 600; }
+  .dlv-why { opacity: .85; }
+  .dlv-why.none { opacity: .55; font-style: italic; }
+  .dlv-note { margin: .45rem 0 0; opacity: .8; }
+
+  /* Budget sweet spot */
+  .curve { margin: .2rem 0 .7rem; padding: .6rem .75rem; border-radius: 10px; font-size: 12.5px;
+    border: 1px solid var(--color-border, rgba(255,255,255,.12)); }
+  .curve-quiet { opacity: .7; font-size: 12px; }
+  .curve-ceiling { border-left: 4px solid var(--color-warning, #f59e0b); }
+  .curve-room { border-left: 4px solid var(--color-success, #10b981); }
+  .curve-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .3rem .6rem; margin-bottom: .35rem; }
+  .curve-title { font-weight: 600; }
+  .curve-tag { margin-left: auto; font-size: 12px; opacity: .8; }
+  .curve table { width: 100%; border-collapse: collapse; }
+  .curve th { text-align: left; font-size: 10.5px; font-weight: 600; opacity: .6; text-transform: uppercase;
+    letter-spacing: .04em; padding: .15rem .2rem; }
+  .curve td { padding: .25rem .2rem; border-top: 1px solid var(--color-border, rgba(255,255,255,.06)); }
+  .curve .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .curve-days { opacity: .55; margin-left: .4rem; font-size: 11px; }
+  .curve-best td { font-weight: 600; }
+  .curve-bar { display: inline-block; width: 54px; height: 5px; border-radius: 3px; margin-right: .4rem; vertical-align: middle;
+    background: var(--color-border, rgba(255,255,255,.12)); overflow: hidden; }
+  .curve-bar i { display: block; height: 100%; background: var(--color-success, #10b981); }
+  .curve-bar.neg i { background: var(--color-danger, #ef4444); }
+  .curve-why { margin: .45rem 0 0; }
+  .curve-foot { margin: .25rem 0 0; opacity: .55; font-size: 11.5px; }
+
+  /* Country & placement */
+  .bd-controls { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .8rem; margin: 0 0 .8rem; }
+  .bd-hint { font-size: 12px; opacity: .65; }
+  .bd-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+  .bd-table { padding: 14px 16px; overflow-x: auto; }
+  .bd-table h3 { font-size: 14px; margin: 0 0 .5rem; }
+  .bd-table table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .bd-table th { text-align: left; font-weight: 600; opacity: .65; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .04em; padding: .3rem .4rem; border-bottom: 1px solid var(--color-border, rgba(255,255,255,.12)); }
+  .bd-table td { padding: .42rem .4rem; border-bottom: 1px solid var(--color-border, rgba(255,255,255,.06)); vertical-align: top; }
+  .bd-table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .bd-bar { display: inline-block; width: 46px; height: 5px; border-radius: 3px; margin-right: .4rem; vertical-align: middle;
+    background: var(--color-border, rgba(255,255,255,.12)); overflow: hidden; }
+  .bd-bar i { display: block; height: 100%; background: var(--accent-secondary, #8b5cf6); }
+  .bd-flag { display: block; font-size: 11.5px; margin-top: .12rem; }
+  .bd-bleed .bd-flag, .bd-weak .bd-flag { color: var(--color-danger, #ef4444); }
+  .bd-strong .bd-flag { color: var(--color-success, #10b981); }
+  .bd-rest td { opacity: .6; }
+  .bd-empty { opacity: .7; font-size: 13px; }
+  .bd-warn { color: var(--color-warning, #f59e0b); font-size: 12.5px; margin: .5rem 0; }
+  @media (max-width: 760px) { .bd-grid { grid-template-columns: 1fr; } }
+
   /* Date bar — style.css predates it too. */
   .date-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
     gap: .6rem 1rem; padding: .7rem .9rem; margin: 0 0 .5rem; }
@@ -2716,6 +3053,7 @@ function renderAll() {
   renderTruthPanel();
   renderVerdicts();
   renderCreativeDesk();
+  renderBreakdowns();
   renderGuardrails();
   renderKpis();
   renderFunnel();
