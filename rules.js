@@ -1373,6 +1373,15 @@
       const d = c.desk, f = c.fresh, v = c.verdict || {};
       const before = items.length;
 
+      /* A campaign that is switched off has nothing left to decide. The budget
+         rules still produce a read for the day it ran — that is history, not a
+         task. */
+      if (c.status && !/^(ACTIVE|WITH_ISSUES)$/i.test(c.status)) {
+        quiet.push({ campaign: label, campaignId: c.id,
+          text: `Already ${String(c.status).toLowerCase().replace(/_/g, ' ')}. Nothing to do.` });
+        return;
+      }
+
       if (d && d.verdicts) {
         const pause = d.verdicts.toPause || [];
         const held = (d.verdicts.bleeding || []).filter(a => a.heldFromPause);
@@ -1410,7 +1419,7 @@
           lines: [], money: 0,
           why: (v.reasons && v.reasons[0]) || ''
         });
-      } else if (FIX[v.code]) {
+      } else if (FIX[v.code] && (v.code === 'NEEDS_SETUP' || num(c.lpv) >= 100)) {
         items.push({
           priority: 3, kind: 'fix', when: 'Today', campaign: label, campaignId: c.id,
           title: `${label}: ${FIX[v.code]}`, lines: [], money: 0,
@@ -1434,7 +1443,8 @@
 
       if (items.length === before) {
         quiet.push({ campaign: label, campaignId: c.id,
-          text: f && f.state === 'learning' ? 'Still in its first days. Leave it alone and do not judge it yet.'
+          text: FIX[v.code] && num(c.lpv) < 100 ? `Only ${Math.round(num(c.lpv))} landing-page views so far — too few to say where the funnel leaks. Leave it running.`
+              : f && f.state === 'learning' ? 'Still in its first days. Leave it alone and do not judge it yet.'
               : v.headline ? `${v.headline}. No ad to pause, no creative needed yet.` : 'Nothing to do.' });
       }
     });

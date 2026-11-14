@@ -1323,6 +1323,18 @@ function computeVerdicts() {
     c.curve = VE.spendCurve(c.history, ber);
     c.verdict = VE.applyCeiling(c.verdict, c.curve);
 
+    /* A campaign that is switched off has no decision left. The ladder still
+       reads the day it ran (it spent today before being paused), which would
+       show "Kill it" on something already killed. */
+    if (c.status && !DELIVERING.includes(c.status)) {
+      const was = c.verdict;
+      c.verdict = { ...was, code: 'MONITOR', tone: 'neutral',
+        headline: `Already ${c.status.toLowerCase().replace(/_/g, ' ')} — nothing to do`,
+        budgetFrom: null, budgetTo: null, budgetDelta: null,
+        reasons: [`While it ran, the rules read: ${was.headline.toLowerCase()}. It is switched off now, so there is nothing to apply.`],
+        notes: [] };
+    }
+
     /* The ad-level read: which ads to pause, and whether to add new ones. */
     c.desk = null; c.fresh = null;
     if (c.status === 'ACTIVE' || c.status === 'WITH_ISSUES') {
