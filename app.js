@@ -466,7 +466,7 @@ async function graphAll(path, params, maxPages) {
    are not a delivery problem. */
 const LIVE_AD_STATUSES = ['ACTIVE', 'DISAPPROVED', 'WITH_ISSUES', 'PENDING_REVIEW',
                           'IN_PROCESS', 'PENDING_BILLING_INFO', 'PREAPPROVED'];
-const AD_OBJECT_FIELDS = 'id,name,campaign_id,effective_status,issues_info,ad_review_feedback,' +
+const AD_OBJECT_FIELDS = 'id,name,campaign_id,created_time,effective_status,issues_info,ad_review_feedback,' +
                          'creative{id,title,body,object_type,video_id,thumbnail_url}';
 
 /* ==========================================================================
@@ -641,9 +641,39 @@ function windowLabel() {
   return LS.get('meta_date_preset', 'today').replace(/_/g, ' ');
 }
 
+/* THE CREATIVE DESK'S OWN WINDOW
+   --------------------------------------------------------------------------
+   Whether an ad has earned its place cannot depend on which day the date bar
+   happens to show. Judged on "today" every ad looks like a €9 test; judged on
+   "last month" a dead ad looks alive. So the desk always reads the last seven
+   closed days per ad, plus fourteen days of daily clicks and CPM so it can see
+   an ad wearing out. Two extra requests, cached for 20 minutes because the
+   hourly request limit is the thing that has taken this dashboard down before. */
+const CREATIVE_TTL_MS = 20 * 60 * 1000;
+async function creativeLookback(acc) {
+  const key = `cgo_creative_cache::${acc}`;
+  let cached = null;
+  try { cached = JSON.parse(LS.get(key, 'null')); } catch (e) { cached = null; }
+  if (cached && cached.t && Date.now() - cached.t < CREATIVE_TTL_MS) return { ...cached.data, cached: true };
+  try {
+    const [l, d] = await Promise.all([
+      graphAll(`${acc}/insights`, { level: 'ad', fields: AD_FIELDS, date_preset: 'last_7d', limit: 300 }),
+      graphAll(`${acc}/insights`, { level: 'ad', fields: 'ad_id,spend,impressions,inline_link_clicks',
+                                    date_preset: 'last_14d', time_increment: 1, limit: 500 }, 4)
+    ]);
+    const data = { rows: l.data || [], daily: d.data || [] };
+    try { LS.set(key, JSON.stringify({ t: Date.now(), data })); } catch (e) { /* quota — the cache is optional */ }
+    return data;
+  } catch (e) {
+    // Rate-limited or refused: fall back to the last good copy rather than going blind.
+    if (cached && cached.data) return { ...cached.data, stale: true, error: e.message };
+    return { rows: [], daily: [], error: e.message };
+  }
+}
+
 async function fetchAccount(acc, preset) {
   const win = windowParams();
-  const [account, campaigns, adsets, judged, history, adInsights, adsMeta] = await Promise.all([
+  const [account, campaigns, adsets, judged, history, adInsights, adsMeta, lookback] = await Promise.all([
     // account_status / spend_cap are the problems that stop everything at once
     graph(acc, { fields: 'name,currency,timezone_name,account_status,disable_reason,spend_cap,amount_spent' }),
     graphAll(`${acc}/campaigns`, { fields: 'id,name,status,effective_status,daily_budget,lifetime_budget,created_time,issues_info', limit: 200 }),
@@ -654,14 +684,16 @@ async function fetchAccount(acc, preset) {
     graph(`${acc}/insights`, { level: 'campaign', fields: 'campaign_id,spend,actions,action_values,purchase_roas', date_preset: 'last_30d', time_increment: 1, limit: 800 }),
     graph(`${acc}/insights`, Object.assign({ level: 'ad', fields: AD_FIELDS, limit: 300 }, win)),
     // issues_info and ad_review_feedback carry Meta's own reason for a refusal
-    graphAll(`${acc}/ads`, { fields: AD_OBJECT_FIELDS, effective_status: JSON.stringify(LIVE_AD_STATUSES), limit: 300 })
+    graphAll(`${acc}/ads`, { fields: AD_OBJECT_FIELDS, effective_status: JSON.stringify(LIVE_AD_STATUSES), limit: 300 }),
+    // the creative desk's own fixed window — see creativeLookback()
+    creativeLookback(acc)
   ]);
 
   /* An ad that spent in this window and was paused since is not in the list
      above, but its row still needs a headline, a format and a video. Fetch
      just those by id — usually none, occasionally a handful. */
   const known = new Set((adsMeta.data || []).map(a => a.id));
-  const missing = [...new Set((adInsights.data || []).map(r => r.ad_id).filter(id => id && !known.has(id)))].slice(0, 100);
+  const missing = [...new Set((adInsights.data || []).concat(lookback.rows || []).map(r => r.ad_id).filter(id => id && !known.has(id)))].slice(0, 100);
   for (let i = 0; i < missing.length; i += 50) {
     try {
       const res = await graph('', { ids: missing.slice(i, i + 50).join(','), fields: AD_OBJECT_FIELDS });
@@ -689,6 +721,7 @@ async function fetchAccount(acc, preset) {
     campaigns: campaigns.data || [], adsets: adsets.data || [],
     judged: judged.data || [], history: history.data || [],
     adInsights: adInsights.data || [], adsMeta: adsMeta.data || [], preset,
+    adLookback: lookback.rows || [], adDaily: lookback.daily || [], lookbackError: lookback.error || null,
     accountId: acc, accountName: account.name || acc, videoLengths: lengths
   });
 
@@ -727,6 +760,8 @@ async function syncMetaAPI() {
     State.accountErrors = failed.map(f => `${f.accountId}: ${f.message}`);
     State.campaigns = ok.flatMap(r => r.campaigns);
     State.ads = ok.flatMap(r => r.ads);
+    State.creative = ok.flatMap(r => (r.creative && r.creative.rows) || []);
+    State.creativeInfo = ok.map(r => r.creative).filter(Boolean)[0] || null;
     State.adStatuses = ok.flatMap(r => r.adStatuses || []);
     State.adsetStatuses = ok.flatMap(r => r.adsetStatuses || []);
     State.accountInfo = ok.map(r => r.account);
@@ -782,6 +817,8 @@ function loadDemoFallback() {
   const demo = buildDemoData();
   State.campaigns = demo.campaigns;
   State.ads = demo.ads;
+  State.creative = demo.ads.map(a => a._creative).filter(Boolean);
+  State.creativeInfo = { window: 'demo data', fallback: true };
   State.source = 'demo';
   State.truth = null;
   State.truthStatus = null;
@@ -851,7 +888,7 @@ function conversions(row) {
   return { purchases, revenue, atc, ic, lpvRaw };
 }
 
-function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta, preset, accountId, accountName, videoLengths }) {
+function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta, preset, accountId, accountName, videoLengths, adLookback, adDaily, lookbackError }) {
   const vlen = videoLengths || {};
   let lpvEstimated = false;
 
@@ -961,6 +998,7 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       videoId: (a.creative && a.creative.video_id) || '',
       thumbnail: (a.creative && a.creative.thumbnail_url) || '',
       effectiveStatus: (a.effective_status || '').toUpperCase(),
+      createdTime: a.created_time || '',
       name: a.name || ''
     };
   });
@@ -982,6 +1020,14 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
     effectiveStatus: (x.effective_status || '').toUpperCase(),
     issues: x.issues_info || []
   }));
+
+  const dailyByAd = {};
+  (adDaily || []).forEach(r => {
+    (dailyByAd[r.ad_id] = dailyByAd[r.ad_id] || []).push({
+      date: r.date_start, spend: parseFloat(r.spend) || 0,
+      impressions: parseInt(r.impressions) || 0, clicks: parseInt(r.inline_link_clicks) || 0 });
+  });
+  Object.values(dailyByAd).forEach(rows => rows.sort((a, b) => (a.date || '').localeCompare(b.date || '')));
 
   const ads = adInsights.map(r => {
     const cr = creativeById[r.ad_id] || {};
@@ -1006,30 +1052,7 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
     const metaRoas = Array.isArray(r.purchase_roas) && r.purchase_roas.length
       ? parseFloat(r.purchase_roas[0].value) || 0 : 0;
 
-    /* The structured shape the creative desk reads. Kept alongside the
-       display row rather than parsed back out of formatted strings. */
-    const creativeRow = {
-      id: r.ad_id,
-      name: r.ad_name || r.ad_id,
-      campaignId: r.campaign_id || '',
-      campaign: r.campaign_name || '',
-      type: cr.type || (v3 > 0 ? 'Video' : 'Image'),
-      impressions,
-      v3,
-      p25: actionVal(r.video_p25_watched_actions, 'video_view'),
-      p50: actionVal(r.video_p50_watched_actions, 'video_view'),
-      p75: actionVal(r.video_p75_watched_actions, 'video_view'),
-      p100: actionVal(r.video_p100_watched_actions, 'video_view'),
-      avgWatchSec: actionVal(r.video_avg_time_watched_actions, 'video_view'),
-      lengthSec: vlen[cr.videoId] || 0,
-      clicks,
-      spend,
-      purchases: conv.purchases,
-      revenue: conv.revenue,
-      thumbnail: cr.thumbnail || '',
-      status: cr.effectiveStatus || '',
-      days: 1
-    };
+    const creativeRow = creativeRowFrom(r, cr, vlen, dailyByAd, conv, v3, impressions, clicks, spend);
 
     return normalizeAd({
       _creative: creativeRow,
@@ -1061,7 +1084,56 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
     });
   });
 
-  return { campaigns: built, ads, adStatuses, adsetStatuses, lpvEstimated };
+  /* The desk's rows come from its own seven-day window when Meta answered for
+     it, and from the date bar's window only as a fallback. */
+  let creative;
+  if (adLookback && adLookback.length) {
+    const rows = adLookback.map(r => {
+      const cr = creativeById[r.ad_id] || {};
+      const conv = conversions(r);
+      const v3 = actionVal(r.actions, 'video_view') || actionVal(r.video_play_actions, 'video_view');
+      return creativeRowFrom(r, cr, vlen, dailyByAd, conv, v3,
+        parseInt(r.impressions) || 0, parseInt(r.inline_link_clicks) || 0, parseFloat(r.spend) || 0);
+    });
+    creative = { rows, window: 'last 7 closed days', fallback: false };
+  } else {
+    creative = { rows: ads.map(a => a._creative).filter(Boolean), window: windowLabel(), fallback: true,
+                 error: lookbackError || null };
+  }
+
+  return { campaigns: built, ads, adStatuses, adsetStatuses, lpvEstimated, creative };
+}
+
+/* The structured shape the creative desk reads. Kept beside the display row
+   rather than parsed back out of formatted strings. */
+function creativeRowFrom(r, cr, vlen, dailyByAd, conv, v3, impressions, clicks, spend) {
+  const created = cr.createdTime ? Date.parse(cr.createdTime) : NaN;
+  return {
+    id: r.ad_id,
+    name: r.ad_name || r.ad_id,
+    campaignId: r.campaign_id || '',
+    campaign: r.campaign_name || '',
+    type: cr.type || (v3 > 0 ? 'Video' : 'Image'),
+    impressions,
+    v3,
+    p25: actionVal(r.video_p25_watched_actions, 'video_view'),
+    p50: actionVal(r.video_p50_watched_actions, 'video_view'),
+    p75: actionVal(r.video_p75_watched_actions, 'video_view'),
+    p100: actionVal(r.video_p100_watched_actions, 'video_view'),
+    avgWatchSec: actionVal(r.video_avg_time_watched_actions, 'video_view'),
+    lengthSec: vlen[cr.videoId] || 0,
+    clicks,
+    spend,
+    purchases: conv.purchases,
+    revenue: conv.revenue,
+    atc: conv.atc,
+    frequency: parseFloat(r.frequency) || 0,
+    ageDays: Number.isFinite(created) ? Math.max(0, (Date.now() - created) / 86400000) : null,
+    daily: (dailyByAd && dailyByAd[r.ad_id]) || [],
+    thumbnail: cr.thumbnail || '',
+    status: cr.effectiveStatus || '',
+    days: 7
+  };
 }
 
 function decodeFormat(t) {
@@ -1184,6 +1256,25 @@ function metaTrendPool(c, days) {
   return { spend, revenue, purchases: 0, roas: spend > 0 ? revenue / spend : 0, days: rows.length };
 }
 
+/* Average order value, from this campaign's own last seven closed days as Meta
+   reported them — the same basis the per-ad revenue is on. One order costs
+   AOV ÷ break-even ROAS at break-even; that is the yardstick every ad is
+   judged against. Zero when there are too few orders to trust. */
+/* Ads that are switched on and being shown. Meta marks an ad WITH_ISSUES when
+   it is delivering but carries a warning — it is still spending, so it is
+   still a live ad and still a decision. Paused, disapproved and in-review ads
+   are not. */
+const DELIVERING = ['ACTIVE', 'WITH_ISSUES'];
+
+function campaignAov(c) {
+  const days = (c.history || []).filter(d => d.spend > 0).slice(-7);
+  const rev = days.reduce((t, d) => t + (d.revenue || 0), 0);
+  const ord = days.reduce((t, d) => t + (d.purchases || 0), 0);
+  if (ord >= 5) return rev / ord;
+  if ((c.metaPurchases || 0) >= 3) return c.metaRevenue / c.metaPurchases;
+  return 0;
+}
+
 function computeVerdicts() {
   const now = new Date();
   const ctxDay = VE.dayContext(now, State.accountTz);
@@ -1192,6 +1283,20 @@ function computeVerdicts() {
 
   applyTruth();
   detectAtcBroken();
+
+  /* The creative desk's rows, grouped by campaign. Only ads that are switched
+     on can be paused or counted as live; an ad paused earlier this week still
+     has spend rows but is not a decision. */
+  const creativeByCampaign = {};
+  (State.creative || []).forEach(r => {
+    if (r.status && !DELIVERING.includes(r.status)) return;
+    (creativeByCampaign[r.campaignId] = creativeByCampaign[r.campaignId] || []).push(r);
+  });
+  const activeAdsBy = {};
+  const haveAdStatuses = (State.adStatuses || []).length > 0;
+  (State.adStatuses || []).forEach(a => {
+    if (DELIVERING.includes(a.effectiveStatus)) activeAdsBy[a.campaignId] = (activeAdsBy[a.campaignId] || 0) + 1;
+  });
 
   State.campaigns.forEach(c => {
     const { ber, grossMargin, source } = berFor(c);
@@ -1217,6 +1322,24 @@ function computeVerdicts() {
        past the level where it earned most is turned into a hold. */
     c.curve = VE.spendCurve(c.history, ber);
     c.verdict = VE.applyCeiling(c.verdict, c.curve);
+
+    /* The ad-level read: which ads to pause, and whether to add new ones. */
+    c.desk = null; c.fresh = null;
+    if (c.status === 'ACTIVE' || c.status === 'WITH_ISSUES') {
+      const aov = campaignAov(c);
+      const week = (c.history || []).filter(d => d.spend > 0).slice(-7);
+      const spendPerDay = week.length ? week.reduce((t, d) => t + d.spend, 0) / week.length : 0;
+      c.aov = aov;
+      c.beCpa = aov > 0 && ber > 0 ? aov / ber : 0;
+      c.desk = CD.desk(VE.productLabel(c.name), creativeByCampaign[c.id] || [], {
+        ber, beCpa: c.beCpa, currency: State.currency, fullName: c.name,
+        campaignCpa: c.purchases > 0 ? c.spend / c.purchases : 0,
+        campaign: { history: c.history, learning: c.learning, daysLive: c.daysLive, spendPerDay },
+        curve: c.curve, streak: c.profitableStreak,
+        activeAds: haveAdStatuses ? (activeAdsBy[c.id] || 0) : undefined
+      });
+      c.fresh = c.desk.fresh;
+    }
 
     // Stability check — shown as a note, never as a second verdict.
     const pool = metaTrendPool(c, 3);
@@ -1364,6 +1487,7 @@ function renderVerdicts() {
         <div class="evidence-line">${evidenceChip}</div>
         ${budgetLine}
         ${curveBlock(c)}
+        ${freshBlock(c)}
 
         <div class="verdict-stats">
           <div class="vstat tone-${roasTone}" title="${v.confidence && v.confidence.interval ? `Resting on ${v.confidence.orders} orders, so the real figure is between ${v.confidence.interval.lo} and ${v.confidence.interval.hi}` : 'No orders behind this figure'}">
@@ -1403,6 +1527,25 @@ function renderVerdicts() {
 }
 
 /* Where this campaign stops paying for more budget, from its own days. */
+/* "Add new creatives, or not yet?" — on every card, in one line, with the
+   reasons underneath only when there are any. */
+const FRESH_TONE = { urgent: 'danger', add: 'warning', soon: 'neutral', ok: 'success', learning: 'neutral' };
+const FRESH_ICON = { urgent: '🚨', add: '🎬', soon: '🗓️', ok: '✅', learning: '⏳' };
+function freshBlock(c) {
+  const f = c.fresh;
+  if (!f) return '';
+  const tone = FRESH_TONE[f.state] || 'neutral';
+  const reasons = (f.signals || []).map(sg => sg.text).concat(f.opportunities || []);
+  const bleed = c.desk && c.desk.verdicts.bleeding ? c.desk.verdicts.bleeding : [];
+  return `
+    <div class="fresh tone-${tone}">
+      <div class="fresh-head"><span class="fresh-title">🎨 New creatives?</span>
+        <span class="fresh-tag ${tone}">${FRESH_ICON[f.state] || ''} ${esc(f.headline)}</span></div>
+      ${reasons.length ? `<ul class="fresh-why">${reasons.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : `<p class="fresh-quiet">${f.state === 'learning' ? 'Judging creative this early would be guessing.' : 'No sign of the ads wearing out. Do not add budget or new ads for the sake of it.'}</p>`}
+      <p class="fresh-foot">${f.liveAds} ad${f.liveAds === 1 ? '' : 's'} live${f.newLast7 ? ` · ${f.newLast7} launched in the last 7 days` : ''}${bleed.length ? ` · <b>${bleed.length} losing money — see Creative desk</b>` : ''}</p>
+    </div>`;
+}
+
 function curveBlock(c) {
   const cv = c.curve;
   if (!cv) return '';
@@ -1411,7 +1554,8 @@ function curveBlock(c) {
   }
   const tag = cv.state === 'ceiling' ? `best at ${fmtMoney(cv.ceiling.from, 0)}–${fmtMoney(cv.ceiling.to, 0)} a day`
     : cv.state === 'room' ? 'room to scale'
-    : cv.state === 'unprofitable' ? 'no profitable level' : 'no clear ceiling';
+    : cv.state === 'unprofitable' ? 'no profitable level'
+    : cv.state === 'plateau' ? 'extra budget is not paying' : 'no clear ceiling';
   const peak = Math.max(...cv.bands.map(b => Math.abs(b.profitPerDay)), 1);
   const rows = cv.bands.map(b => `
     <tr class="${b === cv.best && cv.state !== 'unprofitable' ? 'curve-best' : ''}">
@@ -1427,6 +1571,7 @@ function curveBlock(c) {
         <tbody>${rows}</tbody>
       </table>
       <p class="curve-why">${esc(cv.reason)}</p>
+      ${cv.state === 'plateau' && cv.efficient ? `<p class="curve-why"><strong>What this means:</strong> about ${fmtMoney(cv.efficient.spendPerDay, 0)} a day earned the same profit as ${fmtMoney(cv.top.spendPerDay, 0)}. The extra ${fmtMoney(cv.extraSpend, 0)} a day is idle money. Do not raise this budget — put new creatives in, and if you want that money working, put it in a new campaign.</p>` : ''}
       <p class="curve-foot">From ${cv.days} closed days of Meta-reported revenue at this campaign's break-even. It shows the shape, not the cents.</p>
     </div>`;
 }
@@ -1801,6 +1946,75 @@ function renderTruthPanel() {
 }
 
 /* ========================================================================== *
+ *  TONIGHT'S PLAN
+ * ========================================================================== *
+ * Every decision on the page, in the order to do them. It adds no new rules —
+ * it reads the verdicts, the spend curve and the ad calls already made. */
+const PLAN_ICON = { pause: '⛔', replace: '🔁', budget: '💶', fix: '🔧', creatives: '🎬' };
+
+function planHost() {
+  let el = document.getElementById('plan-panel');
+  if (!el) {
+    el = document.createElement('section');
+    el.id = 'plan-panel';
+    el.className = 'section-block';
+    const grid = document.getElementById('verdict-grid');
+    const sec = grid && grid.closest('section');
+    if (sec && sec.parentNode) sec.parentNode.insertBefore(el, sec);
+    else document.querySelector('main').appendChild(el);
+  }
+  return el;
+}
+
+function renderPlan() {
+  const host = planHost();
+  if (State.source !== 'api') {
+    host.innerHTML = `<h2 class="section-title">📝 What to do tonight</h2>
+      <p class="section-lede">Connect live data to get a plan. This page is showing demo numbers.</p>`;
+    return;
+  }
+  const plan = VE.tonightPlan(State.campaigns, { dayIsOver: dayIsOver() });
+  const sm = plan.summary;
+
+  const bits = [];
+  if (sm.pauseAds) bits.push(`<b>${sm.pauseAds}</b> ad${sm.pauseAds === 1 ? '' : 's'} to pause`);
+  if (sm.budgetMoves) bits.push(`<b>${sm.budgetMoves}</b> budget move${sm.budgetMoves === 1 ? '' : 's'}`);
+  if (sm.creativeJobs) bits.push(`<b>${sm.newAds}</b> new creatives to make`);
+  const headline = plan.items.length ? bits.join(' · ') : 'Nothing to do. Leave everything running.';
+
+  const cards = plan.items.map((it, i) => `
+    <div class="plan-item kind-${it.kind}">
+      <span class="plan-n">${i + 1}</span>
+      <div class="plan-main">
+        <div class="plan-title">${PLAN_ICON[it.kind] || ''} ${esc(it.title)}${it.money > 0 ? ` <span class="plan-money">${fmtMoney(it.money, 0)} lost in 7 days</span>` : ''}</div>
+        ${it.lines && it.lines.length ? `<ul class="plan-lines">${it.lines.map(l => `<li>${esc(l)}</li>`).join('')}</ul>` : ''}
+        ${it.why ? `<div class="plan-why">${esc(it.why)}</div>` : ''}
+        <div class="plan-when">When: ${esc(it.when)}</div>
+      </div>
+    </div>`).join('');
+
+  const quiet = plan.quiet.length ? `
+    <details class="plan-quiet"><summary>${plan.quiet.length} campaign${plan.quiet.length === 1 ? '' : 's'} need nothing tonight</summary>
+      <ul>${plan.quiet.map(q => `<li><strong>${esc(q.campaign)}</strong> — ${esc(q.text)}</li>`).join('')}</ul>
+    </details>` : '';
+
+  const rhythm = `<p class="plan-rhythm">New ads launched in the last 7 days across active campaigns: <b>${sm.newLast7}</b>. ${sm.newLast7 === 0 ? 'Nothing fresh has gone in all week — this is what makes scaling stall.' : ''}</p>`;
+
+  host.innerHTML = `
+    <h2 class="section-title">📝 What to do tonight</h2>
+    <p class="section-lede">${headline}. In this order. Each one comes from the campaign cards and the creative desk below — this is just the list.</p>
+    ${bleedBanner(sm)}
+    <div class="plan-list">${cards}</div>
+    ${quiet}
+    ${rhythm}`;
+}
+
+function bleedBanner(sm) {
+  if (!(sm.bleedPerWeek > 0)) return '';
+  return `<div class="plan-bleed">Ads below break-even have cost about <b>${fmtMoney(sm.bleedPerWeek, 0)}</b> over break-even in the last 7 days. Pausing them is the fastest money you can save.</div>`;
+}
+
+/* ========================================================================== *
  *  CREATIVE DESK
  * ========================================================================== */
 function creativeHost() {
@@ -1842,74 +2056,81 @@ const AD_CODE = {
   KEEP:         { label: 'Keep', tone: 'neutral' },
   KEEP_FOR_NOW: { label: 'Held — replace it', tone: 'warning' },
   TESTING:      { label: 'Still testing', tone: 'neutral' },
+  WATCH:        { label: 'Watch — do not add budget', tone: 'warning' },
   PAUSE:        { label: 'Pause', tone: 'danger' }
 };
 
 function renderCreativeDesk() {
   const host = creativeHost();
-  const rows = State.ads.map(a => a._creative).filter(Boolean);
+  const camps = State.campaigns.filter(c => c.desk && (c.desk.verdicts.count > 0 || (c.fresh && c.fresh.state !== 'learning')));
 
-  if (!rows.length) {
+  if (!camps.length) {
     host.innerHTML = `
       <h2 class="section-title">🎬 Creative desk</h2>
-      <p class="section-lede">No ad-level data in this window.</p>`;
+      <p class="section-lede">No ad-level data for the active campaigns yet.</p>`;
     return;
   }
 
-  /* Group by campaign so each brief is about one product and one offer. */
-  const byCampaign = {};
-  rows.forEach(r => {
-    const key = r.campaignId || r.campaign || 'Unassigned';
-    (byCampaign[key] = byCampaign[key] || { name: r.campaign || key, ads: [] }).ads.push(r);
-  });
+  const info = State.creativeInfo || {};
+  const windowNote = info.fallback
+    ? `<p class="fresh-warn">⚠ The seven-day ad read did not load${info.error ? ` (${esc(/request limit|rate limit|#17|#4\b/i.test(info.error) ? "Meta's hourly request limit is used up" : info.error)})` : ''}, so these ads are judged on the date bar's window instead. Pause calls are less reliable until it loads — reload in a few minutes.</p>`
+    : '';
 
-  const blocks = Object.entries(byCampaign).map(([key, group]) => {
-    const campaign = State.campaigns.find(c => c.id === key) || {};
-    const { ber } = campaign.id ? berFor(campaign) : { ber: State.econ && State.econ.valid ? State.econ.ber : 0 };
-    const cpa = campaign.purchases > 0 ? campaign.spend / campaign.purchases : 0;
-
-    const label = VE.productLabel(group.name);
-    const d = CD.desk(label, group.ads,
-      { ber, currency: State.currency, campaignCpa: cpa, fullName: group.name });
+  const blocks = camps.map(c => {
+    const d = c.desk;
+    const label = VE.productLabel(c.name);
+    const rowsById = {};
+    (State.creative || []).forEach(r => { rowsById[r.id] = r; });
 
     const adCards = d.verdicts.ads
-      .sort((a, b) => b.spend - a.spend)
+      .slice().sort((a, b) => (b.urgency === 'now') - (a.urgency === 'now') || b.spend - a.spend)
       .map(a => {
         const meta = AD_CODE[a.code] || AD_CODE.KEEP;
         const p = a.diagnosis.primary;
+        const src = rowsById[a.id];
+        const lost = a.lost > 0 && (a.code === 'PAUSE' || a.heldFromPause)
+          ? `<div class="ad-lost">Lost about ${fmtMoney(a.lost, 0)} against break-even in the last 7 days</div>` : '';
         return `
           <div class="ad-card tone-${meta.tone}">
             <div class="ad-head">
               <strong>${esc(a.name)}</strong>
-              <span class="ad-chip ${meta.tone}">${meta.label}</span>
+              <span class="ad-chip ${meta.tone}">${a.heldFromPause ? 'Pause after replacing' : meta.label}</span>
             </div>
             <div class="ad-nums">
               ${fmtMoney(a.spend, 0)} · ${a.purchases} order${a.purchases === 1 ? '' : 's'} · ROAS ${a.roas.toFixed(2)}
-              ${a.type === 'Video' ? ' · video' : ' · image'}
+              ${a.type === 'Video' ? ' · video' : ' · image'}${a.ageDays !== null && a.ageDays !== undefined ? ` · ${Math.round(a.ageDays)}d old` : ''}${a.frequency ? ` · freq ${a.frequency.toFixed(1)}` : ''}
             </div>
             <div class="ad-why">${esc(a.why)}</div>
-            ${retentionBar(CD.retention(group.ads.find(x => x.id === a.id)))}
+            ${lost}
+            ${src ? retentionBar(CD.retention(src)) : ''}
             <div class="ad-stages">
               ${a.diagnosis.stages.map(s => `
                 <span class="schip ${s.status}" title="${esc(s.measurable ? `${s.window} — target ${s.target}%+` : 'Not measurable for this ad')}">
                   ${esc(s.label)} ${s.measurable ? s.value + '%' : '—'}
                 </span>`).join('')}
             </div>
-            ${p ? `<div class="ad-fix"><strong>${esc(p.label)} — ${esc(p.window)}.</strong> ${esc(p.fails)}<br><em>${esc(p.fix)}</em></div>` : ''}
+            ${p && a.code !== 'TESTING' ? `<div class="ad-fix"><strong>${esc(p.label)} — ${esc(p.window)}.</strong> ${esc(p.fails)}<br><em>${esc(p.fix)}</em></div>` : ''}
           </div>`;
       }).join('');
+
+    const calm = !d.verdicts.count
+      ? '<p class="fresh-quiet">No active ad spent in the last 7 days.</p>' : '';
 
     return `
       <article class="card creative-card">
         <header class="creative-head">
           <h3>${esc(label)}</h3>
-          <span class="creative-sub">${d.verdicts.count} ads · fair test ${d.verdicts.threshold ? fmtMoney(d.verdicts.threshold, 0) : '—'}${d.verdicts.overSop ? ` · ${d.verdicts.overSop} over the SOP` : ''}</span>
+          <span class="creative-sub">${d.verdicts.count} ad${d.verdicts.count === 1 ? '' : 's'} · last 7 days · ${d.verdicts.statistical
+            ? `one sale costs ${fmtMoney(c.beCpa, 0)} at break-even · fair test ${fmtMoney(d.verdicts.threshold, 0)}`
+            : `fair test ${d.verdicts.threshold ? fmtMoney(d.verdicts.threshold, 0) : '—'} (no order value yet — pause calls use the older rule)`}${d.verdicts.overSop ? ` · ${d.verdicts.overSop} over the SOP` : ''}</span>
         </header>
+        ${freshBlock(c)}
         <div class="brief ${d.brief.urgent ? 'urgent' : ''}">
           <div class="brief-head">📋 ${esc(d.brief.headline)}</div>
           <div class="brief-body">${d.brief.lines.map(l => mdLine(l)).join('')}</div>
-          <button class="btn-mini" onclick="copyBrief('${esc(key)}')">Copy brief for the team</button>
+          <button class="btn-mini" onclick="copyBrief('${esc(c.id)}')">Copy brief for the team</button>
         </div>
+        ${calm}
         <div class="ad-grid">${adCards}</div>
       </article>`;
   }).join('');
@@ -1917,20 +2138,14 @@ function renderCreativeDesk() {
   host.innerHTML = `
     <h2 class="section-title">🎬 Creative desk</h2>
     <p class="section-lede">
-      Which ads deserve the budget, and what the editors should make next. The retention curve says
-      <em>where</em> a video loses people, and each drop has a different cause — an ad that dies at
-      3 seconds needs a new opening, not a new offer.
+      Always the last 7 closed days, whatever the date bar shows. An ad is only paused when it has spent enough that
+      bad luck stops being a reasonable explanation — the maths is on each ad. The retention curve says
+      <em>where</em> a video loses people.
     </p>
+    ${windowNote}
     ${blocks}`;
 
-  State._briefs = Object.fromEntries(Object.entries(byCampaign).map(([key, group]) => {
-    const campaign = State.campaigns.find(c => c.id === key) || {};
-    const { ber } = campaign.id ? berFor(campaign) : { ber: 0 };
-    const cpa = campaign.purchases > 0 ? campaign.spend / campaign.purchases : 0;
-    const d = CD.desk(VE.productLabel(group.name), group.ads,
-      { ber, currency: State.currency, campaignCpa: cpa, fullName: group.name });
-    return [key, `${d.brief.headline}\n\n${d.brief.lines.join('\n')}`];
-  }));
+  State._briefs = Object.fromEntries(camps.map(c => [c.id, `${c.desk.brief.headline}\n\n${c.desk.brief.lines.join('\n')}`]));
 }
 
 /* The briefs use a little markdown so they can be pasted straight into
@@ -2849,6 +3064,37 @@ function injectStyles() {
   .curve { margin: .2rem 0 .7rem; padding: .6rem .75rem; border-radius: 10px; font-size: 12.5px;
     border: 1px solid var(--color-border, rgba(255,255,255,.12)); }
   .curve-quiet { opacity: .7; font-size: 12px; }
+  .curve-plateau .curve-tag { background: rgba(245,158,11,.16); color: #f59e0b; }
+  .fresh { margin: 10px 0; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--color-border, rgba(255,255,255,.08)); background: rgba(255,255,255,.02); }
+  .fresh.tone-danger { border-color: rgba(239,68,68,.45); background: rgba(239,68,68,.06); }
+  .fresh.tone-warning { border-color: rgba(245,158,11,.45); background: rgba(245,158,11,.06); }
+  .fresh.tone-success { border-color: rgba(34,197,94,.3); }
+  .fresh-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+  .fresh-title { font-weight: 600; font-size: 13px; }
+  .fresh-tag { font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px; background: rgba(255,255,255,.07); }
+  .fresh-tag.danger { background: rgba(239,68,68,.2); color: #f87171; }
+  .fresh-tag.warning { background: rgba(245,158,11,.2); color: #fbbf24; }
+  .fresh-tag.success { background: rgba(34,197,94,.16); color: #4ade80; }
+  .fresh-why { margin: 8px 0 4px 18px; padding: 0; font-size: 12.5px; line-height: 1.5; }
+  .fresh-quiet, .fresh-foot { margin: 6px 0 0; font-size: 12px; opacity: .75; }
+  .fresh-warn { margin: 8px 0 14px; padding: 8px 12px; border-radius: 8px; background: rgba(245,158,11,.12); font-size: 12.5px; }
+  .ad-lost { margin-top: 4px; font-size: 12px; font-weight: 600; color: #f87171; }
+  .plan-list { display: grid; gap: 10px; margin-top: 12px; }
+  .plan-item { display: flex; gap: 12px; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--color-border, rgba(255,255,255,.08)); background: rgba(255,255,255,.03); }
+  .plan-item.kind-pause { border-color: rgba(239,68,68,.5); background: rgba(239,68,68,.07); }
+  .plan-item.kind-replace { border-color: rgba(245,158,11,.45); }
+  .plan-n { flex: 0 0 26px; height: 26px; border-radius: 50%; background: rgba(255,255,255,.1); display: grid; place-items: center; font-weight: 700; font-size: 13px; }
+  .plan-main { flex: 1; min-width: 0; }
+  .plan-title { font-weight: 650; font-size: 14.5px; }
+  .plan-money { font-size: 12px; font-weight: 600; color: #f87171; margin-left: 6px; }
+  .plan-lines { margin: 6px 0 0 18px; padding: 0; font-size: 12.5px; line-height: 1.5; }
+  .plan-why { margin-top: 6px; font-size: 12.5px; opacity: .85; line-height: 1.5; }
+  .plan-when { margin-top: 6px; font-size: 11.5px; opacity: .6; text-transform: uppercase; letter-spacing: .03em; }
+  .plan-bleed { margin: 12px 0 0; padding: 10px 14px; border-radius: 10px; background: rgba(239,68,68,.1); font-size: 13px; }
+  .plan-quiet { margin-top: 12px; font-size: 13px; }
+  .plan-quiet summary { cursor: pointer; opacity: .8; }
+  .plan-quiet ul { margin: 8px 0 0 18px; padding: 0; line-height: 1.6; }
+  .plan-rhythm { margin: 12px 0 0; font-size: 12.5px; opacity: .8; }
   .curve-ceiling { border-left: 4px solid var(--color-warning, #f59e0b); }
   .curve-room { border-left: 4px solid var(--color-success, #10b981); }
   .curve-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .3rem .6rem; margin-bottom: .35rem; }
@@ -3050,6 +3296,7 @@ function renderAll() {
   renderCommandBar();
   renderDateBar();
   renderDataStrip();
+  renderPlan();
   renderTruthPanel();
   renderVerdicts();
   renderCreativeDesk();

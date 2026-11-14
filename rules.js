@@ -141,7 +141,9 @@
       minSpread: 1.5,           // the budget has to have actually moved
       dropPct: 15,              // the top band must earn this much less...
       dropAbs: 10,              // ...and at least this many euros a day less
-      overshoot: 1.05           // tolerance before a budget counts as past the ceiling
+      overshoot: 1.05,          // tolerance before a budget counts as past the ceiling
+      minMarginal: 0.10,        // each extra euro of spend must bring back at least 10c profit...
+      plateauSpread: 1.4        // ...judged only when the top band spent 40%+ more than the low band
     }
   };
 
@@ -1270,7 +1272,19 @@
       return { ...base, state: 'unprofitable',
                reason: 'No spend level has been profitable on these days, so there is no sweet spot to find — the offer or the creative has to change first.' };
     }
-    if (best === top) {
+    /* What did the EXTRA money earn? Profit per extra euro spent, from the low
+       band to the top band. Ten cents or less per euro is the extra budget
+       doing nothing, even if ROAS is still above break-even — which is exactly
+       the case the plain ladder cannot see. */
+    const low = bands[0];
+    const extra = top.spendPerDay - low.spendPerDay;
+    const widened = low.spendPerDay > 0 && top.spendPerDay / low.spendPerDay >= cfg.plateauSpread;
+    const marginal = extra > 0 ? round2((top.profitPerDay - low.profitPerDay) / extra) : null;
+    base.marginal = marginal;
+    base.low = low;
+    const stalled = widened && marginal !== null && marginal < cfg.minMarginal;
+
+    if (best === top && !stalled) {
       return { ...base, state: 'room',
                reason: `Profit per day has been highest at the highest spend level so far (${eur0(top.from)}–${eur0(top.to)} a day). No ceiling found yet.` };
     }
@@ -1279,6 +1293,14 @@
       return { ...base, state: 'ceiling',
                ceiling: { from: best.from, to: best.to, typical: best.spendPerDay },
                reason: `This campaign has earned most at ${eur0(best.from)}–${eur0(best.to)} a day (about ${eur0(best.profitPerDay)} profit a day at ROAS ${best.roas}). At ${eur0(top.from)}–${eur0(top.to)} a day it earned ${eur0(top.profitPerDay)} a day at ROAS ${top.roas} — more spend, not more money.` };
+    }
+    if (stalled) {
+      const lowProfit = eur0(low.profitPerDay), topProfit = eur0(top.profitPerDay);
+      return { ...base, state: 'plateau',
+               ceiling: { from: low.from, to: top.to, typical: low.spendPerDay },
+               efficient: { spendPerDay: low.spendPerDay, profitPerDay: low.profitPerDay },
+               extraSpend: round2(extra),
+               reason: `At ${eur0(low.from)}–${eur0(low.to)} a day it made about ${lowProfit} profit a day. At ${eur0(top.from)}–${eur0(top.to)} a day it made ${topProfit} — about ${eur0(extra)} more spend a day and ${marginal <= 0 ? 'no extra profit' : eur0(top.profitPerDay - low.profitPerDay) + ' more profit'}. ROAS can still be above break-even and the extra budget is still not paying.` };
     }
     return { ...base, state: 'unclear',
              reason: 'Profit per day is about the same at every spend level it has run at, so the history does not point to a ceiling either way.' };
@@ -1289,7 +1311,7 @@
      that has already been tried and lost money. The cheat sheet's answer is
      the same one: find the sweet spot, then widen with new creatives. */
   function applyCeiling(v, curve) {
-    if (!v || !curve || curve.state !== 'ceiling') return v;
+    if (!v || !curve || !(curve.state === 'ceiling' || curve.state === 'plateau')) return v;
     const top = curve.ceiling.to * RULES.curve.overshoot;
     const raising = v.budgetTo !== null && v.budgetFrom !== null && v.budgetTo > v.budgetFrom;
 
@@ -1297,7 +1319,9 @@
       return {
         ...v,
         code: 'HOLD', tone: TONE.HOLD || 'neutral',
-        headline: 'At its ceiling — add creatives, not budget',
+        headline: curve.state === 'plateau'
+          ? 'Extra budget is not paying — add creatives, not budget'
+          : 'At its ceiling — add creatives, not budget',
         ceilingBlocked: { wouldHaveBeen: v.code, budgetTo: v.budgetTo },
         budgetTo: null, budgetDelta: null,
         reasons: [
@@ -1315,6 +1339,109 @@
       };
     }
     return v;
+  }
+
+  /* ------------------------------------------------------------------
+     TONIGHT'S PLAN
+     ------------------------------------------------------------------
+     The verdict cards say what each campaign should do with its budget; the
+     creative desk says which ads to pause and whether to add new ones. A
+     founder deciding at night should not have to read ten cards to find out
+     what to DO. This puts every action in one ordered list:
+
+       1. pause the ads that are burning money (saves money today)
+       2. kill / cut campaigns that lose money
+       3. replace held ads, fix broken funnels
+       4. creatives that are urgent
+       5. scale what has earned it
+       6. creatives that should be commissioned now, then soon
+
+     Nothing here makes a new decision. It orders decisions already made by
+     the budget rules, the spend curve and the ad rules.
+     ------------------------------------------------------------------ */
+  function tonightPlan(campaigns, opts) {
+    const dayOver = !!(opts && opts.dayIsOver);
+    const items = [];
+    const quiet = [];
+    const sum = { pauseAds: 0, bleedPerWeek: 0, budgetMoves: 0, creativeJobs: 0, newLast7: 0, newAds: 0 };
+    const MONEY_NOW = { KILL: 2, DESCALE: 3, PRICE_DROP: 3, SCALE: 5, SURF: 5 };
+    const FIX = { DIAGNOSE: 'Fix what is leaking', NEEDS_SETUP: 'Finish the setup' };
+    const when = dayOver ? 'Now — the day is closed' : 'After midnight — the day is still running';
+
+    (campaigns || []).forEach(c => {
+      const label = productLabel(c.name);
+      const d = c.desk, f = c.fresh, v = c.verdict || {};
+      const before = items.length;
+
+      if (d && d.verdicts) {
+        const pause = d.verdicts.toPause || [];
+        const held = (d.verdicts.bleeding || []).filter(a => a.heldFromPause);
+        if (pause.length) {
+          const lost = pause.reduce((t, a) => t + num(a.lost), 0);
+          sum.pauseAds += pause.length; sum.bleedPerWeek += lost;
+          items.push({
+            priority: 1, kind: 'pause', when: 'Now — pausing an ad does not need to wait for midnight',
+            campaign: label, campaignId: c.id,
+            title: `Pause ${pause.length} ad${pause.length === 1 ? '' : 's'} in ${label}`,
+            money: round2(lost),
+            lines: pause.map(a => `${a.name} — ${eur0(a.spend)} spent, ${a.purchases} order${a.purchases === 1 ? '' : 's'}`),
+            why: `Together they have lost about ${eur0(lost)} against break-even in the last 7 days. Each one is past the point where bad luck explains it.`
+          });
+        }
+        if (held.length) {
+          const lost = held.reduce((t, a) => t + num(a.lost), 0);
+          sum.bleedPerWeek += lost;
+          items.push({
+            priority: 3, kind: 'replace', when: 'Today — upload the replacement first',
+            campaign: label, campaignId: c.id,
+            title: `Replace ${held.length} losing ad${held.length === 1 ? '' : 's'} in ${label}`,
+            money: round2(lost),
+            lines: held.map(a => `${a.name} — ${eur0(a.spend)} spent, ${a.purchases} order${a.purchases === 1 ? '' : 's'}`),
+            why: 'These are losing money too, but switching them off now would leave the campaign under 3 ads. Add the new ad, then pause these.'
+          });
+        }
+      }
+
+      if (MONEY_NOW[v.code]) {
+        sum.budgetMoves++;
+        items.push({
+          priority: MONEY_NOW[v.code], kind: 'budget', when, campaign: label, campaignId: c.id,
+          title: `${label}: ${v.headline}`,
+          lines: [], money: 0,
+          why: (v.reasons && v.reasons[0]) || ''
+        });
+      } else if (FIX[v.code]) {
+        items.push({
+          priority: 3, kind: 'fix', when: 'Today', campaign: label, campaignId: c.id,
+          title: `${label}: ${FIX[v.code]}`, lines: [], money: 0,
+          why: (v.reasons && v.reasons[0]) || v.headline || ''
+        });
+      }
+
+      if (f) sum.newLast7 += f.newLast7 || 0;
+      if (f && f.addCount > 0) {
+        sum.creativeJobs++; sum.newAds += f.addCount;
+        const pr = f.state === 'urgent' ? 4 : f.state === 'add' ? 6 : 7;
+        items.push({
+          priority: pr, kind: 'creatives', when: f.state === 'urgent' ? 'Today' : f.state === 'add' ? 'This week, start today' : 'This week',
+          campaign: label, campaignId: c.id,
+          title: `${label}: ${f.headline}`,
+          lines: (f.signals || []).map(sg => sg.text).concat(f.opportunities || []),
+          money: 0,
+          why: ''
+        });
+      }
+
+      if (items.length === before) {
+        quiet.push({ campaign: label, campaignId: c.id,
+          text: f && f.state === 'learning' ? 'Still in its first days. Leave it alone and do not judge it yet.'
+              : v.headline ? `${v.headline}. No ad to pause, no creative needed yet.` : 'Nothing to do.' });
+      }
+    });
+
+    items.sort((a, b) => a.priority - b.priority || num(b.money) - num(a.money));
+    sum.bleedPerWeek = round2(sum.bleedPerWeek);
+    return { items, quiet, summary: sum };
   }
 
   function guardrails(campaigns) {
@@ -1523,7 +1650,7 @@
     RULES, economics, netMarginPct, grossMarginFromBer, parseCampaignName, cmCode,
     clockIn, detectWindow, dayContext, funnel, biggestLeak, verdict, guardrails, deliveryAlarms, productLabel,
     campaignDelivery, accountHealth, breakdown, reviewReason, spendCurve, applyCeiling,
-    countUnprofitableStreak, countProfitableStreak, money,
+    countUnprofitableStreak, countProfitableStreak, money, tonightPlan,
     revenueVerified, scalingLocked, marginLabel, windowAgreement,
     roasInterval, ordersNeeded, provenAbove, weekendLift, surfPctFromLift
   };
