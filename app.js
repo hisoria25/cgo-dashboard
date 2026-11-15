@@ -378,7 +378,7 @@ function loadData() {
   State.currency = 'EUR';
   State.source = 'demo';
   State.truth = null;
-  State.truthStatus = null;
+  State.truthStatus = null; State.adOrders = null;
   State.adStatuses = []; State.adsetStatuses = []; State.accountInfo = []; State.breakdowns = null;
   setApiStatus('offline');
   document.getElementById('brand-sub').innerText = 'Demo data · connect the Meta API for live verdicts';
@@ -512,7 +512,7 @@ function setActiveAccount(id) {
   if (activeAccount().id === id) return;
   LS.set('cgo_active_account', id);
   State.truth = null;          // another account's order book is not this one's
-  State.truthStatus = null;
+  State.truthStatus = null; State.adOrders = null;
   State.truthMatch = null;
   loadEconomics();             // this account's margins, not the last one's
   renderAccountTabs();
@@ -782,6 +782,7 @@ async function syncMetaAPI() {
     // Shopify is the revenue of record. Pull it for the same window, in the
     // same timezone, before any verdict is computed.
     await syncTruth(preset);
+    await syncAdOrders();
 
     setApiStatus('online', `Live · ${accountClock()}`);
     document.getElementById('brand-sub').innerText = ok.length === 1
@@ -821,7 +822,7 @@ function loadDemoFallback() {
   State.creativeInfo = { window: 'demo data', fallback: true };
   State.source = 'demo';
   State.truth = null;
-  State.truthStatus = null;
+  State.truthStatus = null; State.adOrders = null;
   State.truthMatch = null;
   State.adStatuses = []; State.adsetStatuses = []; State.accountInfo = []; State.breakdowns = null;
   renderAll();
@@ -864,6 +865,33 @@ async function syncTruth(preset) {
   State.truthMatch = TR.match(State.campaigns, res.data.byProduct || {}, LS.json('cgo_product_map', {}));
   State.truthStatus = { state: 'ok', message: null };
   State.truthSyncedAt = Date.now();
+}
+
+/* ------------------------------------------------- orders by ad ---------- */
+/* Which ad sold each order. Read for the same seven closed days the creative
+   desk uses, and only ever used to show the number and to stop a wrong pause —
+   Shopify cannot start a pause. */
+async function syncAdOrders() {
+  State.adOrders = null;
+  const workerUrl = LS.get('truth_worker_url', '');
+  const dashKey = LS.get('truth_dash_key', '');
+  if (!workerUrl || !dashKey) { State.adOrders = { state: 'off' }; return; }
+  if (!(State.creative || []).length) { State.adOrders = { state: 'no-ads' }; return; }
+  if (State.creativeInfo && State.creativeInfo.fallback) {
+    /* The ad rows are not the seven-day window, so their order counts would
+       not line up with Shopify's. Say so instead of comparing unlike things. */
+    State.adOrders = { state: 'skipped', message: 'The seven-day ad read did not load, so ad orders are not compared.' };
+    return;
+  }
+  try {
+    const res = await TR.fetchAdOrders({ workerUrl, dashKey, tz: State.accountTz || 'Europe/Berlin' });
+    if (!res.ok) { State.adOrders = { state: 'error', message: res.error || res.reason }; return; }
+    const summary = TR.matchAdOrders(State.creative, res.data);
+    State.adOrders = { state: 'ok', summary, syncedAt: Date.now() };
+  } catch (e) {
+    console.error(e);
+    State.adOrders = { state: 'error', message: String(e && e.message || e) };
+  }
 }
 
 /* --------------------------------------------------- API → app model ----- */
@@ -2077,6 +2105,36 @@ const AD_CODE = {
   PAUSE:        { label: 'Pause', tone: 'danger' }
 };
 
+/* One line per ad: what the Shopify order book says about it. */
+function adShopLine(a) {
+  const sh = a.shop;
+  if (!sh) return '';
+  if (sh.state === 'ambiguous') {
+    return '<div class="ad-shop dim">Shopify: this ad name is used by more than one ad, so its orders cannot be split — not counted.</div>';
+  }
+  if (!sh.trusted) {
+    return `<div class="ad-shop dim">Shopify: ${sh.orders} order${sh.orders === 1 ? '' : 's'} so far — order history does not reach back over the whole week yet.</div>`;
+  }
+  const roas = a.shopRoas !== null && a.shopRoas !== undefined ? ` · ROAS ${a.shopRoas.toFixed(2)}` : '';
+  return `<div class="ad-shop ${sh.orders > 0 ? 'has' : 'none'}">Shopify order book: ${sh.orders} order${sh.orders === 1 ? '' : 's'} · ${fmtMoney(sh.revenue, 0)}${roas}</div>`;
+}
+
+function adOrdersNote() {
+  const ao = State.adOrders;
+  if (!ao || ao.state === 'off' || ao.state === 'no-ads') return '';
+  if (ao.state === 'skipped' || ao.state === 'error') {
+    return `<p class="fresh-warn">⚠ Ad orders from Shopify are not shown: ${esc(ao.message || '')}</p>`;
+  }
+  const s = ao.summary;
+  if (!s) return '';
+  const bits = [];
+  if (!s.covers) bits.push(`History starts ${esc(String(s.collectingSince || '').slice(0, 10) || 'recently')}, so the week is only partly covered and Shopify cannot overrule a pause yet.`);
+  if (s.orphanRevenue > 0) bits.push(`${fmtMoney(s.orphanRevenue, 0)} of this week's sales came from ad names that are not on the desk (renamed or removed ads).`);
+  if (s.untaggedRevenue > 0) bits.push(`${fmtMoney(s.untaggedRevenue, 0)} had no ad tag at all.`);
+  if (s.ambiguous > 0) bits.push(`${s.ambiguous} ad${s.ambiguous === 1 ? '' : 's'} share a name with another ad.`);
+  return `<p class="section-lede ad-orders-note"><strong>Shopify order book by ad</strong> — ${s.totalOrders} orders, ${fmtMoney(s.totalRevenue, 0)} this week.${bits.length ? ' ' + bits.join(' ') : ''}</p>`;
+}
+
 function renderCreativeDesk() {
   const host = creativeHost();
   const camps = State.campaigns.filter(c => c.desk && (c.desk.verdicts.count > 0 || (c.fresh && c.fresh.state !== 'learning')));
@@ -2111,12 +2169,13 @@ function renderCreativeDesk() {
           <div class="ad-card tone-${meta.tone}">
             <div class="ad-head">
               <strong>${esc(a.name)}</strong>
-              <span class="ad-chip ${meta.tone}">${a.heldFromPause ? 'Pause after replacing' : meta.label}</span>
+              <span class="ad-chip ${meta.tone}">${a.heldFromPause ? 'Pause after replacing' : a.shopCheck ? 'Check first — Shopify shows sales' : meta.label}</span>
             </div>
             <div class="ad-nums">
               ${fmtMoney(a.spend, 0)} · ${a.purchases} order${a.purchases === 1 ? '' : 's'} · ROAS ${a.roas.toFixed(2)}
               ${a.type === 'Video' ? ' · video' : ' · image'}${a.ageDays !== null && a.ageDays !== undefined ? ` · ${Math.round(a.ageDays)}d old` : ''}${a.frequency ? ` · freq ${a.frequency.toFixed(1)}` : ''}
             </div>
+            ${adShopLine(a)}
             <div class="ad-why">${esc(a.why)}</div>
             ${lost}
             ${src ? retentionBar(CD.retention(src)) : ''}
@@ -2160,6 +2219,7 @@ function renderCreativeDesk() {
       <em>where</em> a video loses people.
     </p>
     ${windowNote}
+    ${adOrdersNote()}
     ${blocks}`;
 
   State._briefs = Object.fromEntries(camps.map(c => [c.id, `${c.desk.brief.headline}\n\n${c.desk.brief.lines.join('\n')}`]));
@@ -2936,7 +2996,7 @@ function handleCsvUpload(e) {
     State.campaigns = campaignsFromAds(State.ads);
     State.source = 'csv';
     State.truth = null;
-    State.truthStatus = null;
+    State.truthStatus = null; State.adOrders = null;
     State.truthMatch = null;
     setApiStatus('offline');
     document.getElementById('brand-sub').innerText = `CSV: ${file.name}`;
@@ -3284,6 +3344,10 @@ function injectStyles() {
   .ad-chip.warning { background: rgba(245,158,11,.18); color: #f59e0b; }
   .ad-chip.neutral { background: rgba(148,163,184,.18); color: #94a3b8; }
   .ad-nums { font-size: .76rem; opacity: .75; margin: .3rem 0; }
+  .ad-shop { font-size: .76rem; margin: .15rem 0 .3rem; opacity: .9; }
+  .ad-shop.has { color: #34d399; }
+  .ad-shop.none { opacity: .65; }
+  .ad-shop.dim { opacity: .6; font-style: italic; }
   .ad-why  { font-size: .76rem; line-height: 1.5; margin-bottom: .5rem; }
 
   .ret { display: flex; align-items: flex-end; gap: 3px; height: 54px; margin: .4rem 0 .2rem; }

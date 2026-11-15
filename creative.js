@@ -242,6 +242,26 @@
   const pctTxt = p => (p < 0.01 ? '<1%' : Math.round(p * 100) + '%');
 
   /** One ad, judged against its campaign's own break-even. */
+
+  /* Shopify's own count for this ad, if it can be trusted: the ad name matched
+     exactly one ad and the order history reaches back over the whole window. */
+  function shopFacts(a) {
+    const sh = a && a.shop;
+    if (!sh || !sh.trusted || sh.state === 'ambiguous') return null;
+    return { orders: n(sh.orders), revenue: n(sh.revenue) };
+  }
+
+  function shopVeto(a, lambda, metaPurch, ctx) {
+    const f = shopFacts(a);
+    if (!f || f.orders <= 0 || (metaPurch > 0 && f.orders <= metaPurch)) return null;
+    const pShop = poissonCdf(f.orders, lambda);
+    if (pShop <= AD_RULES.pausePct) return null;          // still conclusive on Shopify's count
+    return {
+      code: 'WATCH', urgency: null, shopCheck: true,
+      why: `Meta credits this ad with ${metaPurch} order${metaPurch === 1 ? '' : 's'}, but the Shopify order book shows ${f.orders} (${money(f.revenue, ctx)}) carrying this ad's name. On that count a break-even ad would be this unlucky about ${pctTxt(pShop)} of the time — not proven bad. Check it before you pause it.`
+    };
+  }
+
   function judgeAd(a, ctx) {
     const spend = n(a.spend), purch = n(a.purchases), rev = n(a.revenue);
     const ber = n(ctx.ber), beCpa = n(ctx.beCpa);
@@ -257,6 +277,11 @@
         why: `${money(spend, ctx)} spent. A fair test needs ${money(AD_RULES.minSpendMult * beCpa, ctx)} (2× the ${money(beCpa, ctx)} one sale costs at break-even). Too early to judge — leave it alone.` };
     }
     if (pBad <= AD_RULES.pausePct) {
+      /* Shopify can stop a wrong pause, never start one. Meta's per-ad sales
+         are the weaker number on this account, so when the order book shows
+         this ad's name selling, the test is run again on that count. */
+      const veto = shopVeto(a, lambda, purch, ctx);
+      if (veto) return { ...base, ...veto };
       return { ...base, code: 'PAUSE', urgency: 'now',
         why: purch === 0
           ? `${money(spend, ctx)} spent and no sale. An ad at break-even would have made about ${lambda.toFixed(1)} by now — there is only a ${pctTxt(pBad)} chance this is bad luck. Pause it.`
@@ -308,7 +333,7 @@
       if (statistical) {
         const j = judgeAd(a, ctx);
         code = j.code; why = j.why;
-        extra = { lambda: j.lambda, pBad: j.pBad, lost: j.lost, urgency: j.urgency };
+        extra = { lambda: j.lambda, pBad: j.pBad, lost: j.lost, urgency: j.urgency, shopCheck: !!j.shopCheck };
       } else {
         const tested = threshold ? spend >= threshold : false;
         if (!tested) {
@@ -329,7 +354,13 @@
           code = 'KEEP';
           why = `ROAS ${roas.toFixed(2)} against break-even ${ber.toFixed(2)}. Carrying its weight.`;
         }
-        extra = { urgency: code === 'PAUSE' ? 'now' : null,
+        const f = shopFacts(a);
+        if (code === 'PAUSE' && f && f.orders > 0 && ber > 0 && spend > 0 && f.revenue / spend >= ber) {
+          code = 'WATCH';
+          why = `Meta shows ROAS ${roas.toFixed(2)}, but the Shopify order book credits this ad's name with ${f.orders} order${f.orders === 1 ? '' : 's'} (${money(f.revenue, ctx)}) — ROAS ${(f.revenue / spend).toFixed(2)}, above break-even ${ber.toFixed(2)}. Check it before you pause it.`;
+          extra = { shopCheck: true };
+        }
+        extra = { ...extra, urgency: code === 'PAUSE' ? 'now' : null,
                   lost: r2(Math.max(0, spend - (ber > 0 ? rev / ber : rev))) };
       }
 
@@ -339,6 +370,8 @@
         tested: code !== 'TESTING', threshold, code, why,
         ageDays: a.ageDays === undefined ? null : a.ageDays,
         frequency: n(a.frequency) || null,
+        shop: a.shop || null,
+        shopRoas: (a.shop && a.shop.state !== 'ambiguous' && a.shop.orders != null && spend > 0) ? r2(n(a.shop.revenue) / spend) : null,
         diagnosis: d,
         ...extra,
         /* What this ad cost beyond break-even over the lookback. */

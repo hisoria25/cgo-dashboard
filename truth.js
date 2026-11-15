@@ -346,6 +346,96 @@
     };
   }
 
+
+  /* ------------------------------------------------------------------
+     ORDERS BY AD
+     Shopify cannot say which ad an order came from, but Funnelish can: it
+     stores the ad name Meta put in the link. The Worker keeps those and
+     reports revenue per ad name at /ads. The join to a Meta ad is on the
+     NAME, so it is done out loud like the product match above: an ad whose
+     name is shared by two live ads is never given a number, because half of
+     it could belong to the other one.
+     ------------------------------------------------------------------ */
+  function adKey(s) {
+    return String(s == null ? '' : s).normalize('NFC').split(/\s+/).join(' ').trim().toLowerCase();
+  }
+
+  async function fetchAdOrders({ workerUrl, dashKey, tz, fromDays, toDays }) {
+    if (!workerUrl || !dashKey) return { ok: false, reason: 'not-configured' };
+    const { since, until } = tzDayRange(tz, fromDays === undefined ? -7 : fromDays, toDays === undefined ? 0 : toDays);
+    const base = String(workerUrl).trim().replace(/\/+$/, '');
+    const url = `${base}/ads?since=${encodeURIComponent(since.toISOString())}` +
+                `&until=${encodeURIComponent(until.toISOString())}`;
+    let res, body;
+    try { res = await fetch(url, { headers: { 'X-Dash-Key': dashKey } }); }
+    catch (e) { return { ok: false, reason: 'unreachable', error: 'Could not reach the Truth Worker for ad orders.' }; }
+    try { body = await res.json(); }
+    catch (e) { return { ok: false, reason: 'bad-response', error: `Ad orders: non-JSON reply (HTTP ${res.status}).` }; }
+    if (!res.ok || !body || body.ok === false) {
+      return { ok: false, reason: 'error', error: (body && body.error) || `HTTP ${res.status}` };
+    }
+    return { ok: true, data: body, since, until };
+  }
+
+  /**
+   * Gives every creative row its Shopify order count, or says why it has none.
+   *   rows  — State.creative rows ({id, name, ...}); mutated: row.shop = {...}
+   *   data  — the Worker's /ads body
+   * Returns a summary of what could not be placed.
+   */
+  function matchAdOrders(rows, data) {
+    const list = rows || [];
+    const byAd = (data && data.byAd) || {};
+    const covers = !!(data && data.coversWholeRange);
+
+    const nameCount = Object.create(null);
+    list.forEach(r => { const k = adKey(r.name); if (k) nameCount[k] = (nameCount[k] || 0) + 1; });
+
+    const entries = Object.values(byAd);
+    const byName = Object.create(null), byId = Object.create(null);
+    entries.forEach(e => {
+      if (e.name) byName[adKey(e.name)] = e;
+      if (e.adId) byId[String(e.adId)] = e;
+    });
+
+    const used = new Set();
+    let ambiguous = 0;
+    list.forEach(r => {
+      const k = adKey(r.name);
+      const viaId = byId[String(r.id)];
+      const viaName = byName[k];
+
+      if (nameCount[k] > 1 && !viaId) {
+        ambiguous++;
+        if (viaName) used.add(viaName);
+        r.shop = { state: 'ambiguous', orders: null, revenue: null, trusted: false };
+        return;
+      }
+      /* An order tagged with the raw ad id adds to the same ad as its name. */
+      const hit = [viaName, viaId].filter(Boolean);
+      const uniq = hit.filter((e, i) => hit.indexOf(e) === i);
+      uniq.forEach(e => used.add(e));
+      const orders = uniq.reduce((s, e) => s + (e.orders || 0), 0);
+      const revenue = round2(uniq.reduce((s, e) => s + (e.revenue || 0), 0));
+      r.shop = { state: orders > 0 ? 'matched' : 'none', orders, revenue, trusted: covers };
+    });
+
+    const orphans = entries.filter(e => !used.has(e));
+    return {
+      covers,
+      ads: list.length,
+      ambiguous,
+      orphanCount: orphans.length,
+      orphanRevenue: round2(orphans.reduce((s, e) => s + (e.revenue || 0), 0)),
+      orphans: orphans.sort((a, b) => b.revenue - a.revenue).slice(0, 8)
+        .map(e => ({ name: e.name || e.adId, orders: e.orders, revenue: e.revenue })),
+      untaggedRevenue: round2((data && data.untaggedRevenue) || 0),
+      totalRevenue: round2((data && data.revenue) || 0),
+      totalOrders: (data && data.orders) || 0,
+      collectingSince: (data && data.collectingSince) || null
+    };
+  }
+
   /* rules.js loads before this file in the browser and is required ahead of it
      in Node. Resolve it at call time rather than capturing it at load time, so
      the order of <script> tags cannot silently disable product matching. */
@@ -357,5 +447,6 @@
   function round2(v) { const n = parseFloat(v); return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; }
 
   return { fetchTruth, match, rangeForPreset, tzDayRange, tzOffsetMinutes,
-           key, headKey, cmForProduct, rangeForDays, FUNNELS, PRESET_RANGE };
+           key, headKey, cmForProduct, rangeForDays, FUNNELS, PRESET_RANGE,
+           adKey, fetchAdOrders, matchAdOrders };
 });
