@@ -539,8 +539,105 @@
     };
   }
 
+  /* ------------------------------------------------------------------
+     SPREAD THE WINNER — a second ad account, a different page
+     ------------------------------------------------------------------
+     Adding creatives widens a campaign. Spreading widens the business: the
+     same winning ads in a second ad account behind a different page earn more
+     reach and mean one ban cannot stop every sale. It is the other half of how
+     the big competitors scale (see COMPETITOR_PLAYBOOK).
+
+     It is only worth doing once the ad has proven itself, so it sits behind
+     three gates. These gates are a house rule of thumb, not Meta's:
+       1. profitable 3 days in a row   — the SOP's own trigger
+       2. about €150 a day or more      — below that one account has room left
+       3. a winning ad with orders      — there has to be something to copy
+     ------------------------------------------------------------------ */
+  const SPREAD = { minStreak: 3, minSpendPerDay: 150, minOrders: 2, maxWinners: 3 };
+
+  const SPREAD_STEPS = [
+    'Pick the second ad account: the one with the fewest active campaigns and no payment problem. Open its tab on this dashboard to check.',
+    'Give it its own Facebook page with a different name and a real brand look — one page per ad account, as your anti-ban rule says. No doctor personas.',
+    'Copy the winning ad(s) exactly: same video, same text, same headline. Do not change the winner\'s opening — the proof is that it already works.',
+    'Rename each copy with a suffix such as " | B". The Shopify order book matches sales by ad name; two ads with the same name would count each other\'s orders.',
+    'Build it like any test: one new campaign, 1 ad set, 3–5 ads, at least €100 a day, break-even ROAS in the campaign name. Judge it by the normal rules, starting with the day-1 11AM check.',
+    'Leave the original campaign alone. The second account is extra reach and insurance, not a move.',
+    'Give the new account its own pixel. The page will still fire both, so each account sees purchases from the other — judge the new campaign on the Shopify order book by ad name, not on Meta\'s count.'
+  ];
+
+  const SPREAD_DONTS = [
+    'Do not spread a campaign that is not profitable yet. You would only copy a loss into a second account.',
+    'Do not use a page or ad account that has ever been restricted.',
+    'Do not launch the copy in the same ad account: it competes with the original for the same people.'
+  ];
+
+  /**
+   * @param input { verdicts, campaign: {spendPerDay}, streak, ber, currency }
+   * Returns null when the campaign has not earned the question yet.
+   */
+  function spreadPlan(input) {
+    const { verdicts, campaign = {}, streak = 0, ber = 0, currency } = input || {};
+    if (!(streak >= SPREAD.minStreak && ber > 0) || !verdicts) return null;
+    const ctx = { currency };
+    const perDay = n(campaign.spendPerDay);
+    const winners = verdicts.ads
+      .filter(a => (a.code === 'SCALE_SOURCE' || a.code === 'KEEP') && n(a.purchases) >= SPREAD.minOrders && a.roas >= ber)
+      .sort((a, b) => b.roas - a.roas || b.spend - a.spend)
+      .slice(0, SPREAD.maxWinners)
+      .map(a => ({ id: a.id, name: a.name, roas: a.roas, purchases: a.purchases, spend: a.spend,
+                   hookRate: a.hook && a.hook.isVideo ? a.hook.hookRate : null }));
+
+    const gates = [
+      { key: 'streak', ok: true, text: `Profitable ${streak} days in a row.` },
+      { key: 'spend', ok: perDay >= SPREAD.minSpendPerDay,
+        text: perDay >= SPREAD.minSpendPerDay
+          ? `Spending about ${money(perDay, ctx).replace(/\.\d\d$/, '')} a day — enough that one account is filling up.`
+          : `Spending about ${money(perDay, ctx).replace(/\.\d\d$/, '')} a day. Below ${money(SPREAD.minSpendPerDay, ctx).replace(/\.\d\d$/, '')} a day one account still has room, so a second one adds cost before it adds sales.` },
+      { key: 'winner', ok: winners.length > 0,
+        text: winners.length
+          ? `${winners.length} ad${winners.length === 1 ? '' : 's'} clearly earning: ${winners.map(w => `${w.name} (ROAS ${w.roas.toFixed(2)}, ${w.purchases} orders)`).join('; ')}.`
+          : `No single ad has ${SPREAD.minOrders}+ orders above break-even yet, so there is nothing proven to copy.` }
+    ];
+    const ready = gates.every(g => g.ok);
+    const names = winners.map(w => w.name);
+
+    return {
+      ready, gates, winners,
+      headline: ready
+        ? 'Winner found — test it in a second ad account with a different page'
+        : 'Not ready to spread yet',
+      steps: ready ? SPREAD_STEPS.slice() : [],
+      donts: SPREAD_DONTS.slice(),
+      planLines: ready ? [`Winner ready for a second ad account behind a different page: ${names.join(', ')}.`] : []
+    };
+  }
+
+  /* What the biggest competitor does to scale. A dated snapshot: facts read
+     from Meta's public Ad Library, the account structure inferred from them. */
+  const COMPETITOR_PLAYBOOK = {
+    title: 'How a big competitor scales — and what to copy',
+    source: 'Prodigy Berlin (snoring product), Meta Ad Library, read 17 Nov 2026. Their ad accounts are not public; that part is inferred.',
+    facts: [
+      'About 4,600 ads in 13 months; around 210 live now, spread over six Facebook pages. Two of them carry about 77% of the live ads.',
+      'Every live ad uses the same story text and the same headline. Only the video changes — 158 videos in 79 different lengths.',
+      'All six pages send traffic to one landing page, and that page loads three Meta pixels. That points to about three ad-account setups sharing one site.',
+      'Meta closed most of their older pages. The same ads get relaunched on fresh pages, so part of their scale is rebuilding after bans.'
+    ],
+    copy: [
+      'Keep the text and headline fixed and change only the opening video. This is what the first-3-seconds panel above is for.',
+      'Run the same winners from more than one page and ad account, so one ban does not stop sales.',
+      'Add new ads every week, before the old ones tire.',
+      'Send every page to one landing page and read sales in one place.'
+    ],
+    skip: [
+      'Fake doctor personas and medical claims. They are what gets their pages closed, and in DACH they are a legal risk.',
+      'Several pixels on one page with no plan. It scrambles the numbers per campaign.',
+      'Copying their volume. They launch about 12 new ads a day on a large budget; your pace is 1–3 a week per campaign.'
+    ]
+  };
+
   function money(v, ctx) {
-    const sym = { EUR: '€', USD: '$', GBP: '£' }[(ctx && ctx.currency) || 'EUR'] || '€';
+    const sym ={ EUR: '€', USD: '$', GBP: '£' }[(ctx && ctx.currency) || 'EUR'] || '€';
     return sym + n(v).toFixed(2);
   }
 
@@ -798,7 +895,7 @@
      ------------------------------------------------------------------
      Plain enough for an editor to act on without a meeting.
      ------------------------------------------------------------------ */
-  function brief(campaignName, verdicts, needs, ctx, fresh, hooks) {
+  function brief(campaignName, verdicts, needs, ctx, fresh, hooks, spread) {
     const lines = [];
     const cur = (ctx && ctx.currency) || 'EUR';
 
@@ -855,6 +952,12 @@
       }
     }
 
+    if (spread && spread.ready) {
+      lines.push('');
+      lines.push(`**Spread the winner:** ${spread.winners.map(w => `**${w.name}** (ROAS ${w.roas.toFixed(2)}, ${w.purchases} orders)`).join(', ')} — test in a second ad account behind a different page.`);
+      spread.steps.forEach((s, i) => lines.push(`${i + 1}. ${s}`));
+    }
+
     if (needs.dominant) {
       lines.push('');
       lines.push(`**What they must fix: ${needs.dominant.label.toUpperCase()} (${needs.dominant.window}).**`);
@@ -900,12 +1003,17 @@
     needs.needed = Math.max(needs.needed, fresh.addCount);
     if (fresh.state === 'urgent') needs.urgent = true;
     const hooks = hookDesk(verdicts.ads);
-    return { campaign: campaignName, verdicts, needs, fresh, hooks, brief: brief(campaignName, verdicts, needs, ctx, fresh, hooks) };
+    const spread = spreadPlan({
+      verdicts, campaign: (ctx && ctx.campaign) || {}, streak: (ctx && ctx.streak) || 0,
+      ber: ctx && ctx.ber, currency: ctx && ctx.currency
+    });
+    return { campaign: campaignName, verdicts, needs, fresh, hooks, spread,
+             brief: brief(campaignName, verdicts, needs, ctx, fresh, hooks, spread) };
   }
 
   return {
     STAGES, SOP_MAX_ADS, SOP_MIN_ADS, FAIR_TEST_MULTIPLE, AD_RULES, FRESH,
-    HOOK, retention, diagnose, hookReport, hookDesk, fairTestThreshold, poissonCdf, judgeAd, adVerdicts,
+    HOOK, SPREAD, COMPETITOR_PLAYBOOK, spreadPlan, retention, diagnose, hookReport, hookDesk, fairTestThreshold, poissonCdf, judgeAd, adVerdicts,
     freshness, cadenceTarget, trendOf, roasTrend, campaignNeeds, brief, desk
   };
 });

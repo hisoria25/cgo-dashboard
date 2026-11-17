@@ -1442,7 +1442,7 @@
           priority: pr, kind: 'creatives', when: f.state === 'urgent' ? 'Today' : f.state === 'add' ? 'This week, start today' : 'This week',
           campaign: label, campaignId: c.id,
           title: `${label}: ${f.headline}`,
-          lines: (f.signals || []).map(sg => sg.text).concat(f.opportunities || [], (d && d.hooks && d.hooks.planLines) || []),
+          lines: (f.signals || []).map(sg => sg.text).concat(f.opportunities || [], (d && d.hooks && d.hooks.planLines) || [], (d && d.spread && d.spread.planLines) || []),
           money: 0,
           why: ''
         });

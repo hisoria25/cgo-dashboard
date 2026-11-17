@@ -1585,6 +1585,7 @@ function freshBlock(c, withHooks) {
       ${reasons.length ? `<ul class="fresh-why">${reasons.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : `<p class="fresh-quiet">${f.state === 'learning' ? 'Judging creative this early would be guessing.' : 'No sign of the ads wearing out. Do not add budget or new ads for the sake of it.'}</p>`}
       ${wantsNew && f.addCount ? `<p class="fresh-count">Make <b>${f.addCount}</b> new ad${f.addCount === 1 ? '' : 's'}${f.trigger === 'streak' ? ' — your SOP says to test new creatives once a campaign is profitable 3 days in a row' : ''}.</p>` : ''}
       ${wantsNew ? (withHooks ? hookBlock(c) : '<p class="fresh-foot"><a href="#creative-desk">See which opening to keep and what to change in the first 3 seconds ↓</a></p>') : ''}
+      ${c.desk && c.desk.spread ? (withHooks ? spreadBlock(c) : `<p class="fresh-foot"><a href="#creative-desk">${c.desk.spread.ready ? '🚀 Winner ready to test in a second ad account — see the steps ↓' : 'Spread the winner to a second ad account — not ready yet, see why ↓'}</a></p>`) : ''}
       <p class="fresh-foot">${f.liveAds} ad${f.liveAds === 1 ? '' : 's'} live${f.newLast7 ? ` · ${f.newLast7} launched in the last 7 days` : ''}${bleed.length ? ` · <b>${bleed.length} losing money — see Creative desk</b>` : ''}</p>
     </div>`;
 }
@@ -1636,6 +1637,39 @@ function hookBlock(c) {
       ${hd.keep ? `<p class="hook-note"><b>Reuse it:</b> put the opening of <b>${esc(hd.keep.name)}</b> on the new ads and change what comes after second 3 — the body, the proof or the offer.</p>` : ''}
       ${changes.length ? `<div class="hook-change"><div class="hook-change-head">${esc(lead)}</div><ol>${changes.map(t => `<li>${esc(t)}</li>`).join('')}</ol></div>` : ''}
       <p class="hook-foot">The picture is Meta's preview frame for the ad — usually the opening, not always the exact first frame. Open the ad in Ads Manager to watch its first 3 seconds. Meta reports who is still watching at second 3 and at the quarter mark; it cannot show the footage itself.</p>
+    </div>`;
+}
+
+/* ----------------------------------------------------------------------------
+   SPREAD THE WINNER — a second ad account behind a different page, plus what
+   the biggest competitor does to scale.
+   ---------------------------------------------------------------------------- */
+function spreadBlock(c) {
+  const sp = c.desk && c.desk.spread;
+  if (!sp) return '';
+  const pb = CD.COMPETITOR_PLAYBOOK;
+  let others = [];
+  try {
+    const here = activeAccount().id;
+    others = accountRegistry().filter(a => a.id !== here).map(a => a.label);
+  } catch (e) { others = []; }
+  const list = items => `<ul>${items.map(t => `<li>${esc(t)}</li>`).join('')}</ul>`;
+  return `
+    <div class="spread-panel ${sp.ready ? 'ready' : 'wait'}">
+      <div class="hook-head">${sp.ready ? '🚀' : '⏳'} ${esc(sp.headline)}</div>
+      <ul class="spread-gates">${sp.gates.map(g => `<li class="${g.ok ? 'ok' : 'no'}">${g.ok ? '✅' : '⬜'} ${esc(g.text)}</li>`).join('')}</ul>
+      ${sp.ready ? `
+        <div class="hook-change"><div class="hook-change-head">How to do it:</div>
+          <ol>${sp.steps.map(t => `<li>${esc(t)}</li>`).join('')}</ol></div>
+        ${others.length ? `<p class="hook-note"><b>Your other accounts on this dashboard:</b> ${others.map(esc).join(', ')}. Open each tab to see how many campaigns are active and whether anything is blocked.</p>` : ''}
+        <div class="hook-change"><div class="hook-change-head">Do not:</div>${list(sp.donts)}</div>` : ''}
+      <details class="spread-comp">
+        <summary>${esc(pb.title)}</summary>
+        <div class="hook-change"><div class="hook-change-head">What they do</div>${list(pb.facts)}</div>
+        <div class="hook-change"><div class="hook-change-head">Copy this</div>${list(pb.copy)}</div>
+        <div class="hook-change"><div class="hook-change-head">Do not copy this</div>${list(pb.skip)}</div>
+        <p class="hook-foot">${esc(pb.source)}</p>
+      </details>
     </div>`;
 }
 
@@ -3424,6 +3458,16 @@ function injectStyles() {
   .ad-why  { font-size: .76rem; line-height: 1.5; margin-bottom: .5rem; }
 
   .fresh-count { font-size: 13px; margin: 8px 0 2px; }
+  .spread-panel { margin: 10px 0 4px; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.03); }
+  .spread-panel.ready { border-color: rgba(16,185,129,.45); background: rgba(16,185,129,.06); }
+  .spread-panel.wait { border-color: rgba(148,163,184,.3); }
+  .spread-gates { list-style: none; margin: 0 0 6px; padding: 0; font-size: .78rem; line-height: 1.5; }
+  .spread-gates li { margin-bottom: 3px; }
+  .spread-gates li.no { opacity: .75; }
+  .spread-panel ul:not(.spread-gates) { margin: 4px 0 0 18px; padding: 0; line-height: 1.5; font-size: .78rem; }
+  .spread-comp { margin-top: 10px; font-size: .78rem; }
+  .spread-comp summary { cursor: pointer; font-weight: 600; }
   .hook-panel { margin: 10px 0 4px; padding: 10px 12px; border-radius: 10px;
     border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.03); }
   .hook-head { font-weight: 600; font-size: 13px; margin-bottom: 8px; }
