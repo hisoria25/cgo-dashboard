@@ -1571,18 +1571,90 @@ function renderVerdicts() {
    reasons underneath only when there are any. */
 const FRESH_TONE = { urgent: 'danger', add: 'warning', soon: 'neutral', ok: 'success', learning: 'neutral' };
 const FRESH_ICON = { urgent: '🚨', add: '🎬', soon: '🗓️', ok: '✅', learning: '⏳' };
-function freshBlock(c) {
+function freshBlock(c, withHooks) {
   const f = c.fresh;
   if (!f) return '';
   const tone = FRESH_TONE[f.state] || 'neutral';
   const reasons = (f.signals || []).map(sg => sg.text).concat(f.opportunities || []);
   const bleed = c.desk && c.desk.verdicts.bleeding ? c.desk.verdicts.bleeding : [];
+  const wantsNew = ['soon', 'add', 'urgent'].includes(f.state);
   return `
     <div class="fresh tone-${tone}">
       <div class="fresh-head"><span class="fresh-title">🎨 New creatives?</span>
         <span class="fresh-tag ${tone}">${FRESH_ICON[f.state] || ''} ${esc(f.headline)}</span></div>
       ${reasons.length ? `<ul class="fresh-why">${reasons.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : `<p class="fresh-quiet">${f.state === 'learning' ? 'Judging creative this early would be guessing.' : 'No sign of the ads wearing out. Do not add budget or new ads for the sake of it.'}</p>`}
+      ${wantsNew && f.addCount ? `<p class="fresh-count">Make <b>${f.addCount}</b> new ad${f.addCount === 1 ? '' : 's'}${f.trigger === 'streak' ? ' — your SOP says to test new creatives once a campaign is profitable 3 days in a row' : ''}.</p>` : ''}
+      ${wantsNew ? (withHooks ? hookBlock(c) : '<p class="fresh-foot"><a href="#creative-desk">See which opening to keep and what to change in the first 3 seconds ↓</a></p>') : ''}
       <p class="fresh-foot">${f.liveAds} ad${f.liveAds === 1 ? '' : 's'} live${f.newLast7 ? ` · ${f.newLast7} launched in the last 7 days` : ''}${bleed.length ? ` · <b>${bleed.length} losing money — see Creative desk</b>` : ''}</p>
+    </div>`;
+}
+
+/* ----------------------------------------------------------------------------
+   THE FIRST 3 SECONDS
+   Which opening to keep, which to replace, and what an editor changes.
+   ---------------------------------------------------------------------------- */
+function hookThumb(h) {
+  const url = h && h.thumbnail;
+  return url && /^https:\/\//i.test(url)
+    ? `<img class="hook-thumb" src="${esc(url)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.outerHTML='<div class=&quot;hook-thumb none&quot;>no preview</div>'">`
+    : '<div class="hook-thumb none">no preview</div>';
+}
+
+function hookCol(kind, title, h) {
+  if (!h) return '';
+  const scrolled = h.scrolled > 0 ? `${fmtInt(h.scrolled)} of ${fmtInt(h.impressions)} viewers scrolled past before second 3` : '';
+  return `
+    <div class="hook-col ${kind}">
+      ${hookThumb(h)}
+      <div class="hook-info">
+        <div class="hook-tag">${esc(title)}</div>
+        <div class="hook-name">${esc(h.name)}</div>
+        <div class="hook-rate"><b>${h.hookRate}%</b> hook rate <span class="dim">· target ${h.target}%+</span></div>
+        ${scrolled ? `<div class="hook-sub">${esc(scrolled)}</div>` : ''}
+      </div>
+    </div>`;
+}
+
+function hookBlock(c) {
+  const hd = c.desk && c.desk.hooks;
+  if (!hd) return '';
+  if (!hd.measured) {
+    return `<div class="hook-panel"><div class="hook-head">🎞️ The first 3 seconds</div><p class="fresh-quiet">${esc(hd.note)}</p></div>`;
+  }
+  const changes = hd.changes || [];
+  const lead = hd.replace
+    ? 'What to change in the opening you are replacing:'
+    : hd.beatOnly ? `The opening of ${hd.beatOnly.name} works, but viewers leave right after it. Change:` : '';
+  return `
+    <div class="hook-panel">
+      <div class="hook-head">🎞️ The first 3 seconds</div>
+      <div class="hook-cols">
+        ${hookCol('keep', 'Keep this opening', hd.keep)}
+        ${hookCol('replace', 'Replace this opening', hd.replace)}
+      </div>
+      ${!hd.keep ? '<p class="hook-note">No opening in this campaign is at target yet — every new ad needs a new first 3 seconds.</p>' : ''}
+      ${hd.keep ? `<p class="hook-note"><b>Reuse it:</b> put the opening of <b>${esc(hd.keep.name)}</b> on the new ads and change what comes after second 3 — the body, the proof or the offer.</p>` : ''}
+      ${changes.length ? `<div class="hook-change"><div class="hook-change-head">${esc(lead)}</div><ol>${changes.map(t => `<li>${esc(t)}</li>`).join('')}</ol></div>` : ''}
+      <p class="hook-foot">The picture is Meta's preview frame for the ad — usually the opening, not always the exact first frame. Open the ad in Ads Manager to watch its first 3 seconds. Meta reports who is still watching at second 3 and at the quarter mark; it cannot show the footage itself.</p>
+    </div>`;
+}
+
+/* One line on every video ad card. */
+function adHookLine(a) {
+  const h = a.hook;
+  if (!h || !h.isVideo) return '';
+  if (h.verdict === 'thin') return `<div class="ad-hook thin">First 3 seconds: ${esc(h.headline)}</div>`;
+  const tone = h.verdict === 'keep' ? 'keep' : h.verdict === 'tweak' ? 'tweak' : 'replace';
+  const todo = (h.changes || []);
+  return `
+    <div class="ad-hook ${tone}">
+      ${hookThumb(h)}
+      <div class="ad-hook-body">
+        <div><strong>First 3 seconds:</strong> ${esc(h.headline)}</div>
+        ${h.scrolled > 0 ? `<div class="hook-sub">${fmtInt(h.scrolled)} of ${fmtInt(h.impressions)} viewers scrolled past before second 3.</div>` : ''}
+        ${h.verdict === 'keep' && h.keep.length ? `<div class="hook-sub">${esc(h.keep[0])}</div>` : ''}
+        ${todo.length ? `<details class="ad-hook-more"><summary>What to change</summary><ol>${todo.map(t => `<li>${esc(t)}</li>`).join('')}</ol></details>` : ''}
+      </div>
     </div>`;
 }
 
@@ -2179,13 +2251,14 @@ function renderCreativeDesk() {
             <div class="ad-why">${esc(a.why)}</div>
             ${lost}
             ${src ? retentionBar(CD.retention(src)) : ''}
+            ${adHookLine(a)}
             <div class="ad-stages">
               ${a.diagnosis.stages.map(s => `
                 <span class="schip ${s.status}" title="${esc(s.measurable ? `${s.window} — target ${s.target}%+` : 'Not measurable for this ad')}">
                   ${esc(s.label)} ${s.measurable ? s.value + '%' : '—'}
                 </span>`).join('')}
             </div>
-            ${p && a.code !== 'TESTING' ? `<div class="ad-fix"><strong>${esc(p.label)} — ${esc(p.window)}.</strong> ${esc(p.fails)}<br><em>${esc(p.fix)}</em></div>` : ''}
+            ${p && a.code !== 'TESTING' && !(p.key === 'hook' && a.hook && a.hook.isVideo && a.hook.verdict !== 'thin') ? `<div class="ad-fix"><strong>${esc(p.label)} — ${esc(p.window)}.</strong> ${esc(p.fails)}<br><em>${esc(p.fix)}</em></div>` : ''}
           </div>`;
       }).join('');
 
@@ -2200,7 +2273,7 @@ function renderCreativeDesk() {
             ? `one sale costs ${fmtMoney(c.beCpa, 0)} at break-even · fair test ${fmtMoney(d.verdicts.threshold, 0)}`
             : `fair test ${d.verdicts.threshold ? fmtMoney(d.verdicts.threshold, 0) : '—'} (no order value yet — pause calls use the older rule)`}${d.verdicts.overSop ? ` · ${d.verdicts.overSop} over the SOP` : ''}</span>
         </header>
-        ${freshBlock(c)}
+        ${freshBlock(c, true)}
         <div class="brief ${d.brief.urgent ? 'urgent' : ''}">
           <div class="brief-head">📋 ${esc(d.brief.headline)}</div>
           <div class="brief-body">${d.brief.lines.map(l => mdLine(l)).join('')}</div>
@@ -3349,6 +3422,43 @@ function injectStyles() {
   .ad-shop.none { opacity: .65; }
   .ad-shop.dim { opacity: .6; font-style: italic; }
   .ad-why  { font-size: .76rem; line-height: 1.5; margin-bottom: .5rem; }
+
+  .fresh-count { font-size: 13px; margin: 8px 0 2px; }
+  .hook-panel { margin: 10px 0 4px; padding: 10px 12px; border-radius: 10px;
+    border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.03); }
+  .hook-head { font-weight: 600; font-size: 13px; margin-bottom: 8px; }
+  .hook-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+  .hook-col { display: flex; gap: 10px; align-items: flex-start; padding: 8px; border-radius: 8px;
+    border: 1px solid rgba(255,255,255,.08); }
+  .hook-col.keep { border-color: rgba(16,185,129,.45); background: rgba(16,185,129,.07); }
+  .hook-col.replace { border-color: rgba(239,68,68,.45); background: rgba(239,68,68,.07); }
+  .hook-thumb { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; flex: 0 0 64px;
+    background: rgba(148,163,184,.18); }
+  .hook-thumb.none { display: flex; align-items: center; justify-content: center; font-size: .6rem; opacity: .6;
+    text-align: center; }
+  .hook-info { min-width: 0; }
+  .hook-tag { font-size: .66rem; text-transform: uppercase; letter-spacing: .04em; opacity: .75; }
+  .hook-col.keep .hook-tag { color: #10b981; opacity: 1; }
+  .hook-col.replace .hook-tag { color: #f87171; opacity: 1; }
+  .hook-name { font-size: .8rem; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+  .hook-rate { font-size: .78rem; margin-top: 2px; }
+  .hook-sub { font-size: .7rem; opacity: .7; line-height: 1.4; margin-top: 2px; }
+  .hook-note { font-size: .78rem; line-height: 1.5; margin: 8px 0 0; }
+  .hook-change { margin-top: 8px; font-size: .78rem; }
+  .hook-change-head { font-weight: 600; margin-bottom: 4px; }
+  .hook-change ol, .ad-hook-more ol { margin: 4px 0 0 18px; padding: 0; line-height: 1.5; }
+  .hook-change li, .ad-hook-more li { margin-bottom: 3px; }
+  .hook-foot { font-size: .68rem; opacity: .6; line-height: 1.45; margin: 8px 0 0; }
+  .ad-hook { display: flex; gap: 8px; align-items: flex-start; font-size: .74rem; line-height: 1.45;
+    margin: 0 0 .5rem; padding: 6px 8px; border-radius: 8px; background: rgba(148,163,184,.1); }
+  .ad-hook .hook-thumb { width: 44px; height: 44px; flex-basis: 44px; }
+  .ad-hook.keep { background: rgba(16,185,129,.1); }
+  .ad-hook.tweak { background: rgba(245,158,11,.1); }
+  .ad-hook.replace { background: rgba(239,68,68,.1); }
+  .ad-hook.thin { opacity: .65; display: block; }
+  .ad-hook-body { min-width: 0; }
+  .ad-hook-more { margin-top: 4px; }
+  .ad-hook-more summary { cursor: pointer; font-weight: 600; }
 
   .ret { display: flex; align-items: flex-end; gap: 3px; height: 54px; margin: .4rem 0 .2rem; }
   .ret-col { flex: 1; display: flex; flex-direction: column; justify-content: flex-end;

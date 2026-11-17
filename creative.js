@@ -195,6 +195,133 @@
   }
 
   /* ------------------------------------------------------------------
+     THE FIRST 3 SECONDS
+     ------------------------------------------------------------------
+     Meta cannot show the footage, but it does say how many people were still
+     watching at second 3 and at the quarter mark. That is enough to say whether
+     the opening stops the scroll, and — if it does — whether the line after it
+     pays the opening off. The "what to change" list is the house rule set for
+     openers (the same rules the editor briefs use), so the answer is something
+     an editor can act on without a meeting.
+
+     The thumbnail is Meta's preview frame for the ad. It is usually the
+     opening, not always the exact first frame, so it is shown as a reminder of
+     what is being judged, not as proof.
+     ------------------------------------------------------------------ */
+  const HOOK = { minImpressions: 1000, seconds: 3 };
+
+  const HOOK_REPLACE = [
+    'Cut a new 3-second opener and put it in front. Keep everything from second 3 onward exactly as it is — do not re-edit the body.',
+    'Open on the moment, not the product: no logo, no product and no brand in the first 3 seconds. Show a situation the viewer already knows.',
+    'No face close-up, no skin close-up and no red pain zones on a body. It is the commonest Meta reject for health products.',
+    'Put the caption on frame 1 — many viewers watch muted. About six words, one key word in colour, centred in the lower third.',
+    'Movement inside the first half second: a cut, a hand, a step. A still frame reads as a photo and gets scrolled past.',
+    'Use the same caption style as the body so the join does not look like a different ad.'
+  ];
+  const HOOK_TWEAK = [
+    'Change the opening frame only. The thumbnail is what viewers see first; make it the strongest image of the first 3 seconds.',
+    'Caption on frame 1, six words or fewer, one key word in colour.',
+    'Start the movement in the first half second.',
+    'Upload the new opening as a second ad beside this one rather than replacing it, so the test is fair.'
+  ];
+
+  /**
+   * @param ad  one ad row: { type, impressions, v3, p25, lengthSec, thumbnail }
+   */
+  function hookReport(ad) {
+    const isVideo = (ad.type || '').toLowerCase() === 'video' || n(ad.v3) > 0;
+    const thumbnail = /^https:\/\//i.test(ad.thumbnail || '') ? ad.thumbnail : '';
+    if (!isVideo) {
+      return { isVideo: false, verdict: 'image', thumbnail, hookRate: null,
+        headline: 'Image ad — it has no first 3 seconds to analyse.', changes: [], keep: [] };
+    }
+    const imp = n(ad.impressions), v3 = n(ad.v3), p25 = n(ad.p25), len = n(ad.lengthSec);
+    if (imp < HOOK.minImpressions) {
+      return { isVideo: true, verdict: 'thin', thumbnail, hookRate: null, impressions: imp,
+        headline: `Only ${Math.round(imp)} views so far — the opening needs ${HOOK.minImpressions} to be judged fairly.`,
+        changes: [], keep: [] };
+    }
+
+    const hookS = STAGES[0], beatS = STAGES[1];
+    const hookRate = r1(ratio(v3, imp));
+    const status = grade(hookRate, hookS);
+    const quarterAt = len > 0 ? r1(len * 0.25) : null;
+    /* On a clip under 12 seconds the quarter mark falls inside the opening, so
+       "3s → 25%" stops meaning anything. */
+    const beatMeasurable = v3 > 0 && !(quarterAt !== null && quarterAt <= HOOK.seconds);
+    const beatRate = beatMeasurable ? r1(ratio(p25, v3)) : null;
+    const beatStatus = beatMeasurable ? grade(beatRate, beatS) : 'untracked';
+    const scrolled = Math.max(0, Math.round(imp - v3));
+
+    const changes = [], keep = [];
+    let verdict, headline;
+    if (status === 'alert') {
+      verdict = 'replace';
+      headline = `Hook rate ${hookRate}% — ${r1(100 - hookRate)}% scroll past before second 3 (target ${hookS.good}%+). Replace the first 3 seconds.`;
+      changes.push(...HOOK_REPLACE);
+    } else if (status === 'warning') {
+      verdict = 'tweak';
+      headline = `Hook rate ${hookRate}% — under the ${hookS.good}% target. Keep the idea, sharpen the opening frame.`;
+      changes.push(...HOOK_TWEAK);
+    } else {
+      verdict = 'keep';
+      headline = `Hook rate ${hookRate}% — it stops the scroll (target ${hookS.good}%+). Reuse this opening.`;
+      keep.push('Copy this exact opening onto the new ads and change what comes after second 3: the body, the proof or the offer.');
+      keep.push('Do not change the first frame or the caption.');
+    }
+    if (beatStatus === 'alert' || beatStatus === 'warning') {
+      changes.push(`People stop, then ${r1(100 - beatRate)}% leave before the quarter mark${quarterAt !== null ? ` (${quarterAt}s)` : ''}. Say again by second 5 what the opening promised — cut whatever sits between them (logo sting, slow pan, a line of setup).`);
+    }
+
+    return { isVideo: true, verdict, thumbnail, hookRate, status, target: hookS.good, scrolled, impressions: imp,
+      beatRate, beatStatus, quarterAt, headline, changes, keep };
+  }
+
+  /**
+   * The campaign's openings side by side: the one to keep, the one to replace.
+   * The one to replace is the broken opening with the most money behind it —
+   * that is where a new first 3 seconds pays back soonest.
+   */
+  function hookDesk(scored) {
+    const vids = (scored || []).filter(a => a.hook && a.hook.isVideo && a.hook.verdict !== 'thin');
+    if (!vids.length) {
+      const anyVideo = (scored || []).some(a => a.hook && a.hook.isVideo);
+      return { measured: false, keep: null, replace: null, ranked: [], changes: [], planLines: [],
+        note: anyVideo
+          ? `The video ads here have fewer than ${HOOK.minImpressions} views each, so no opening can be judged yet.`
+          : 'No video ads in this campaign, so there is no first 3 seconds to analyse.' };
+    }
+    const ranked = vids.slice().sort((a, b) => b.hook.hookRate - a.hook.hookRate);
+    const pick = a => ({ id: a.id, name: a.name, code: a.code, spend: a.spend, thumbnail: a.hook.thumbnail,
+      hookRate: a.hook.hookRate, scrolled: a.hook.scrolled, impressions: a.hook.impressions,
+      verdict: a.hook.verdict, headline: a.hook.headline, changes: a.hook.changes, keep: a.hook.keep,
+      beatRate: a.hook.beatRate, beatStatus: a.hook.beatStatus, quarterAt: a.hook.quarterAt, target: a.hook.target });
+    const healthy = ranked.filter(a => a.hook.status === 'healthy');
+    const keep = healthy.length ? pick(healthy[0]) : null;
+    const broken = vids.filter(a => a.hook.verdict === 'replace' || a.hook.verdict === 'tweak')
+      .sort((a, b) => b.spend - a.spend);
+    const replace = broken.length ? pick(broken[0]) : null;
+    /* A healthy opening with a leaking second beat still has one thing to fix. */
+    const beatOnly = !replace
+      ? vids.filter(a => a.hook.beatStatus === 'alert' || a.hook.beatStatus === 'warning').sort((a, b) => b.spend - a.spend)[0]
+      : null;
+
+    const planLines = [];
+    if (keep) planLines.push(`Keep this opening: ${keep.name} — hook rate ${keep.hookRate}%.`);
+    if (replace) planLines.push(`Replace this opening: ${replace.name} — hook rate ${replace.hookRate}% (${r1(100 - replace.hookRate)}% scroll past before second 3).`);
+    if (!keep && !replace && beatOnly) planLines.push(`${beatOnly.name}: the opening works but viewers leave right after it.`);
+    if (!keep && replace) planLines.push('No opening in this campaign is at target yet — all new ads need a new first 3 seconds.');
+
+    return {
+      measured: true, keep, replace,
+      beatOnly: beatOnly ? pick(beatOnly) : null,
+      ranked: ranked.map(pick),
+      changes: replace ? replace.changes : (beatOnly ? beatOnly.hook.changes : []),
+      planLines, note: ''
+    };
+  }
+
+  /* ------------------------------------------------------------------
      AD VERDICTS
      ------------------------------------------------------------------
      An ad has had a fair test when it has spent enough to have produced a
@@ -371,6 +498,8 @@
         ageDays: a.ageDays === undefined ? null : a.ageDays,
         frequency: n(a.frequency) || null,
         shop: a.shop || null,
+        hook: hookReport(a),
+        thumbnail: /^https:\/\//i.test(a.thumbnail || '') ? a.thumbnail : '',
         shopRoas: (a.shop && a.shop.state !== 'ambiguous' && a.shop.orders != null && spend > 0) ? r2(n(a.shop.revenue) / spend) : null,
         diagnosis: d,
         ...extra,
@@ -558,7 +687,11 @@
       add('pipeline', 1, `Nothing new has gone into this campaign for ${Math.round(newest)} days.`);
     }
 
-    const young = campaign.learning || n(campaign.daysLive) < 3;
+    /* Profitable three days running is the SOP's trigger for new creatives. It
+       also ends the "too early to judge" exemption: a campaign that has already
+       beaten break-even three days in a row has been judged. */
+    const streakTrigger = streak >= 3 && ber > 0;
+    const young = (campaign.learning || n(campaign.daysLive) < 3) && !streakTrigger;
     const target = cadenceTarget(campaign.spendPerDay);
     const cadence = { target, actual: newLast7, met: newLast7 >= target };
     if (!young && target > 0 && newLast7 < target) {
@@ -585,7 +718,13 @@
       headline = `Add ${addCount} new creatives today`;
     } else if (score >= FRESH.needScoreAdd) {
       state = 'add'; addCount = 3;
-      headline = 'Add 3 new creatives now';
+      headline = streakTrigger
+        ? `Profitable ${streak} days running — add 3 new creatives now`
+        : 'Add 3 new creatives now';
+    } else if (streakTrigger) {
+      state = 'add';
+      addCount = Math.max(2, target);
+      headline = `Profitable ${streak} days running — add ${addCount} new creatives now`;
     } else if (score >= FRESH.needScoreSoon || opportunities.length) {
       state = 'soon'; addCount = 2;
       headline = 'Get 2 new creatives ready this week';
@@ -596,6 +735,7 @@
 
     return {
       state, headline, addCount, score, signals, opportunities,
+      trigger: streakTrigger ? 'streak' : null, streak: streakTrigger ? streak : 0,
       liveAds: liveN, topAd: top ? top.name : null, topShare: r2(topShare),
       newestAdDays: newest === null ? null : Math.round(newest), newLast7, cadence,
       trend: tr, roasTrend: rt
@@ -658,7 +798,7 @@
      ------------------------------------------------------------------
      Plain enough for an editor to act on without a meeting.
      ------------------------------------------------------------------ */
-  function brief(campaignName, verdicts, needs, ctx, fresh) {
+  function brief(campaignName, verdicts, needs, ctx, fresh, hooks) {
     const lines = [];
     const cur = (ctx && ctx.currency) || 'EUR';
 
@@ -687,13 +827,31 @@
     if (needs.needed > 0) {
       lines.push('');
       lines.push(`**Make ${needs.needed} new ${needs.needed === 1 ? 'ad' : 'ads'}.**`);
-      if (fresh && fresh.signals.length) {
+      const why = fresh ? fresh.signals.map(sg => sg.text).concat(fresh.opportunities || []) : [];
+      if (why.length) {
         lines.push('Why now:');
-        fresh.signals.forEach(sg => lines.push(`- ${sg.text}`));
+        why.forEach(t => lines.push(`- ${t}`));
       }
       lines.push('Launch them as a new test campaign beside this one (horizontal scaling), so the ad that is working is not disturbed.');
       if (needs.bestFormat && needs.bestFormat.roas > 0) {
         lines.push(`Format: **${needs.bestFormat.type}** — it runs at ROAS ${needs.bestFormat.roas} here against ${needs.formats.slice(1).map(f => `${f.type} ${f.roas}`).join(', ') || 'nothing else tested'}.`);
+      }
+    }
+
+    if (hooks && hooks.measured && (needs.needed > 0 || hooks.replace)) {
+      lines.push('');
+      lines.push('**The first 3 seconds — keep and change:**');
+      if (hooks.keep) {
+        lines.push(`Keep this opening: **${hooks.keep.name}** — hook rate ${hooks.keep.hookRate}% (target ${hooks.keep.target}%+). Put it on the new ads and change what comes after second 3.`);
+      } else {
+        lines.push('No opening here is at target yet, so every new ad needs a new first 3 seconds.');
+      }
+      if (hooks.replace) {
+        lines.push(`Replace this opening: **${hooks.replace.name}** — hook rate ${hooks.replace.hookRate}%, ${r1(100 - hooks.replace.hookRate)}% scroll past before second 3, ${money(hooks.replace.spend, ctx)} spent on it.`);
+        hooks.replace.changes.forEach(c => lines.push(`- ${c}`));
+      } else if (hooks.beatOnly) {
+        lines.push(`The opening of **${hooks.beatOnly.name}** works, but viewers leave right after it.`);
+        hooks.beatOnly.changes.forEach(c => lines.push(`- ${c}`));
       }
     }
 
@@ -741,12 +899,13 @@
     /* The freshness read can ask for more ads than the pruning logic alone. */
     needs.needed = Math.max(needs.needed, fresh.addCount);
     if (fresh.state === 'urgent') needs.urgent = true;
-    return { campaign: campaignName, verdicts, needs, fresh, brief: brief(campaignName, verdicts, needs, ctx, fresh) };
+    const hooks = hookDesk(verdicts.ads);
+    return { campaign: campaignName, verdicts, needs, fresh, hooks, brief: brief(campaignName, verdicts, needs, ctx, fresh, hooks) };
   }
 
   return {
     STAGES, SOP_MAX_ADS, SOP_MIN_ADS, FAIR_TEST_MULTIPLE, AD_RULES, FRESH,
-    retention, diagnose, fairTestThreshold, poissonCdf, judgeAd, adVerdicts,
+    HOOK, retention, diagnose, hookReport, hookDesk, fairTestThreshold, poissonCdf, judgeAd, adVerdicts,
     freshness, cadenceTarget, trendOf, roasTrend, campaignNeeds, brief, desk
   };
 });
