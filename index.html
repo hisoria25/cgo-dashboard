@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CGO Media Buyer — Verdict Dashboard</title>
   <meta name="description" content="Meta ads decision dashboard running the Samuel Ecom scaling rules against the Shopify order book: scale, keep, descale or kill, with the exact new budget.">
-  <link rel="stylesheet" href="style.css?v=20261117c">
+  <link rel="stylesheet" href="style.css?v=20261117d">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
@@ -143,6 +143,11 @@
         <div class="form-group">
           <label for="econ-fees">Payment fees %</label>
           <input type="number" step="0.1" id="econ-fees" class="search-input full" value="3" />
+        </div>
+        <div class="form-group">
+          <label for="econ-refund">Expected refunds % of revenue</label>
+          <input type="number" step="0.1" min="0" max="50" id="econ-refund" class="search-input full" value="2" />
+          <span class="hint">Measured 17 Nov 2026 on Shopify, Stripe and PayPal: about 1.3–2%. Applies to every account in this browser. Only adds a note under each campaign's revenue line.</span>
         </div>
       </div>
 
@@ -453,11 +458,11 @@
   </footer>
 </main>
 
-<script src="rules.js?v=20261117c"></script>
-<script src="truth.js?v=20261117c"></script>
-<script src="creative.js?v=20261117c"></script>
-<script src="calendar.js?v=20261117c"></script>
-<script src="app.js?v=20261117c"></script>
-<script src="hub.js?v=20261117c"></script>
+<script src="rules.js?v=20261117d"></script>
+<script src="truth.js?v=20261117d"></script>
+<script src="creative.js?v=20261117d"></script>
+<script src="calendar.js?v=20261117d"></script>
+<script src="app.js?v=20261117d"></script>
+<script src="hub.js?v=20261117d"></script>
 </body>
 </html>

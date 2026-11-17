@@ -132,7 +132,16 @@ function todayInAccountTz(offsetDays = 0) {
 /* ========================================================================== *
  *  UNIT ECONOMICS
  * ========================================================================== */
+/* The share of revenue that ends up refunded, as a percentage. Measured 17 Nov 2026 across Shopify, Stripe
+   and PayPal at about 1.3 to 2%. Kept per browser, editable in Unit Economics. */
+function expectedRefundPct() {
+  const v = parseFloat(LS.get('cgo_expected_refund_pct', '2'));
+  return isFinite(v) && v >= 0 && v <= 50 ? v : 2;
+}
+
 function loadEconomics() {
+  const rf = document.getElementById('econ-refund');
+  if (rf) rf.value = expectedRefundPct();
   const saved = acctJson('cgo_econ', { price: 29.95, cogs: 7, shipping: 2, feePct: 3 });
   ['price', 'cogs', 'shipping', 'fees'].forEach(k => {
     const el = document.getElementById('econ-' + k);
@@ -189,6 +198,8 @@ function setupModals() {
 
   document.getElementById('btn-save-econ').addEventListener('click', () => {
     const inputs = readEconomicsInputs();
+    const rf = parseFloat(document.getElementById('econ-refund').value);
+    if (isFinite(rf) && rf >= 0 && rf <= 50) LS.set('cgo_expected_refund_pct', String(rf));
     acctSet('cgo_econ', JSON.stringify(inputs));
     State.econ = VE.economics(inputs);
     close('econ-modal');
@@ -1393,6 +1404,9 @@ function computeVerdicts() {
     };
 
     c.verdict = VE.verdict(c, ctx);
+    c.refundCushion = c.revenueSource === 'shopify'
+      ? VE.refundCushion({ net: c.trueRevenue, refunded: c.trueRefunded, spend: c.spend, ber, expectedPct: expectedRefundPct() })
+      : null;
 
     /* The ladder asks whether today is profitable. The curve asks whether the
        last increase was worth it, from this campaign's own days — and a scale
@@ -1488,6 +1502,18 @@ function sparkline(series, ber) {
 /* The revenue provenance strip on each card. This is the single most
    important thing on the card, because it says whether the number underneath
    can be trusted. */
+/* What refunds will probably still take off this window. A note, not a verdict. */
+function refundLine(c) {
+  const r = c.refundCushion;
+  if (!r || !(r.expectedPct > r.alreadyPct)) return '';
+  if (r.thin) {
+    return `<div class="rev-line unverified"><span class="rev-badge warn">⚠ Thin</span>
+      <span>After the refunds usually still to come (about ${r.expectedPct}% in total), ROAS falls from ${r.roas.toFixed(2)} to ${r.roasAfter.toFixed(2)} — under break-even ${r.ber.toFixed(2)}. This profit could disappear.</span></div>`;
+  }
+  return `<div class="rev-line"><span class="rev-badge">After refunds</span>
+    <span>About ${r.expectedPct}% of revenue is usually refunded in the end (${r.alreadyPct}% so far): ROAS ${r.roas.toFixed(2)} → ${r.roasAfter.toFixed(2)}${r.profitable ? (r.stillProfitable ? ' — still above break-even.' : ' — below break-even.') : '.'}</span></div>`;
+}
+
 function revenueLine(c) {
   if (c.revenueSource === 'shopify') {
     const gap = c.revenueGap;
@@ -1498,7 +1524,7 @@ function revenueLine(c) {
     return `<div class="rev-line verified">
       <span class="rev-badge ok">✓ Shopify</span>
       <span>${fmtMoney(c.trueRevenue, 0)} from ${c.trueOrders} order${c.trueOrders === 1 ? '' : 's'}${refund}${gapTxt}</span>
-    </div>`;
+    </div>${refundLine(c)}`;
   }
   if (c.revenueSource === 'meta') {
     return `<div class="rev-line unverified">

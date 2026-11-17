@@ -214,6 +214,45 @@
       : 'Contribution margin (before refunds)';
   }
 
+
+  /* ------------------------------------------------------------------
+     2d. REFUND CUSHION
+     ------------------------------------------------------------------
+     Shopify revenue is already net of the refunds that HAVE happened, but
+     refunds keep arriving for weeks, so a young window always looks a little
+     better than it will end up. Measured 17 Nov 2026 across Shopify, Stripe
+     and PayPal: about 1.3 to 2% of revenue is refunded (not the 25-40% on the
+     support chart — that is the size of a partial refund when one is given).
+
+     This works out what ROAS becomes once the expected total is deducted. It
+     is a NOTE under the revenue line, never a second verdict: it does not move
+     a budget or change a verdict.
+
+       final net = current net x (1 - expected) / (1 - already refunded share)
+     ------------------------------------------------------------------ */
+  function refundCushion(input) {
+    const i = input || {};
+    const net = num(i.net), refunded = num(i.refunded), spend = num(i.spend), ber = num(i.ber);
+    const expected = Math.min(0.5, Math.max(0, num(i.expectedPct) / 100));
+    if (!(net > 0) || !(spend > 0) || !(ber > 0)) return null;
+    const gross = net + refunded;
+    const already = gross > 0 ? refunded / gross : 0;
+    const roas = net / spend;
+    const factor = expected > already ? (1 - expected) / (1 - already) : 1;
+    const roasAfter = roas * factor;
+    return {
+      expectedPct: round1(expected * 100),
+      alreadyPct: round1(already * 100),
+      roas: round2(roas),
+      roasAfter: round2(roasAfter),
+      ber: round2(ber),
+      lostToReserve: round2(net - net * factor),
+      profitable: roas > ber,
+      stillProfitable: roasAfter > ber,
+      thin: roas > ber && roasAfter <= ber
+    };
+  }
+
   /* ------------------------------------------------------------------
      2c. CONFIDENCE
      ------------------------------------------------------------------
@@ -1685,7 +1724,7 @@
     clockIn, detectWindow, dayContext, funnel, biggestLeak, verdict, guardrails, deliveryAlarms, productLabel,
     campaignDelivery, accountHealth, breakdown, reviewReason, spendCurve, applyCeiling,
     countUnprofitableStreak, countProfitableStreak, money, tonightPlan,
-    revenueVerified, scalingLocked, marginLabel, windowAgreement,
+    revenueVerified, scalingLocked, marginLabel, refundCushion, windowAgreement,
     roasInterval, ordersNeeded, provenAbove, weekendLift, surfPctFromLift
   };
 });
