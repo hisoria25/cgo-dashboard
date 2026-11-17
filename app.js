@@ -838,6 +838,7 @@ async function syncMetaAPI() {
     // same timezone, before any verdict is computed.
     await syncTruth(preset);
     await syncAdOrders();
+    await syncCosts();
 
     setApiStatus('online', `Live · ${accountClock()}`);
     document.getElementById('brand-sub').innerText = ok.length === 1
@@ -926,6 +927,65 @@ async function syncTruth(preset) {
 /* Which ad sold each order. Read for the same seven closed days the creative
    desk uses, and only ever used to show the number and to stop a wrong pause —
    Shopify cannot start a pause. */
+/* The product data sheet is private, so the dashboard compares each campaign's
+   break-even to a copy kept in the Worker. Display plus a plan note only. */
+async function syncCosts() {
+  State.costs = null;
+  const workerUrl = LS.get('truth_worker_url', '');
+  const dashKey = LS.get('truth_dash_key', '');
+  if (!workerUrl || !dashKey) { State.costs = { state: 'off' }; return; }
+  try {
+    const res = await TR.fetchCosts({ workerUrl, dashKey });
+    if (!res.ok) { State.costs = { state: 'error', message: res.error || res.reason }; return; }
+    if (res.data.empty) { State.costs = { state: 'empty' }; return; }
+    State.costs = { state: 'ok', check: TR.costCheck(State.campaigns, res.data) };
+  } catch (e) {
+    console.error(e);
+    State.costs = { state: 'error', message: String(e && e.message || e) };
+  }
+}
+
+function applyCostWarnings() {
+  const chk = State.costs && State.costs.check;
+  const byId = {};
+  if (chk) chk.rows.forEach(r => { byId[r.id] = r; });
+  (State.campaigns || []).forEach(c => { c.costWarn = byId[c.id] || null; });
+}
+
+function renderCostPanel() {
+  let el = document.getElementById('cost-panel');
+  if (!el) {
+    el = document.createElement('section');
+    el.id = 'cost-panel';
+    const host = document.getElementById('truth-panel');
+    if (host && host.parentNode) host.parentNode.insertBefore(el, host.nextSibling);
+    else document.body.appendChild(el);
+  }
+  const st = State.costs;
+  if (!st || st.state === 'off') { el.innerHTML = ''; return; }
+  if (st.state === 'error') {
+    el.innerHTML = `<div class="cost-card"><b>🧮 Cost sheet check unavailable</b><div class="cost-sub">${esc(st.message || '')}</div></div>`;
+    return;
+  }
+  if (st.state === 'empty') {
+    el.innerHTML = `<div class="cost-card"><b>🧮 Cost sheet check — no copy yet</b><div class="cost-sub">Ask Claude to copy the product data sheet into the Worker once, then this compares every campaign's break-even to it.</div></div>`;
+    return;
+  }
+  const c = st.check;
+  const bad = c.rows.filter(r => r.status === 'differs' || r.status === 'incomplete');
+  const info = c.rows.filter(r => r.status === 'no-ber' || r.status === 'no-row' || r.status === 'no-code');
+  const when = c.ageDays === null ? '' : c.ageDays === 0 ? 'copied today' : `copied ${c.ageDays} day${c.ageDays === 1 ? '' : 's'} ago`;
+  const head = bad.length
+    ? `<b>🧮 Cost sheet check — ${bad.length} to look at</b>`
+    : `<b>🧮 Cost sheet check — all ${c.counts.match} campaign break-evens match the sheet</b>`;
+  const line = (r) => `<li class="${r.active ? 'live' : 'off'}"><b>${esc(r.label)}</b> ${r.code ? `<span class="cost-code">${esc(r.code)}</span>` : ''}${r.active ? '' : ' <span class="cost-off">paused</span>'}<div>${esc(r.message)}</div></li>`;
+  el.innerHTML = `<div class="cost-card ${bad.length ? 'warn' : 'ok'}">
+    <div class="cost-head">${head}<span class="cost-sub">Sheet ${esc(when)}${c.stale ? ' — <b>older than 14 days, ask Claude to refresh it</b>' : ''}</span></div>
+    ${bad.length ? `<ul class="cost-list">${bad.map(line).join('')}</ul>` : ''}
+    ${info.length ? `<details class="cost-more"><summary>${info.length} other note${info.length === 1 ? '' : 's'}</summary><ul class="cost-list">${info.map(line).join('')}</ul></details>` : ''}
+  </div>`;
+}
+
 async function syncAdOrders() {
   State.adOrders = null;
   const workerUrl = LS.get('truth_worker_url', '');
@@ -2173,7 +2233,7 @@ function renderTruthPanel() {
  * ========================================================================== *
  * Every decision on the page, in the order to do them. It adds no new rules —
  * it reads the verdicts, the spend curve and the ad calls already made. */
-const PLAN_ICON = { pause: '⛔', replace: '🔁', budget: '💶', fix: '🔧', creatives: '🎬', delivery: '📉' };
+const PLAN_ICON = { pause: '⛔', replace: '🔁', budget: '💶', fix: '🔧', creatives: '🎬', delivery: '📉', costs: '🧮' };
 
 function planHost() {
   let el = document.getElementById('plan-panel');
@@ -2204,6 +2264,7 @@ function renderPlan() {
   const bits = [];
   if (sm.pauseAds) bits.push(`<b>${sm.pauseAds}</b> ad${sm.pauseAds === 1 ? '' : 's'} to pause`);
   if (sm.budgetMoves) bits.push(`<b>${sm.budgetMoves}</b> budget move${sm.budgetMoves === 1 ? '' : 's'}`);
+  if (sm.costWarnings) bits.push(`<b>${sm.costWarnings}</b> cost check${sm.costWarnings === 1 ? '' : 's'}`);
   if (sm.deliveryWarnings) bits.push(`<b>${sm.deliveryWarnings}</b> delivery warning${sm.deliveryWarnings === 1 ? '' : 's'}`);
   if (sm.creativeJobs) bits.push(`<b>${sm.newAds}</b> new creatives to make`);
   const headline = plan.items.length ? bits.join(' · ') : 'Nothing to do. Leave everything running.';
@@ -3440,6 +3501,18 @@ function injectStyles() {
   @media (max-width: 760px) { .dstrip-src { margin-left: 0; } }
 
   #truth-panel { margin: 0 0 1rem; }
+  #cost-panel { margin: 0 0 1rem; }
+  .cost-card { border: 1px solid var(--border, rgba(128,128,128,.3)); border-radius: 12px; padding: .8rem 1rem; background: rgba(128,128,128,.06); }
+  .cost-card.warn { border-color: rgba(245,158,11,.5); background: rgba(245,158,11,.07); }
+  .cost-card.ok { border-color: rgba(16,185,129,.35); }
+  .cost-head { display: flex; flex-wrap: wrap; gap: .3rem .9rem; align-items: baseline; justify-content: space-between; }
+  .cost-sub { font-size: .8rem; opacity: .75; }
+  .cost-list { list-style: none; margin: .6rem 0 0; padding: 0; display: grid; gap: .6rem; }
+  .cost-list li { font-size: .88rem; line-height: 1.45; }
+  .cost-list li.off { opacity: .65; }
+  .cost-code, .cost-off { font-size: .72rem; padding: 0 .4rem; border-radius: 6px; background: rgba(128,128,128,.18); margin-left: .25rem; }
+  .cost-more { margin-top: .6rem; font-size: .85rem; }
+  .cost-more summary { cursor: pointer; opacity: .8; }
   .truth-card { border-radius: 12px; padding: 1rem 1.15rem; border: 1px solid var(--color-border, rgba(255,255,255,.1));
     background: var(--color-surface, rgba(255,255,255,.03)); }
   .truth-card.ok   { border-left: 4px solid var(--color-success, #10b981); }
@@ -3610,11 +3683,13 @@ function injectStyles() {
  * ========================================================================== */
 function renderAll() {
   computeVerdicts();
+  applyCostWarnings();
   renderCommandBar();
   renderDateBar();
   renderDataStrip();
   renderPlan();
   renderTruthPanel();
+  renderCostPanel();
   renderVerdicts();
   renderCreativeDesk();
   renderBreakdowns();

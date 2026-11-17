@@ -1403,7 +1403,7 @@
     const items = [];
     const quiet = [];
     const sum = { pauseAds: 0, bleedPerWeek: 0, budgetMoves: 0, creativeJobs: 0, newLast7: 0, newAds: 0,
-      cadenceTarget: 0, cadenceActual: 0, cadenceBehind: [], deliveryWarnings: 0 };
+      cadenceTarget: 0, cadenceActual: 0, cadenceBehind: [], deliveryWarnings: 0, costWarnings: 0 };
     const MONEY_NOW = { KILL: 2, DESCALE: 3, PRICE_DROP: 3, SCALE: 5, SURF: 5 };
     const FIX = { DIAGNOSE: 'Fix what is leaking', NEEDS_SETUP: 'Finish the setup' };
     const when = dayOver ? 'Now — the day is closed' : 'After midnight — the day is still running';
@@ -1465,6 +1465,22 @@
           priority: 3, kind: 'fix', when: 'Today', campaign: label, campaignId: c.id,
           title: `${label}: ${FIX[v.code]}`, lines: [], money: 0,
           why: (v.reasons && v.reasons[0]) || v.headline || ''
+        });
+      }
+
+      /* Cost sheet drift: the break-even in the campaign name no longer matches the
+         product data sheet. Judgement is only as good as that number. */
+      const cw = c.costWarn;
+      if (cw && (cw.status === 'differs' || cw.status === 'incomplete')) {
+        sum.costWarnings++;
+        items.push({
+          priority: 5, kind: 'costs', when: 'This week — before you trust the next verdict',
+          campaign: label, campaignId: c.id,
+          title: `${label}: break-even may be wrong`,
+          lines: [cw.message, cw.status === 'differs'
+            ? 'Decide which number is right, then fix the sheet or rename the campaign so both say the same.'
+            : 'Fill in the price and costs for this product in the sheet.'],
+          money: 0, why: ''
         });
       }
 

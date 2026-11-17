@@ -439,6 +439,101 @@
   /* rules.js loads before this file in the browser and is required ahead of it
      in Node. Resolve it at call time rather than capturing it at load time, so
      the order of <script> tags cannot silently disable product matching. */
+
+  /* ------------------------------------------------------------------
+     COST SHEET CHECK
+     ------------------------------------------------------------------
+     The dashboard reads each campaign's break-even (BER) from the campaign
+     NAME. The product data sheet is where it is worked out. If the two
+     drift apart — a supplier quote changes, a price is raised, a name is
+     never updated — the dashboard quietly judges a campaign against the
+     wrong line. This lines them up so the owner sees it.
+
+     The sheet is private, so the dashboard reads a copy kept in the Worker
+     (see saveCosts there). Nothing here moves a budget or changes a verdict. */
+  var COST_TOLERANCE = 0.02;   // two decimals in a name: 1.32 vs 1.33 is rounding, not drift
+  var COST_STALE_DAYS = 14;
+
+  function berFromName(name) {
+    var VE = (typeof globalThis !== 'undefined' && globalThis.VerdictEngine) || root.VerdictEngine;
+    if (VE && VE.parseCampaignName) { var p = VE.parseCampaignName(name); return p && p.ber ? p.ber : null; }
+    var parts = String(name || '').split('|');
+    for (var i = parts.length - 1; i >= 0; i--) {
+      var m = parts[i].trim().match(/^(\d\.\d{1,2})\b/);
+      if (m) return parseFloat(m[1]);
+    }
+    return null;
+  }
+
+  function costCheck(campaigns, costs, nowMs) {
+    var rows = (costs && costs.rows) || {};
+    var savedMs = costs && costs.savedAt ? Date.parse(costs.savedAt) : NaN;
+    var now = nowMs || Date.now();
+    var ageDays = Number.isFinite(savedMs) ? Math.floor((now - savedMs) / 86400000) : null;
+    var out = [];
+
+    (campaigns || []).forEach(function (c) {
+      var code = cmOf(c.name);
+      var label = String(c.name || '').split('|').map(function (x) { return x.trim(); })[2] || c.name;
+      var active = !/^(PAUSED|ADSET_PAUSED|CAMPAIGN_PAUSED|ARCHIVED|DELETED)$/.test(String(c.status || ''));
+      var nameBer = berFromName(c.name);
+      var row = code ? rows[code] : null;
+      var r = { id: c.id, code: code, label: label, active: active, nameBer: nameBer,
+                sheetBer: row && row.ber > 0 ? row.ber : null, price: row ? row.price : null, status: 'match', message: '' };
+
+      if (!code) {
+        r.status = 'no-code';
+        r.message = 'The campaign name has no CM code, so it cannot be matched to the sheet.';
+      } else if (!row) {
+        r.status = 'no-row';
+        r.message = code + ' is not in the sheet copy.';
+      } else if (!(row.ber > 0) || !(row.price > 0)) {
+        r.status = 'incomplete';
+        r.message = code + ' has no price or break-even in the sheet yet, so there is nothing to check this campaign against.';
+      } else if (nameBer === null) {
+        r.status = 'no-ber';
+        r.message = 'The name carries no break-even, so the dashboard uses the account figure. The sheet says ' + row.ber.toFixed(2) + '.';
+      } else {
+        var diff = Math.round((nameBer - row.ber) * 100) / 100;
+        r.diff = diff;
+        if (Math.abs(diff) > COST_TOLERANCE) {
+          r.status = 'differs';
+          r.message = 'The sheet says ' + row.ber.toFixed(2) + ' but the campaign name says ' + nameBer.toFixed(2) + '. ' +
+            (diff < 0
+              ? 'The dashboard is using the LOWER figure, so it can call this campaign profitable when it is not.'
+              : 'The dashboard is using the HIGHER figure, so it can call this campaign unprofitable when it is not.') +
+            ' One of the two is out of date.';
+        }
+      }
+      out.push(r);
+    });
+
+    var order = { differs: 0, incomplete: 1, 'no-row': 2, 'no-code': 3, 'no-ber': 4, match: 5 };
+    out.sort(function (a, b) {
+      return (a.status === 'match') - (b.status === 'match') ||
+             (b.active - a.active) || (order[a.status] - order[b.status]);
+    });
+    var count = function (st) { return out.filter(function (x) { return x.status === st; }).length; };
+    return {
+      rows: out, ageDays: ageDays, stale: ageDays !== null && ageDays > COST_STALE_DAYS, savedAt: costs ? costs.savedAt || null : null,
+      counts: { match: count('match'), differs: count('differs'), incomplete: count('incomplete'),
+                noRow: count('no-row') + count('no-code'), noBer: count('no-ber') },
+      activeProblems: out.filter(function (x) { return x.active && (x.status === 'differs' || x.status === 'incomplete'); }).length
+    };
+  }
+
+  async function fetchCosts({ workerUrl, dashKey }) {
+    if (!workerUrl || !dashKey) return { ok: false, reason: 'not-configured' };
+    var base = String(workerUrl).trim().replace(/\/+$/, '');
+    var res, body;
+    try { res = await fetch(base + '/costs', { headers: { 'X-Dash-Key': dashKey } }); }
+    catch (e) { return { ok: false, reason: 'unreachable', error: 'Could not reach the Truth Worker for the cost sheet copy.' }; }
+    try { body = await res.json(); }
+    catch (e) { return { ok: false, reason: 'bad-response', error: 'Cost sheet copy: non-JSON reply (HTTP ' + res.status + ').' }; }
+    if (!res.ok || !body || body.ok === false) return { ok: false, reason: 'error', error: (body && body.error) || ('HTTP ' + res.status) };
+    return { ok: true, data: body };
+  }
+
   function productLabelOf(name) {
     const VE = (typeof globalThis !== 'undefined' && globalThis.VerdictEngine) || root.VerdictEngine;
     return (VE && VE.productLabel) ? VE.productLabel(name) : name;
@@ -448,5 +543,5 @@
 
   return { fetchTruth, match, rangeForPreset, tzDayRange, tzOffsetMinutes,
            key, headKey, cmForProduct, rangeForDays, FUNNELS, PRESET_RANGE,
-           adKey, fetchAdOrders, matchAdOrders };
+           adKey, fetchAdOrders, matchAdOrders, costCheck, fetchCosts, COST_TOLERANCE, COST_STALE_DAYS };
 });

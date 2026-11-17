@@ -281,6 +281,7 @@ main > [hidden] { display: none !important; }
     if (el.id === 'hub-today') return 'today';
     if (el.id === 'hub-calendar') return 'calendar';
     if (el.id === 'plan-panel') return 'today';
+    if (el.id === 'cost-panel') return 'today campaigns';
     if (el.id === 'guardrails') return 'today campaigns';
     if (el.id === 'creative-desk' || el.classList.contains('table-card')) return 'creatives';
     if (el.tagName === 'FOOTER') return 'all';
