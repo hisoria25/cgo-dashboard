@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CGO Media Buyer — Verdict Dashboard</title>
   <meta name="description" content="Meta ads decision dashboard running the Samuel Ecom scaling rules against the Shopify order book: scale, keep, descale or kill, with the exact new budget.">
-  <link rel="stylesheet" href="style.css?v=20261117b">
+  <link rel="stylesheet" href="style.css?v=20261117c">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
@@ -51,6 +51,11 @@
     <span id="acct-hint" class="acct-hint">Reading one account at a time</span>
   </div>
 </header>
+
+<!-- ======================= HUB TABS =======================
+     Four tabs over the same page. Nothing was removed: every section that
+     was here before still exists and is listed under one of the tabs. -->
+<nav id="hub-tabs" class="hub-tabs" aria-label="Sections · Bereiche"></nav>
 
 <!-- ======================= DATA SOURCES MODAL ======================= -->
 <div id="settings-modal" class="modal-overlay">
@@ -166,6 +171,9 @@
 </div>
 
 <main class="container main-content fade-in">
+
+  <section id="hub-today" class="hub-page" aria-label="Today · Heute"></section>
+  <section id="hub-calendar" class="hub-page" aria-label="Calendar · Kalender"></section>
 
   <!-- ======================= COMMAND BAR ======================= -->
   <div class="card command-bar">
@@ -445,9 +453,11 @@
   </footer>
 </main>
 
-<script src="rules.js?v=20261117b"></script>
-<script src="truth.js?v=20261117b"></script>
-<script src="creative.js?v=20261117b"></script>
-<script src="app.js?v=20261117b"></script>
+<script src="rules.js?v=20261117c"></script>
+<script src="truth.js?v=20261117c"></script>
+<script src="creative.js?v=20261117c"></script>
+<script src="calendar.js?v=20261117c"></script>
+<script src="app.js?v=20261117c"></script>
+<script src="hub.js?v=20261117c"></script>
 </body>
 </html>

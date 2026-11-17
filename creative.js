@@ -991,6 +991,207 @@
   }
 
   /** Everything for one campaign in a single call. */
+
+  /* ------------------------------------------------------------------
+     DELIVERY CHECK — is Meta still spending the budget, and are clicks still
+     turning into orders?
+
+     Three readings, from data already on the page (the ads' daily rows and the
+     campaign's daily orders). It never moves a budget and never pauses anything.
+       squeezed       spend fell well under budget AND CPM rose: you are paying
+                      more per view and still getting less
+       underdelivery  spend fell well under budget, CPM did not rise
+       page           spend is fine and CTR holds, but orders per 100 clicks fell
+                      by half: the leak is after the click
+
+     The numbers are a rule of thumb. Checked day by day on 6 real campaigns
+     (5 to 14 days each, 17 Nov 2026): quiet on the three where the budget had
+     been cut by hand, and it fired on the three that really dipped — one of
+     them was paused the next day. They are not Meta's numbers, and Meta never
+     says who won an auction.
+     ------------------------------------------------------------------ */
+  const SQUEEZE = {
+    minDays: 5,          // days with spend before it says anything
+    recentDays: 2,       // the days judged for delivery
+    pageRecentDays: 3,   // the days judged for orders per click
+    fillAlert: 0.70,     // spending under 70% of budget ...
+    fullBefore: 0.85,    // ... after having spent at least 85% on some earlier day
+    cpmRisePct: 20,      // CPM this much above its own earlier level = a price squeeze
+    ctrKeep: 0.80,       // CTR still at least 80% of before = the ads themselves hold up
+    rateDrop: 0.50,      // orders per 100 clicks at or under half of before
+    minBaseOrders: 8,    // need this many orders before to compare against
+    minRecentClicks: 150
+  };
+
+  /**
+   * @param input { ads: rows with .daily [{date,spend,impressions,clicks}], history: [{date,spend,purchases}],
+   *                budget (now), budgetChanges: [{date,time,oldBudget,newBudget}] from the account's change log (or null),
+   *                learning, status, beCpa, currency, seasonNote }
+   * @returns null (nothing to flag) or { primary, flags, headline, why[], todo[], numbers }
+   */
+  function squeezeCheck(input) {
+    const inp = input || {};
+    if (inp.status && !/^(ACTIVE|WITH_ISSUES)$/i.test(inp.status)) return null;
+    if (inp.learning) return null;
+
+    // Fold the ads' daily rows into one row per day for the campaign.
+    const byDate = {};
+    (inp.ads || []).forEach(a => (a.daily || []).forEach(d => {
+      if (!d || !d.date) return;
+      const o = byDate[d.date] || (byDate[d.date] = { date: d.date, spend: 0, impressions: 0, clicks: 0 });
+      o.spend += n(d.spend); o.impressions += n(d.impressions); o.clicks += n(d.clicks);
+    }));
+    const orders = {};
+    (inp.history || []).forEach(h => { if (h && h.date) orders[h.date] = n(h.purchases); });
+
+    const days = Object.values(byDate).filter(d => d.spend > 0).sort((a, b) => a.date.localeCompare(b.date));
+    if (days.length < SQUEEZE.minDays) return null;
+
+    const money = (v) => (inp.currency === 'USD' ? '$' : inp.currency === 'GBP' ? '£' : '€') + Math.round(v);
+    const pct = (v) => Math.round(v * 100);
+    const flags = [];
+    const numbers = {};
+
+    /* ---- delivery: spend against the budget in force THAT day, and CPM ----
+       A budget cut by hand makes spend fall without anything being wrong, so
+       each day is measured against the budget that was live on it, and a day
+       the budget changed on is left out. Without the change log the check is
+       skipped rather than guessed. */
+    const budget = n(inp.budget);
+    const changes = Array.isArray(inp.budgetChanges) ? inp.budgetChanges : null;
+    numbers.deliveryChecked = false;
+    if (budget > 0 && changes) {
+      const budgetOn = (date) => {
+        const list = changes.slice().sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || '')));
+        if (list.some(c => c.date === date)) return null;              // changed that day: mixed, leave it out
+        const before = list.filter(c => c.date < date);
+        if (before.length) return n(before[before.length - 1].newBudget);
+        const after = list.find(c => c.date > date);
+        return after ? n(after.oldBudget) : budget;
+      };
+      const clean = days.map(d => Object.assign({ budget: budgetOn(d.date) }, d)).filter(d => d.budget > 0);
+      const recentAll = days.slice(-SQUEEZE.recentDays);
+      const recent = clean.filter(d => recentAll.some(r => r.date === d.date));
+      const base = clean.filter(d => !recentAll.some(r => r.date === d.date));
+      if (recent.length === SQUEEZE.recentDays && base.length >= 3) {
+        numbers.deliveryChecked = true;
+        const fillOf = d => d.spend / d.budget;
+        const fillRecent = recent.reduce((t, d) => t + fillOf(d), 0) / recent.length;
+        const fillBase = base.reduce((t, d) => t + fillOf(d), 0) / base.length;
+        const spentFullBefore = base.some(d => fillOf(d) >= SQUEEZE.fullBefore);
+        numbers.fillRecent = r2(fillRecent); numbers.fillBase = r2(fillBase);
+        if (spentFullBefore && fillRecent <= SQUEEZE.fillAlert) {
+          const im = (arr) => arr.reduce((t, d) => t + d.impressions, 0);
+          const sp = (arr) => arr.reduce((t, d) => t + d.spend, 0);
+          const cpmRecent = im(recent) > 0 ? sp(recent) / im(recent) * 1000 : 0;
+          const cpmBase = im(base) > 0 ? sp(base) / im(base) * 1000 : 0;
+          const rise = cpmBase > 0 ? ((cpmRecent - cpmBase) / cpmBase) * 100 : 0;
+          numbers.cpmRecent = r2(cpmRecent); numbers.cpmBase = r2(cpmBase); numbers.cpmRisePct = r1(rise);
+          flags.push(rise >= SQUEEZE.cpmRisePct ? 'squeezed' : 'underdelivery');
+        }
+      }
+    }
+
+    /* ---- the page: orders per 100 clicks, with CTR holding ---- */
+    const pr = days.slice(-SQUEEZE.pageRecentDays);
+    const pb = days.slice(0, days.length - SQUEEZE.pageRecentDays);
+    if (pb.length >= 3) {
+      const clicks = arr => arr.reduce((t, d) => t + d.clicks, 0);
+      const imps = arr => arr.reduce((t, d) => t + d.impressions, 0);
+      const ords = arr => arr.reduce((t, d) => t + n(orders[d.date]), 0);
+      const baseOrders = ords(pb), recentClicks = clicks(pr);
+      if (baseOrders >= SQUEEZE.minBaseOrders && recentClicks >= SQUEEZE.minRecentClicks && clicks(pb) > 0) {
+        const rateBase = baseOrders / clicks(pb) * 100;
+        const rateRecent = ords(pr) / recentClicks * 100;
+        const ctrBase = imps(pb) > 0 ? clicks(pb) / imps(pb) : 0;
+        const ctrRecent = imps(pr) > 0 ? clicks(pr) / imps(pr) : 0;
+        numbers.ordersPer100Base = r2(rateBase); numbers.ordersPer100Recent = r2(rateRecent);
+        numbers.ctrBase = r2(ctrBase * 100); numbers.ctrRecent = r2(ctrRecent * 100);
+        if (rateRecent <= rateBase * SQUEEZE.rateDrop && ctrRecent >= ctrBase * SQUEEZE.ctrKeep) flags.push('page');
+      }
+    }
+
+    if (!flags.length) return null;
+    const primary = flags.includes('squeezed') ? 'squeezed' : flags.includes('underdelivery') ? 'underdelivery' : 'page';
+    const delivery = primary !== 'page';
+    const both = delivery && flags.includes('page');
+
+    let headline;
+    if (primary === 'squeezed') {
+      headline = `Delivery squeeze: spending ${pct(numbers.fillRecent)}% of budget while CPM is up ${Math.round(numbers.cpmRisePct)}%`;
+    } else if (primary === 'underdelivery') {
+      headline = `Under-delivering: only ${pct(numbers.fillRecent)}% of budget spent (it was spending ${pct(numbers.fillBase)}%)`;
+    } else {
+      headline = `Clicks stopped turning into orders: ${numbers.ordersPer100Base} → ${numbers.ordersPer100Recent} orders per 100 clicks`;
+    }
+    if (both) headline += ' — and orders per click fell too';
+
+    const why = [];
+    if (delivery) {
+      why.push(`Spend over the last ${SQUEEZE.recentDays} days averaged ${pct(numbers.fillRecent)}% of the ${money(budget)} budget; earlier it was ${pct(numbers.fillBase)}%.`);
+      why.push(primary === 'squeezed'
+        ? `CPM went from ${money(numbers.cpmBase)} to ${money(numbers.cpmRecent)} (+${Math.round(numbers.cpmRisePct)}%): you are paying more per thousand views and still getting less.`
+        : `CPM barely moved (${money(numbers.cpmBase)} → ${money(numbers.cpmRecent)}), so the price did not rise — Meta is simply finding fewer people it expects to buy.`);
+    }
+    if (flags.includes('page')) {
+      why.push(`Orders per 100 clicks fell from ${numbers.ordersPer100Base} to ${numbers.ordersPer100Recent} while CTR held (${numbers.ctrBase}% → ${numbers.ctrRecent}%): people still click, fewer buy. The leak is after the click.`);
+    }
+    if (inp.seasonNote) why.push(inp.seasonNote);
+
+    const todo = [];
+    if (delivery) {
+      todo.push('Do not raise the budget.');
+      todo.push('Add a new first 3 seconds. Near-copies of other ads can compete with each other for delivery.');
+      if (n(inp.beCpa) > 0) todo.push(`Consider a cost cap near your break-even cost per order (${money(inp.beCpa)}). Test it on one campaign: it can also cut spend.`);
+      todo.push('Check in Events Manager that Purchase still fires.');
+    }
+    if (flags.includes('page')) {
+      todo.push('Find what changed on the page or checkout in these days: price, shipping text, banner, speed, payment methods.');
+      todo.push('Click through ad → page → checkout on your phone.');
+      if (!delivery) todo.push('Leave the ads alone for now — CTR shows they are doing their job.');
+    }
+    return { primary, flags, headline, why, todo, numbers };
+  }
+
+  /**
+   * Turn Meta's activity log (category BUDGET) into per-campaign budget changes
+   * with dates in the ACCOUNT's clock, which is the clock the daily rows use.
+   * Values in the log are minor units (cents). Ad-set budget changes are mapped
+   * to their campaign. Anything it cannot read is skipped, never guessed.
+   * @param rows [{event_type, object_id, event_time, extra_data}]
+   * @param tz   IANA zone of the ad account
+   * @param adsetToCampaign {adsetId: campaignId}
+   * @returns {campaignId: [{date,time,oldBudget,newBudget}]}
+   */
+  function parseBudgetLog(rows, tz, adsetToCampaign) {
+    const out = {};
+    let fmt = null;
+    try {
+      fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz || 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+    } catch (e) { return out; }
+    (rows || []).forEach(r => {
+      if (!r || !/^update_(campaign|ad_set)_budget$/.test(r.event_type || '')) return;
+      const id = r.object_id;
+      const cid = r.event_type === 'update_campaign_budget' ? id : (adsetToCampaign || {})[id];
+      if (!cid) return;
+      let ex = r.extra_data;
+      if (typeof ex === 'string') { try { ex = JSON.parse(ex); } catch (e) { return; } }
+      if (!ex || !ex.old_value || !ex.new_value) return;
+      const oldV = n(ex.old_value.old_value), newV = n(ex.new_value.new_value);
+      if (!(oldV > 0) || !(newV > 0)) return;
+      const t = new Date(String(r.event_time || '').replace(/([+-]\d\d)(\d\d)$/, '$1:$2'));
+      if (isNaN(t.getTime())) return;
+      const parts = {};
+      fmt.formatToParts(t).forEach(p => { parts[p.type] = p.value; });
+      (out[cid] = out[cid] || []).push({
+        date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}`,
+        oldBudget: oldV / 100, newBudget: newV / 100
+      });
+    });
+    Object.values(out).forEach(l => l.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time)));
+    return out;
+  }
+
   function desk(campaignName, ads, ctx) {
     const verdicts = adVerdicts(ads, ctx);
     const needs = campaignNeeds(verdicts, ctx);
@@ -1007,13 +1208,19 @@
       verdicts, campaign: (ctx && ctx.campaign) || {}, streak: (ctx && ctx.streak) || 0,
       ber: ctx && ctx.ber, currency: ctx && ctx.currency
     });
-    return { campaign: campaignName, verdicts, needs, fresh, hooks, spread,
+    const squeeze = squeezeCheck({
+      ads, history: ((ctx && ctx.campaign) || {}).history, budget: ctx && ctx.budget,
+      learning: ((ctx && ctx.campaign) || {}).learning, status: ctx && ctx.status,
+      budgetChanges: ctx && ctx.budgetChanges, beCpa: ctx && ctx.beCpa,
+      currency: ctx && ctx.currency, seasonNote: ctx && ctx.seasonNote
+    });
+    return { campaign: campaignName, verdicts, needs, fresh, hooks, spread, squeeze,
              brief: brief(campaignName, verdicts, needs, ctx, fresh, hooks, spread) };
   }
 
   return {
     STAGES, SOP_MAX_ADS, SOP_MIN_ADS, FAIR_TEST_MULTIPLE, AD_RULES, FRESH,
-    HOOK, SPREAD, COMPETITOR_PLAYBOOK, spreadPlan, retention, diagnose, hookReport, hookDesk, fairTestThreshold, poissonCdf, judgeAd, adVerdicts,
+    HOOK, SPREAD, SQUEEZE, COMPETITOR_PLAYBOOK, spreadPlan, squeezeCheck, parseBudgetLog, retention, diagnose, hookReport, hookDesk, fairTestThreshold, poissonCdf, judgeAd, adVerdicts,
     freshness, cadenceTarget, trendOf, roasTrend, campaignNeeds, brief, desk
   };
 });

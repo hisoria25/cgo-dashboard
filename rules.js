@@ -1364,7 +1364,7 @@
     const items = [];
     const quiet = [];
     const sum = { pauseAds: 0, bleedPerWeek: 0, budgetMoves: 0, creativeJobs: 0, newLast7: 0, newAds: 0,
-      cadenceTarget: 0, cadenceActual: 0, cadenceBehind: [] };
+      cadenceTarget: 0, cadenceActual: 0, cadenceBehind: [], deliveryWarnings: 0 };
     const MONEY_NOW = { KILL: 2, DESCALE: 3, PRICE_DROP: 3, SCALE: 5, SURF: 5 };
     const FIX = { DIAGNOSE: 'Fix what is leaking', NEEDS_SETUP: 'Finish the setup' };
     const when = dayOver ? 'Now — the day is closed' : 'After midnight — the day is still running';
@@ -1426,6 +1426,22 @@
           priority: 3, kind: 'fix', when: 'Today', campaign: label, campaignId: c.id,
           title: `${label}: ${FIX[v.code]}`, lines: [], money: 0,
           why: (v.reasons && v.reasons[0]) || v.headline || ''
+        });
+      }
+
+      /* Delivery warning: Meta spending less than the budget, or orders per click
+         falling while the ads still get clicked. It only ever asks the owner to
+         look — it never moves a budget. */
+      const sq = d && d.squeeze;
+      if (sq) {
+        sum.deliveryWarnings++;
+        items.push({
+          priority: sq.flags.includes('page') && !sq.flags.some(x => x === 'squeezed' || x === 'underdelivery') ? 3 : 4,
+          kind: 'delivery', when: 'Today — look before you change anything',
+          campaign: label, campaignId: c.id,
+          title: `${label}: ${sq.headline}`,
+          lines: sq.todo.slice(), money: 0,
+          why: (sq.why && sq.why[0]) || ''
         });
       }
 

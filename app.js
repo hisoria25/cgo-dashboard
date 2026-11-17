@@ -37,6 +37,8 @@ const State = {
   atcBroken: false      // the ATC event does not fire on these funnels
 };
 
+window.CgoState = State;
+
 const LS = {
   get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch { return d; } },
   set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
@@ -671,6 +673,46 @@ async function creativeLookback(acc) {
   }
 }
 
+/* THE BUDGET CHANGE LOG
+   --------------------------------------------------------------------------
+   Whether Meta is under-delivering depends on the budget that was live on
+   each day, and a budget cut by hand looks exactly like Meta failing to
+   spend. The account's activity log says what the budget was and when it
+   changed. If it cannot be read the delivery check is simply switched off
+   (null), never guessed. Cached 30 minutes. */
+const BUDGET_LOG_TTL_MS = 30 * 60 * 1000;
+async function budgetChangeLog(acc, tz, adsets) {
+  const key = `cgo_budget_log::${acc}`;
+  let cached = null;
+  try { cached = JSON.parse(LS.get(key, 'null')); } catch (e) { cached = null; }
+  if (cached && cached.t && Date.now() - cached.t < BUDGET_LOG_TTL_MS) return cached.data;
+  try {
+    const since = new Date(Date.now() - 18 * 86400000).toISOString().slice(0, 10);
+    const res = await graphAll(`${acc}/activities`, {
+      category: 'BUDGET', since, fields: 'event_type,object_id,event_time,extra_data', limit: 100
+    }, 6);
+    const toCampaign = {};
+    (adsets || []).forEach(a => { if (a && a.id) toCampaign[a.id] = a.campaign_id; });
+    const data = CD.parseBudgetLog(res.data || [], tz, toCampaign);
+    try { LS.set(key, JSON.stringify({ t: Date.now(), data })); } catch (e) { /* optional */ }
+    return data;
+  } catch (e) {
+    return cached && cached.data ? cached.data : null;
+  }
+}
+
+/* A one-line reminder when the calendar says costs are higher for everyone
+   today, so a price rise is not read as Meta choosing someone else. */
+function seasonNoteNow() {
+  try {
+    const K = window.CgoCalendar;
+    if (!K) return null;
+    const today = new Date().toISOString().slice(0, 10);
+    const hit = K.build(today, 1, { includePast: true }).find(e => (e.cpm === 'high' || e.cpm === 'up') && e.cpmFrom <= today && today <= e.end);
+    return hit ? `Today falls in ${hit.name} (${hit.de || hit.name}) — ${(K.CPM_LABEL[hit.cpm] || '').toLowerCase()} for every advertiser, so a higher price alone does not mean a rival won.` : null;
+  } catch (e) { return null; }
+}
+
 async function fetchAccount(acc, preset) {
   const win = windowParams();
   const [account, campaigns, adsets, judged, history, adInsights, adsMeta, lookback] = await Promise.all([
@@ -717,12 +759,14 @@ async function fetchAccount(acc, preset) {
     } catch (e) { /* lengths are a nicety, not a dependency */ }
   }
 
+  const budgetLog = await budgetChangeLog(acc, account.timezone_name, adsets.data || []);
+
   const built = buildFromApi({
     campaigns: campaigns.data || [], adsets: adsets.data || [],
     judged: judged.data || [], history: history.data || [],
     adInsights: adInsights.data || [], adsMeta: adsMeta.data || [], preset,
     adLookback: lookback.rows || [], adDaily: lookback.daily || [], lookbackError: lookback.error || null,
-    accountId: acc, accountName: account.name || acc, videoLengths: lengths
+    accountId: acc, accountName: account.name || acc, videoLengths: lengths, budgetLog
   });
 
   return { ...built, account, accountId: acc };
@@ -916,7 +960,7 @@ function conversions(row) {
   return { purchases, revenue, atc, ic, lpvRaw };
 }
 
-function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta, preset, accountId, accountName, videoLengths, adLookback, adDaily, lookbackError }) {
+function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta, preset, accountId, accountName, videoLengths, adLookback, adDaily, lookbackError, budgetLog }) {
   const vlen = videoLengths || {};
   let lpvEstimated = false;
 
@@ -926,8 +970,10 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
   // campaign must not have its budget touched.
   const adsetBudget = {};
   const learningByCampaign = {};
+  const adsetCount = {};
   (adsets || []).forEach(s => {
     if ((s.effective_status || '').toUpperCase() === 'DELETED') return;
+    adsetCount[s.campaign_id] = (adsetCount[s.campaign_id] || 0) + 1;
     const b = s.daily_budget ? parseFloat(s.daily_budget) / 100 : 0;
     if (b) adsetBudget[s.campaign_id] = (adsetBudget[s.campaign_id] || 0) + b;
     const stage = s.learning_stage_info && s.learning_stage_info.status;
@@ -990,6 +1036,9 @@ function buildFromApi({ campaigns, adsets, judged, history, adInsights, adsMeta,
       learning: !!learningByCampaign[c.id],
       budget,
       budgetSource,
+      // null = the change log is unavailable or cannot be matched to one budget; the delivery check then stays off
+      budgetChanges: budgetLog && budgetSource !== 'lifetime' && budgetSource !== 'none' &&
+                     !(budgetSource === 'adset' && adsetCount[c.id] > 1) ? (budgetLog[c.id] || []) : null,
       series,
       createdTime: c.created_time,
       daysLive: Math.max(1, closedDays + (judgingToday && spend > 0 ? 1 : 0)),
@@ -1376,7 +1425,9 @@ function computeVerdicts() {
         campaignCpa: c.purchases > 0 ? c.spend / c.purchases : 0,
         campaign: { history: c.history, learning: c.learning, daysLive: c.daysLive, spendPerDay },
         curve: c.curve, streak: c.profitableStreak,
-        activeAds: haveAdStatuses ? (activeAdsBy[c.id] || 0) : undefined
+        activeAds: haveAdStatuses ? (activeAdsBy[c.id] || 0) : undefined,
+        budget: c.budget, status: c.status, budgetChanges: c.budgetChanges,
+        seasonNote: seasonNoteNow()
       });
       c.fresh = c.desk.fresh;
     }
@@ -1512,7 +1563,7 @@ function renderVerdicts() {
         : `<span class="eq thin" title="The range still crosses break-even, so this is not yet a reliable signal">~ ${conf.orders} order${conf.orders === 1 ? '' : 's'} — not conclusive${conf.ordersNeeded ? `, needs about ${conf.ordersNeeded}` : ''}</span>`;
 
     return `
-      <article class="card verdict-card tone-${v.tone}">
+      <article class="card verdict-card tone-${v.tone}" data-cid="${esc(c.id)}">
         <header class="verdict-head">
           <div class="verdict-name">
             <h3>${esc(VE.productLabel(c.name))}</h3>
@@ -2096,7 +2147,7 @@ function renderTruthPanel() {
  * ========================================================================== *
  * Every decision on the page, in the order to do them. It adds no new rules —
  * it reads the verdicts, the spend curve and the ad calls already made. */
-const PLAN_ICON = { pause: '⛔', replace: '🔁', budget: '💶', fix: '🔧', creatives: '🎬' };
+const PLAN_ICON = { pause: '⛔', replace: '🔁', budget: '💶', fix: '🔧', creatives: '🎬', delivery: '📉' };
 
 function planHost() {
   let el = document.getElementById('plan-panel');
@@ -2115,16 +2166,19 @@ function planHost() {
 function renderPlan() {
   const host = planHost();
   if (State.source !== 'api') {
+    State.lastPlan = null;
     host.innerHTML = `<h2 class="section-title">📝 What to do tonight</h2>
       <p class="section-lede">Connect live data to get a plan. This page is showing demo numbers.</p>`;
     return;
   }
   const plan = VE.tonightPlan(State.campaigns, { dayIsOver: dayIsOver() });
+  State.lastPlan = plan;
   const sm = plan.summary;
 
   const bits = [];
   if (sm.pauseAds) bits.push(`<b>${sm.pauseAds}</b> ad${sm.pauseAds === 1 ? '' : 's'} to pause`);
   if (sm.budgetMoves) bits.push(`<b>${sm.budgetMoves}</b> budget move${sm.budgetMoves === 1 ? '' : 's'}`);
+  if (sm.deliveryWarnings) bits.push(`<b>${sm.deliveryWarnings}</b> delivery warning${sm.deliveryWarnings === 1 ? '' : 's'}`);
   if (sm.creativeJobs) bits.push(`<b>${sm.newAds}</b> new creatives to make`);
   const headline = plan.items.length ? bits.join(' · ') : 'Nothing to do. Leave everything running.';
 
@@ -3544,6 +3598,9 @@ function renderAll() {
   renderTable();
   renderPlaybook();
   renderCharts();
+  if (window.CgoHub) {
+    window.CgoHub.refresh({ campaigns: State.campaigns, plan: State.lastPlan || null, tz: State.accountTz, source: State.source, lastSync: State.lastSync });
+  }
 }
 
 /* ========================================================================== *
