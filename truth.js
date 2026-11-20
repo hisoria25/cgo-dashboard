@@ -522,6 +522,111 @@
     };
   }
 
+  /* ------------------------------------------------------------------
+     SUPPLIER CHECK — the platform's own numbers
+     ------------------------------------------------------------------
+     Dropshipping Lite knows what each order really cost to make and ship.
+     The Worker turns the last few weeks of orders into a real break-even per
+     product; this lines it up with each campaign's name. Matching is by
+     product name (LidLux™ = LidLux), so no CM code is needed. Where the
+     supplier has too few orders to say, the sheet check is used instead. */
+  var SUPPLIER_TOLERANCE = 0.04;
+  var SUPPLIER_MIN_ORDERS = 8;
+
+  function normProduct(s) {
+    return String(s || '').toLowerCase().replace(/[™®©]/g, '').replace(/[^a-z0-9äöüß]+/g, ' ').trim();
+  }
+
+  function supplierCheck(campaigns, supplier, nowMs) {
+    var rows = (supplier && supplier.rows) || {};
+    var out = [];
+    (campaigns || []).forEach(function (c) {
+      var parts = String(c.name || '').split('|').map(function (x) { return x.trim(); });
+      var label = parts[2] || c.name;
+      var active = !/^(PAUSED|ADSET_PAUSED|CAMPAIGN_PAUSED|ARCHIVED|DELETED)$/.test(String(c.status || ''));
+      var nameBer = berFromName(c.name);
+      var row = rows[normProduct(label)] || null;
+      var r = { id: c.id, code: cmOf(c.name), label: label, active: active, nameBer: nameBer, source: 'supplier',
+                realBer: row && row.ber > 0 ? row.ber : null, orders: row ? row.orders : 0, status: 'match', message: '' };
+      if (!row) {
+        r.status = 'no-row';
+        r.message = 'Dropshipping Lite has no recent orders for ' + label + '.';
+      } else if (row.orders < SUPPLIER_MIN_ORDERS) {
+        r.status = 'few';
+        r.message = 'Only ' + row.orders + ' recent supplier order' + (row.orders === 1 ? '' : 's') + ' for ' + label + ' — too few to trust a real break-even yet.';
+      } else if (!(row.ber > 0)) {
+        r.status = 'incomplete';
+        r.message = 'On the last ' + row.orders + ' orders the supplier cost and fees are above the sale price, so there is no break-even at the current price.';
+      } else if (nameBer === null) {
+        r.status = 'no-ber';
+        r.message = 'The name carries no break-even. The real supplier cost says ' + row.ber.toFixed(2) + '.';
+      } else {
+        var diff = Math.round((nameBer - row.ber) * 100) / 100;
+        r.diff = diff;
+        if (Math.abs(diff) > SUPPLIER_TOLERANCE) {
+          r.status = 'differs';
+          r.message = 'Real supplier cost says break-even ' + row.ber.toFixed(2) + ' (last ' + row.orders + ' orders, average order €' + row.aov.toFixed(2) +
+            ', cost €' + row.costPerOrder.toFixed(2) + ' + fees €' + row.feesPerOrder.toFixed(2) + '), but the campaign name says ' + nameBer.toFixed(2) + '. ' +
+            (diff < 0
+              ? 'The dashboard is using the LOWER figure, so it can call this campaign profitable when it is not.'
+              : 'The dashboard is using the HIGHER figure, so it can call this campaign unprofitable when it is not.') +
+            ' Rename the campaign to ' + row.ber.toFixed(2) + ' to fix it.';
+        }
+      }
+      out.push(r);
+    });
+    return out;
+  }
+
+  /* Supplier rows win where they can speak (enough orders); the sheet fills
+     the gaps. Same shape as costCheck so the rest of the dashboard is unchanged. */
+  function mergeCostChecks(sheetChk, supplier, campaigns, nowMs) {
+    var now = nowMs || Date.now();
+    var sup = supplier && supplier.rows ? supplierCheck(campaigns, supplier, now) : [];
+    var sheetById = {};
+    if (sheetChk) sheetChk.rows.forEach(function (r) { sheetById[r.id] = r; });
+    var speaks = { match: 1, differs: 1, incomplete: 1, 'no-ber': 1 };
+    var rows = (campaigns || []).map(function (c, i) {
+      var s = sup[i];
+      if (s && speaks[s.status]) return s;
+      var sh = sheetById[c.id];
+      if (sh) { sh.source = 'sheet'; return sh; }
+      return s || null;
+    }).filter(Boolean);
+    var order = { differs: 0, incomplete: 1, 'no-row': 2, 'no-code': 3, few: 4, 'no-ber': 5, match: 6 };
+    rows.sort(function (a, b) {
+      return (a.status === 'match') - (b.status === 'match') ||
+             (b.active - a.active) || ((order[a.status] || 9) - (order[b.status] || 9));
+    });
+    var count = function (st) { return rows.filter(function (x) { return x.status === st; }).length; };
+    var supMs = supplier && supplier.fetchedAt ? Date.parse(supplier.fetchedAt) : NaN;
+    var usedSupplier = rows.some(function (r) { return r.source === 'supplier'; });
+    var ageDays = usedSupplier && Number.isFinite(supMs) ? Math.floor((now - supMs) / 86400000)
+                  : sheetChk ? sheetChk.ageDays : null;
+    return {
+      rows: rows, ageDays: ageDays,
+      stale: usedSupplier ? (ageDays !== null && ageDays > 2) : !!(sheetChk && sheetChk.stale),
+      savedAt: usedSupplier ? supplier.fetchedAt : (sheetChk ? sheetChk.savedAt : null),
+      usedSupplier: usedSupplier,
+      counts: { match: count('match'), differs: count('differs'), incomplete: count('incomplete'),
+                noRow: count('no-row') + count('no-code'), noBer: count('no-ber'), few: count('few') },
+      activeProblems: rows.filter(function (x) { return x.active && (x.status === 'differs' || x.status === 'incomplete'); }).length
+    };
+  }
+
+  async function fetchSupplier({ workerUrl, dashKey }) {
+    if (!workerUrl || !dashKey) return { ok: false, reason: 'not-configured' };
+    var base = String(workerUrl).trim().replace(/\/+$/, '');
+    var res, body;
+    try { res = await fetch(base + '/supplier', { headers: { 'X-Dash-Key': dashKey } }); }
+    catch (e) { return { ok: false, reason: 'unreachable', error: 'Could not reach the Truth Worker for the supplier read.' }; }
+    try { body = await res.json(); }
+    catch (e) { return { ok: false, reason: 'bad-response', error: 'Supplier read: non-JSON reply (HTTP ' + res.status + ').' }; }
+    if (!res.ok || !body || body.ok === false) return { ok: false, reason: 'error', error: (body && body.error) || ('HTTP ' + res.status) };
+    if (body.off) return { ok: false, reason: 'off', error: body.message };
+    return { ok: true, data: body };
+  }
+
   async function fetchCosts({ workerUrl, dashKey }) {
     if (!workerUrl || !dashKey) return { ok: false, reason: 'not-configured' };
     var base = String(workerUrl).trim().replace(/\/+$/, '');
@@ -543,5 +648,6 @@
 
   return { fetchTruth, match, rangeForPreset, tzDayRange, tzOffsetMinutes,
            key, headKey, cmForProduct, rangeForDays, FUNNELS, PRESET_RANGE,
-           adKey, fetchAdOrders, matchAdOrders, costCheck, fetchCosts, COST_TOLERANCE, COST_STALE_DAYS };
+           adKey, fetchAdOrders, matchAdOrders, costCheck, fetchCosts, COST_TOLERANCE, COST_STALE_DAYS,
+           supplierCheck, mergeCostChecks, fetchSupplier, normProduct, SUPPLIER_TOLERANCE, SUPPLIER_MIN_ORDERS };
 });

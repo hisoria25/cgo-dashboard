@@ -931,14 +931,27 @@ async function syncTruth(preset) {
    break-even to a copy kept in the Worker. Display plus a plan note only. */
 async function syncCosts() {
   State.costs = null;
+  State.supplier = null;
   const workerUrl = LS.get('truth_worker_url', '');
   const dashKey = LS.get('truth_dash_key', '');
   if (!workerUrl || !dashKey) { State.costs = { state: 'off' }; return; }
   try {
-    const res = await TR.fetchCosts({ workerUrl, dashKey });
-    if (!res.ok) { State.costs = { state: 'error', message: res.error || res.reason }; return; }
-    if (res.data.empty) { State.costs = { state: 'empty' }; return; }
-    State.costs = { state: 'ok', check: TR.costCheck(State.campaigns, res.data) };
+    /* Two sources: the supplier's real order costs (preferred) and the private
+       sheet copy (fills the gaps). Either one alone is enough. */
+    const [cRes, sRes] = await Promise.all([
+      TR.fetchCosts({ workerUrl, dashKey }),
+      TR.fetchSupplier({ workerUrl, dashKey })
+    ]);
+    const sup = sRes.ok ? sRes.data : null;
+    State.supplier = sRes.ok ? { state: 'ok', data: sup }
+      : { state: sRes.reason === 'off' || sRes.reason === 'not-configured' ? 'off' : 'error', message: sRes.error || sRes.reason };
+    const sheet = cRes.ok && !cRes.data.empty ? TR.costCheck(State.campaigns, cRes.data) : null;
+    if (!sheet && !sup) {
+      if (!cRes.ok) State.costs = { state: 'error', message: cRes.error || cRes.reason };
+      else State.costs = { state: 'empty' };
+      return;
+    }
+    State.costs = { state: 'ok', check: TR.mergeCostChecks(sheet, sup, State.campaigns) };
   } catch (e) {
     console.error(e);
     State.costs = { state: 'error', message: String(e && e.message || e) };
@@ -950,6 +963,24 @@ function applyCostWarnings() {
   const byId = {};
   if (chk) chk.rows.forEach(r => { byId[r.id] = r; });
   (State.campaigns || []).forEach(c => { c.costWarn = byId[c.id] || null; });
+}
+
+/* Dropshipping Lite account: a low balance stops shipping, so it is shown
+   next to the cost check. Read-only. */
+function renderSupplierMoney() {
+  const sp = State.supplier;
+  if (!sp || sp.state === 'off') return '';
+  if (sp.state === 'error') return `<div class="cost-card"><b>📦 Supplier account unavailable</b><div class="cost-sub">${esc(sp.message || '')}</div></div>`;
+  const d = sp.data || {};
+  const eur = (n) => '€' + (Number.isFinite(n) ? n.toFixed(2) : '–');
+  const short = d.unpaidCount > 0 && d.unpaidAmount > d.balance;
+  const head = short
+    ? `<b>📦 Supplier: ${d.unpaidCount} unpaid invoice${d.unpaidCount === 1 ? '' : 's'} (${eur(d.unpaidAmount)}) but only ${eur(d.balance)} balance</b>`
+    : `<b>📦 Supplier account — balance ${eur(d.balance)}${d.unpaidCount ? `, ${d.unpaidCount} unpaid invoice${d.unpaidCount === 1 ? '' : 's'} (${eur(d.unpaidAmount)})` : ', nothing unpaid'}</b>`;
+  const sub = short
+    ? 'Orders can wait for payment before they ship. Top up the Dropshipping Lite balance or pay the invoices.'
+    : (d.stale ? 'Showing the last read — the platform did not answer just now.' : 'Read from Dropshipping Lite.');
+  return `<div class="cost-card ${short ? 'warn' : 'ok'}" style="margin-bottom:.6rem"><div class="cost-head">${head}<span class="cost-sub">${esc(sub)}</span></div></div>`;
 }
 
 function renderCostPanel() {
@@ -972,15 +1003,17 @@ function renderCostPanel() {
     return;
   }
   const c = st.check;
+  const money = renderSupplierMoney();
   const bad = c.rows.filter(r => r.status === 'differs' || r.status === 'incomplete');
-  const info = c.rows.filter(r => r.status === 'no-ber' || r.status === 'no-row' || r.status === 'no-code');
+  const info = c.rows.filter(r => r.status === 'no-ber' || r.status === 'no-row' || r.status === 'no-code' || r.status === 'few');
   const when = c.ageDays === null ? '' : c.ageDays === 0 ? 'copied today' : `copied ${c.ageDays} day${c.ageDays === 1 ? '' : 's'} ago`;
+  const srcWord = c.usedSupplier ? 'real supplier cost' : 'sheet';
   const head = bad.length
-    ? `<b>🧮 Cost sheet check — ${bad.length} to look at</b>`
-    : `<b>🧮 Cost sheet check — all ${c.counts.match} campaign break-evens match the sheet</b>`;
+    ? `<b>🧮 Cost check — ${bad.length} to look at</b>`
+    : `<b>🧮 Cost check — all ${c.counts.match} campaign break-evens match the ${srcWord}</b>`;
   const line = (r) => `<li class="${r.active ? 'live' : 'off'}"><b>${esc(r.label)}</b> ${r.code ? `<span class="cost-code">${esc(r.code)}</span>` : ''}${r.active ? '' : ' <span class="cost-off">paused</span>'}<div>${esc(r.message)}</div></li>`;
-  el.innerHTML = `<div class="cost-card ${bad.length ? 'warn' : 'ok'}">
-    <div class="cost-head">${head}<span class="cost-sub">Sheet ${esc(when)}${c.stale ? ' — <b>older than 14 days, ask Claude to refresh it</b>' : ''}</span></div>
+  el.innerHTML = money + `<div class="cost-card ${bad.length ? 'warn' : 'ok'}">
+    <div class="cost-head">${head}<span class="cost-sub">${c.usedSupplier ? 'Dropshipping Lite, last 21 days of orders' : 'Sheet ' + esc(when)}${c.usedSupplier ? '' : (c.stale ? ' — <b>older than 14 days, ask Claude to refresh it</b>' : '')}</span></div>
     ${bad.length ? `<ul class="cost-list">${bad.map(line).join('')}</ul>` : ''}
     ${info.length ? `<details class="cost-more"><summary>${info.length} other note${info.length === 1 ? '' : 's'}</summary><ul class="cost-list">${info.map(line).join('')}</ul></details>` : ''}
   </div>`;
